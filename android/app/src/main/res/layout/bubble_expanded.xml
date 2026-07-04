@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The expanded balloon: the control web UI + quick actions, floating over apps. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="320dp"
+    android:layout_height="440dp"
+    android:orientation="vertical"
+    android:background="#FFFFFFFF"
+    android:elevation="12dp">
+
+    <LinearLayout
+        android:id="@+id/bubbleHeader"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:background="#1565C0"
+        android:gravity="center_vertical"
+        android:padding="8dp">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textColor="#FFFFFF"
+            android:textStyle="bold"
+            android:text="@string/app_name" />
+
+        <Button
+            android:id="@+id/bubbleStop"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/cast_stop" />
+
+        <Button
+            android:id="@+id/bubbleCollapse"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="—" />
+    </LinearLayout>
+
+    <WebView
+        android:id="@+id/bubbleWeb"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+</LinearLayout>

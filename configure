@@ -1,0 +1,243 @@
+#!/bin/sh
+# Hand-written configure for bsdrX (no autotools dependency).
+# Generates config.mk consumed by the Makefile. Supports native and cross builds.
+#
+#   ./configure [options]
+#     --prefix=DIR           install prefix (default /usr/local)
+#     --host=TRIPLE          cross-compile (e.g. x86_64-w64-mingw32)
+#     --with-openssl=DIR     OpenSSL prefix (required for cross builds)
+#     --enable-sctp          build the usrsctp DataChannel (needs usrsctp)
+#     --static               link a static Linux binary (needs static .a deps;
+#                            pair with --disable-media for a clean portable build)
+#     --disable-tests        skip building tests
+#     CC=...                 override the C compiler
+#   Environment CC/CFLAGS/LDFLAGS are honored.
+set -e
+
+prefix=/usr/local
+host=
+with_openssl=
+enable_sctp=yes        # media is on by default; deps auto-detected below
+enable_video=yes
+enable_audio=yes
+build_tests=yes
+static=no
+CC_OVERRIDE=
+
+for arg in "$@"; do
+    case "$arg" in
+        --prefix=*)       prefix=${arg#*=} ;;
+        --host=*)         host=${arg#*=} ;;
+        --with-openssl=*) with_openssl=${arg#*=} ;;
+        --enable-sctp)    enable_sctp=yes ;;
+        --enable-video)   enable_video=yes ;;
+        --enable-audio)   enable_audio=yes ;;
+        --enable-media)   enable_sctp=yes; enable_video=yes; enable_audio=yes ;;
+        --disable-sctp)   enable_sctp=no ;;
+        --disable-video)  enable_video=no ;;
+        --disable-audio)  enable_audio=no ;;
+        --disable-media)  enable_sctp=no; enable_video=no; enable_audio=no ;;
+        --static)         static=yes ;;
+        --disable-static) static=no ;;
+        --disable-tests)  build_tests=no ;;
+        CC=*)             CC_OVERRIDE=${arg#*=} ;;
+        -h|--help)
+            sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) echo "configure: unknown option: $arg" >&2; exit 1 ;;
+    esac
+done
+
+# --- target OS -------------------------------------------------------------
+case "$host" in
+    *mingw*|*windows*|*win32*) target=windows ;;
+    *darwin*|*apple*)          target=macos ;;
+    "") case "$(uname -s 2>/dev/null)" in
+            Linux)  target=linux ;;
+            Darwin) target=macos ;;
+            *)      target=linux ;;
+        esac ;;
+    *) target=linux ;;
+esac
+
+# --- toolchain -------------------------------------------------------------
+if [ -n "$CC_OVERRIDE" ]; then CC=$CC_OVERRIDE
+elif [ -n "$CC" ]; then :                       # honor env CC
+elif [ -n "$host" ]; then CC=${host}-gcc
+else CC=cc
+fi
+if [ -n "$host" ]; then AR=${host}-ar; else AR=ar; fi
+command -v "$CC" >/dev/null 2>&1 || { echo "configure: C compiler '$CC' not found" >&2; exit 1; }
+
+EXEEXT=
+LDFLAGS_EXTRA=
+case "$target" in
+    windows)
+        INJECT_SRC=src/inject_win.c
+        PLAT_LIBS="-lws2_32 -luser32 -lbcrypt -lcrypt32"
+        LDFLAGS_EXTRA="-static -static-libgcc"
+        EXEEXT=.exe ;;
+    macos)
+        INJECT_SRC=src/inject_macos.c
+        PLAT_LIBS="-framework CoreGraphics -framework CoreFoundation" ;;
+    linux)
+        INJECT_SRC=src/inject_linux.c
+        PLAT_LIBS="-lpthread" ;;
+    *)
+        INJECT_SRC=src/inject_null.c
+        PLAT_LIBS="-lpthread" ;;
+esac
+
+# --- static linking (Linux) ------------------------------------------------
+# When --static, link a fully static binary and ask pkg-config for the full
+# transitive static dependency list. Needs the deps' .a archives installed;
+# for a clean portable build pair with --disable-media (OpenSSL + libc only).
+PKG_LIBS="--libs"
+if [ "$static" = yes ]; then
+    PKG_LIBS="--static --libs"
+    if [ "$target" = linux ] || [ -z "$host" ]; then
+        LDFLAGS_EXTRA="$LDFLAGS_EXTRA -static"
+    fi
+fi
+
+# --- OpenSSL ---------------------------------------------------------------
+if [ -n "$with_openssl" ]; then
+    OSSL_CFLAGS="-I${with_openssl}/include"
+    if [ -d "${with_openssl}/lib64" ]; then ossldir=${with_openssl}/lib64
+    else ossldir=${with_openssl}/lib; fi
+    OSSL_LIBS="-L${ossldir} -lssl -lcrypto"
+elif [ -z "$host" ] && command -v pkg-config >/dev/null 2>&1 && pkg-config --exists openssl 2>/dev/null; then
+    OSSL_CFLAGS=$(pkg-config --cflags openssl)
+    OSSL_LIBS=$(pkg-config $PKG_LIBS openssl)
+else
+    if [ -n "$host" ]; then
+        echo "configure: cross build needs --with-openssl=DIR (OpenSSL built for $host)" >&2
+        exit 1
+    fi
+    OSSL_CFLAGS=
+    OSSL_LIBS="-lssl -lcrypto"
+fi
+
+# --- auto-detect media deps; disable what's missing (so the build never fails
+#     just because an optional lib isn't installed) ----------------------------
+have_pkg() { pkg-config --exists "$@" 2>/dev/null; }
+if [ "$enable_sctp" = yes ]; then
+    if [ ! -f /usr/include/usrsctp.h ] && [ ! -f /usr/local/include/usrsctp.h ] \
+       && ! have_pkg usrsctp; then
+        echo "configure: usrsctp not found -> SCTP disabled (--enable-sctp to force)"; enable_sctp=no
+    fi
+fi
+if [ "$enable_video" = yes ]; then
+    miss=
+    have_pkg libsrtp2 || miss="libsrtp2"
+    if [ "$target" = linux ]; then
+        have_pkg libavcodec libavformat libavdevice libswscale libswresample libavfilter || miss="$miss ffmpeg"
+    fi
+    if [ -n "$miss" ]; then echo "configure: video deps missing ($miss) -> video disabled"; enable_video=no; fi
+fi
+if [ "$enable_audio" = yes ]; then
+    if [ "$target" != linux ] || ! have_pkg opus libpulse-simple; then
+        echo "configure: audio deps missing (opus/libpulse) -> audio disabled"; enable_audio=no
+    fi
+fi
+
+# --- optional SCTP ---------------------------------------------------------
+SCTP_SRC=
+SCTP_DEF=
+SCTP_LIBS=
+if [ "$enable_sctp" = yes ]; then
+    SCTP_SRC=src/sctp.c
+    SCTP_DEF=-DBSDR_ENABLE_SCTP=1
+    SCTP_LIBS=-lusrsctp
+fi
+
+# --- optional media (video / audio; need pkg-config) -----------------------
+MEDIA_SRC=
+MEDIA_DEF=
+MEDIA_CFLAGS=
+MEDIA_LIBS=
+pkg() { pkg-config "$@"; }
+if [ "$enable_video" = yes ] || [ "$enable_audio" = yes ]; then
+    MEDIA_SRC="src/srtp_util.c"
+    MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags libsrtp2 2>/dev/null)"
+    MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS libsrtp2 2>/dev/null || echo -lsrtp2)"
+fi
+if [ "$enable_video" = yes ]; then
+    MEDIA_SRC="$MEDIA_SRC src/video.c"
+    MEDIA_DEF="$MEDIA_DEF -DBSDR_ENABLE_VIDEO=1"
+    if [ "$target" = linux ]; then
+        MEDIA_SRC="$MEDIA_SRC src/capture.c src/threed.c src/filesrc.c src/fileaudio.c"
+        MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_CAPTURE=1"
+        MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags libavcodec libavformat libavdevice libavutil libswscale libswresample libavfilter 2>/dev/null)"
+        MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS libavcodec libavformat libavdevice libavutil libswscale libswresample libavfilter 2>/dev/null)"
+    fi
+fi
+if [ "$enable_audio" = yes ] && [ "$target" = macos ]; then
+    # macOS FULL audio: shared Opus sender/receiver/player (audio.c) + CoreAudio I/O
+    # (audio_coreaudio.c: record/playback/devices/virtual-mic via BlackHole) + the owner-mic
+    # sniffer (micsniff over libpcap). srtp_util.c + libsrtp2 come from the shared media block above.
+    MEDIA_SRC="$MEDIA_SRC src/audio.c src/audio_coreaudio.c src/micsniff.c src/micsniff_capture.c"
+    MEDIA_DEF="$MEDIA_DEF -DBSDR_ENABLE_AUDIO=1 -DBSDR_HAVE_AUDIO=1 -DBSDR_HAVE_PCAP=1"
+    MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags opus 2>/dev/null)"
+    MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS opus 2>/dev/null || echo -lopus) -lpcap -framework CoreAudio -framework AudioToolbox -framework CoreFoundation"
+    echo "configure: macOS full audio = audio.c (Opus DSP) + CoreAudio/BlackHole + libpcap sniffer"
+fi
+if [ "$enable_audio" = yes ] && [ "$target" = linux ]; then
+    MEDIA_SRC="$MEDIA_SRC src/audio.c src/micsniff.c src/micsniff_capture.c"   # owner-mic sniffer
+    MEDIA_DEF="$MEDIA_DEF -DBSDR_ENABLE_AUDIO=1 -DBSDR_HAVE_AUDIO=1"
+    MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags opus libpulse-simple 2>/dev/null)"
+    MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS opus libpulse-simple 2>/dev/null)"
+    # Owner-mic capture: libpcap is the portable engine (macOS BPF, Windows Npcap, Linux). On
+    # Linux it's optional — without it the sniffer falls back to a zero-dependency AF_PACKET
+    # capture. Detect and prefer libpcap when present.
+    if pkg --exists libpcap 2>/dev/null || [ -f /usr/include/pcap.h ] || [ -f /usr/include/pcap/pcap.h ]; then
+        MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_PCAP=1"
+        MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags libpcap 2>/dev/null)"
+        MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS libpcap 2>/dev/null || echo -lpcap)"
+        echo "configure: owner-mic capture = libpcap"
+    else
+        echo "configure: owner-mic capture = AF_PACKET (libpcap not found; install libpcap-dev for the portable path)"
+    fi
+fi
+
+# --- winlist: webui.c always needs bsdr_list_windows -----------------------
+# Pick the platform impl; the X11 one only when capture (video on Linux) is on.
+if [ "$enable_video" = yes ] && [ "$target" = linux ]; then
+    WINLIST_SRC="src/winlist.c"
+    MEDIA_LIBS="$MEDIA_LIBS -lX11"
+elif [ "$target" = windows ]; then
+    WINLIST_SRC="src/winlist_win.c"
+else
+    WINLIST_SRC="src/winlist_null.c"
+fi
+
+# --- emit config.mk --------------------------------------------------------
+cat > config.mk <<EOF
+# Generated by ./configure -- do not edit (re-run configure instead).
+CC          = $CC
+AR          = $AR
+EXEEXT      = $EXEEXT
+TARGET_OS   = $target
+prefix      = $prefix
+bindir      = \$(prefix)/bin
+libdir      = \$(prefix)/lib
+includedir  = \$(prefix)/include
+mandir      = \$(prefix)/share/man
+BUILD_TESTS = $build_tests
+
+INJECT_SRC  = $INJECT_SRC
+WINLIST_SRC = $WINLIST_SRC
+SCTP_SRC    = $SCTP_SRC
+MEDIA_SRC   = $MEDIA_SRC
+
+CFLAGS  = -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude $OSSL_CFLAGS $SCTP_DEF $MEDIA_DEF $MEDIA_CFLAGS $CFLAGS
+LDFLAGS = $LDFLAGS_EXTRA $LDFLAGS
+LDLIBS  = $OSSL_LIBS $PLAT_LIBS $SCTP_LIBS $MEDIA_LIBS
+EOF
+
+echo "configure: target=$target  CC=$CC  static=$static  sctp=$enable_sctp  video=$enable_video  audio=$enable_audio"
+if [ "$static" = yes ] && { [ "$enable_video" = yes ] || [ "$enable_audio" = yes ]; }; then
+    echo "configure: NOTE static + media needs the deps' static archives (.a)."
+    echo "configure:      if the link fails, re-run with --disable-media for a clean static build."
+fi
+echo "configure: wrote config.mk -- now run 'make'"

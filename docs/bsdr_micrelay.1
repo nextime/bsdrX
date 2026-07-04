@@ -1,0 +1,65 @@
+.TH BSDR_MICRELAY 1 "2026-07-04" "bsdrX" "User Commands"
+.SH NAME
+bsdr_micrelay \- router-side owner-mic relay for bsdrX
+.SH SYNOPSIS
+.B bsdr_micrelay
+.BI \-\-iface " IF"
+.BI \-\-quest " HEADSET-IP"
+.BI \-\-to " HOST:PORT"
+.SH DESCRIPTION
+A Bigscreen VR headset sends its microphone only to the Bigscreen cloud (as plain Opus RTP); there
+is no LAN mic-upload channel. On a wired LAN,
+.BR bsdr_agent (1)
+can ARP-spoof to intercept that stream, but over Wi-Fi it cannot \(em the access point bridges
+per-station traffic, so the headset's mic never reaches the host's radio.
+.PP
+The router, however, is in the path for every packet the headset sends.
+.B bsdr_micrelay
+runs on the router, captures the headset's outbound UDP with libpcap, and forwards the raw IPv4
+packets to a bsdrX host running
+.BR "bsdr_agent \-\-sniff\-remote" .
+bsdrX then decodes them through its normal owner-mic path, exposing the
+.B BSDR-Quest-OwnerMic
+virtual microphone and feeding voice computer-control. Because it captures the headset's own
+uplink, the result is the owner's voice only \(em no room mixing, no MITM, no monitor mode.
+.PP
+The binary is fully static (bundled libpcap), so it can be copied straight onto a router. Prebuilt
+binaries for common router and PC architectures ship in
+.B bsdrX_relay.zip
+(see
+.BR distribute.sh );
+an OpenWRT package recipe is in
+.BR openwrt/bsdr-micrelay/ .
+.SH OPTIONS
+.TP
+.BI \-\-iface " IF"
+Capture interface \(em the router LAN/bridge the headset is on (for example
+.BR br-lan ).
+.TP
+.BI \-\-quest " HEADSET-IP"
+The headset's IPv4 address. Only packets from this source are forwarded.
+.TP
+.BI \-\-to " HOST:PORT"
+The bsdrX host and the UDP port it listens on
+.RB ( "bsdr_agent \-\-sniff\-remote PORT" ).
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.SH REQUIREMENTS
+Raw packet capture needs root or the
+.B CAP_NET_RAW
+capability on the router. libpcap is statically linked into the prebuilt binaries; when building
+from source it is the only dependency.
+.SH EXAMPLES
+.TP
+On the router (headset at 192.168.1.50, bsdrX host at 192.168.1.10, port 45099):
+.B bsdr_micrelay \-\-iface br\-lan \-\-quest 192.168.1.50 \-\-to 192.168.1.10:45099
+.TP
+On the bsdrX host:
+.B bsdr_agent \-\-sniff\-remote 45099
+.SH SEE ALSO
+.BR bsdr_agent (1).
+.SH AUTHOR
+Stefy Lanza <stefy@nexlab.net>.
+.SH COPYRIGHT
+Copyright (C) 2026 Stefy Lanza. GNU General Public License v3 or later.

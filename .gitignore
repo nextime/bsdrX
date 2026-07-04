@@ -1,0 +1,41 @@
+/build/
+/build-*/
+*.o
+*.a
+/config.mk
+# runtime log (agent --debug output; not a source artifact)
+/debug.log
+/quest_sim_*.h264
+/quest_sim_*.bin
+# packaging build artifacts (keep the recipes, drop the outputs)
+/dist/
+/installer/stage/
+/installer/vendor/
+/installer/*.exe
+/packaging/*.deb
+/packaging/bsdrx_*_*/
+/.claude/
+# Android build artifacts (keep the sources/recipes, drop outputs)
+/android/deps/
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/app/.cxx/
+/android/local.properties
+/android/captures/
+/android/.idea/
+
+# prepared test APKs
+*.apk
+
+# macOS cross-build deps (keep the recipe, drop the output)
+/osx-deps/
+/.relaycache/
+/relay-build.log
+__pycache__/
+
+# packet captures / logs — RE artifacts, never committed (large + live-session data)
+*.pcap
+*.pcapng
+*.log
+/.gh-publish/

@@ -1,0 +1,266 @@
+.\" Man page for bsdrX (bsdr_agent). Format: man(7) / groff.
+.TH BSDR_AGENT 1 "2026-07-04" "bsdrX" "User Commands"
+.SH NAME
+bsdr_agent \- Bigscreen Remote Desktop host agent (stream a Linux/macOS desktop to a Bigscreen VR headset)
+.SH SYNOPSIS
+.B bsdr_agent
+.RI [ options ]
+.SH DESCRIPTION
+.B bsdr_agent
+is the PC host side of the Bigscreen Remote Desktop protocol. It streams this
+machine's desktop (H.264 video, Opus audio) to a paired Bigscreen VR headset over
+the LAN using the reverse-engineered Bigscreen wire format, injects the headset's
+mouse/keyboard into the local desktop, and optionally relays the session to the
+Bigscreen cloud room ("internet sharing").
+.PP
+Pairing is automatic: the headset discovers this PC on the LAN; the pairing code is
+shown at startup and broadcast in discovery. A local web control panel (default
+http://127.0.0.1:8088) drives the session, the owner-mic sniffer, and voice
+computer control.
+.PP
+The agent runs on Linux (full: capture, audio, sniffer, computer control) and
+macOS (audio + owner-mic sniffer; see
+.BR docs/macos.md ).
+.SH OPTIONS
+.SS Source (what to stream)
+.TP
+.BI \-\-file " PATH"
+Stream a video source instead of the live desktop. The source is decoded and re-encoded so an in-VR
+media bar (play/pause, seek, volume, exit) is composited onto it, and its own audio is streamed.
+\fIPATH\fR may be a local file or an \fBhttp\fR, \fBhttps\fR or \fBrtsp\fR URL. If \fIPATH\fR ends
+in \fB.txt\fR it is treated as a playlist (one file or URL per line; blank lines and #comments
+skipped; only http/https/rtsp URL schemes accepted, pipe/concat rejected) streamed in a loop. A
+single source loops at its end.
+.TP
+.B \-\-file\-gpu
+Encode the \fB\-\-file\fR stream on the GPU (NVENC) instead of libx264 (the default). libx264
+usually looks better at the low bitrates the headset requests; use this to offload the CPU.
+.TP
+.B \-\-no\-video
+Don't stream video (input/control only).
+.TP
+.B \-\-no\-audio
+Don't stream desktop audio or expose the headset mic.
+.SS 2D-to-3D (side-by-side)
+Convert the stream to side-by-side stereo in real time. The Bigscreen remote screen can display an
+SBS frame in 3D \(em set your screen to SBS 3D in the headset to view it. This runs on the CPU
+NV12 frame, so enabling it forces the CPU-scale encode path (no VAAPI/CUDA/kmsgrab).
+.TP
+.BI \-\-threed " MODE"
+\fBoff\fR (default), \fBfast\fR, or \fBai\fR. \fBfast\fR is a light built-in depth heuristic
+(vertical gradient + luma) that runs comfortably on old laptops. \fBai\fR uses the external depth
+helper from \fB\-\-threed\-ai\fR at a reduced rate with temporal reuse; if the helper is missing,
+stalls, or dies, 3D falls back to \fBfast\fR automatically.
+.TP
+.BI \-\-threed\-deepness " N"
+Depth amount, 0\(en100 (default 35): the maximum eye disparity as a fraction of frame width.
+.TP
+.BI \-\-threed\-convergence " N"
+Screen-plane bias, \-50\(en50: moves the zero-parallax plane nearer/farther to tune comfort and
+reduce eye strain.
+.TP
+.B \-\-threed\-swap
+Swap the left/right eye halves (if the headset's SBS eye order is reversed).
+.TP
+.B \-\-threed\-full
+Full resolution per eye. By default 3D renders as a light half-SBS frame at the headset's requested
+resolution (each squished eye is half-width). This option instead renders the side-by-side frame at
+2x linear resolution while keeping the screen's aspect ratio, so each eye holds ~2x the detail \(em
+sharper, but ~4x the pixels (high CPU, and the encode bitrate is doubled to match, so it needs a
+strong PC and good Wi-Fi). The frame is NOT made wider (a 2x-wide frame would make the Quest's
+screen double-wide instead of 3D). Also toggleable in the web panel.
+.TP
+.BI \-\-threed\-ai " CMD"
+External depth-estimator command for \fBai\fR mode (implies \fB\-\-threed ai\fR). bsdrX pipes it a
+small grayscale frame and reads back a depth map, framed as the 8-byte header
+.RB ( BSDD ", " "u16 width, u16 height, little-endian" )
+followed by \fIwidth\fR\(mu\fIheight\fR gray bytes (input luma; output depth, 0=far..255=near), in
+each direction. The helper loops one reply per request, and is called at a reduced rate. A
+ready-to-use helper ships as
+.BR scripts/bsdr-depth-helper.py :
+real monocular depth with a MiDaS-small ONNX model (\fB\-\-model\fR), or a built-in focus/gradient
+heuristic if no model is given, e.g.
+.RB ( "python3 scripts/bsdr-depth-helper.py --model midas_v21_small.onnx" ).
+Without a command \(em or if the helper stalls or dies \(em 3D falls back to \fBfast\fR. All 3D
+options are also settable live from the web panel.
+.SS Headset
+.TP
+.BI \-\-quest_ip " IP"
+Only pair with this headset; ignore all others.
+.TP
+.B \-\-control\-only
+Run discovery + control + web UI, but never stream.
+.SS Owner mic (intercept the headset owner's voice)
+The remote-desktop protocol has no mic-upload channel; the owner's voice only goes
+to the Bigscreen room (cloud) as plain Opus RTP. These options intercept that
+stream off the LAN and expose it as the virtual microphone
+.B BSDR-Quest-OwnerMic .
+.TP
+.B \-\-sniff\-mic
+Passively sniff the owner's room mic and expose it as the owner-only virtual mic.
+Uses \fB\-\-quest_ip\fR if set, else the paired headset. The privileged capture runs
+in a helper started via sudo; it can also be toggled from the web panel.
+.TP
+.B \-\-sniff\-mitm
+Also ARP-spoof the headset\(<->gateway path so a switched LAN routes the traffic
+through this host (toggles IP forwarding; heals ARP on exit). Implies \fB\-\-sniff\-mic\fR.
+Supported on Linux, macOS, and Windows. On Windows it runs in-process (needs Npcap and
+Administrator); IP forwarding is toggled via EnableRouter and neighbour MACs via SendARP.
+.TP
+.BI \-\-sniff\-iface " IF"
+Capture interface (default: the default-route interface).
+.TP
+.BI \-\-sniff\-gw " IP"
+Gateway IP for \fB\-\-sniff\-mitm\fR (default: the default-route gateway).
+.TP
+.BI \-\-sniff\-remote " PORT"
+Receive the owner mic from the router companion
+.BR bsdr_micrelay (1)
+on this UDP port instead of capturing locally. The router is already in the path for the headset's
+traffic, so this works over Wi-Fi with no ARP-spoofing or monitor mode and no root on this host.
+It captures the headset's own uplink, so the result is owner-only. Run on the router:
+.B bsdr_micrelay \-\-iface br\-lan \-\-quest <headset\-ip> \-\-to <this\-host>:PORT .
+Implies \fB\-\-sniff\-mic\fR.
+.SS Voice computer control
+See
+.BR docs/computer-control.md .
+A movable balloon is drawn over the desktop in VR; click it to speak a command,
+which is transcribed (STT) and run by an LLM through a desktop tool set
+(type_text, key, click, scroll, open_app). Endpoints are configured in the web
+panel; computer control can be enabled only while the owner mic is running.
+.TP
+.B \-\-compctl
+Arm voice-driven desktop control (the in-VR balloon). Requires an owner-mic source \(em the LAN
+sniffer (\fB\-\-sniff\-mic\fR/\fB\-\-sniff\-mitm\fR), the router companion (\fB\-\-sniff\-remote\fR),
+or the cloud-room fallback enabled in the web panel (which isolates the owner by ducking other
+room voices while a command is spoken) \(em and an LLM endpoint set in the web panel.
+Speech-to-text falls back to a free, keyless online service if none is configured.
+Also toggleable from the web panel.
+.TP
+.B \-\-compctl\-vision
+Also offer the model a take_screenshot tool so a vision-capable model can look at
+the desktop when a request needs it. Implies \fB\-\-compctl\fR.
+.TP
+.BI \-\-listen\-max " SEC"
+Listening ceiling per command (default 300 = 5 minutes; silence ends a capture
+sooner).
+.TP
+.BI \-\-confirm\-timeout " SEC"
+Auto-cancel the in-VR Send/Cancel prompt after this long (default 60).
+.SS Web control panel
+.TP
+.BI \-\-ui\-port " N"
+Port for the local control panel (default 8088).
+.TP
+.B \-\-no\-ui
+Disable the web control panel.
+.TP
+.B \-\-no\-browser
+Don't auto-open the panel in a browser at startup.
+.SS Internet sharing (cloud relay)
+.TP
+.B \-\-no\-cloud\-video
+Don't relay video to the room (default: on).
+.TP
+.B \-\-no\-cloud\-audio
+Don't relay desktop audio to the room (default: on).
+.TP
+.B \-\-video\-decoupled
+Relay runs its own capture+encoder instead of reusing the LAN encode.
+.TP
+.BI \-\-cloud\-data " MODE"
+Data channel transport: \fBraw\fR (SCTP-over-UDP) or \fBdtls\fR (auto if unset).
+.TP
+.BI \-\-cloud\-dtls\-role " ROLE"
+DTLS role for the data channel: \fBclient\fR, \fBserver\fR, or auto if unset.
+.TP
+.BI \-\-cloud\-latch\-burst " N"
+Number of valid-RTP comedia keepalives sent on each share start to (re)latch the
+Mediasoup relay onto this host's source tuple (default 12; 3 = the previous
+behaviour, 0 = off). Sent again on every off/on toggle, so it doubles as a re-latch.
+.TP
+.BI \-\-cloud\-src\-port " N"
+Hard-pin the cloud media source ports: video = \fIN\fR, audio = \fIN\fR+1,
+data = \fIN\fR+2 (0 = off). Overrides sticky ports. The Mediasoup relay
+comedia-latches each transport onto the source tuple it first sees and will not
+re-latch while the screen is presenting, so reusing the same ports keeps the
+latch valid across toggles.
+.TP
+.B \-\-cloud\-no\-sticky\-ports
+Disable sticky source ports. By DEFAULT bsdrX lets the OS pick ephemeral source
+ports on the first stream to a relay IP (like the official client), then reuses
+those exact ports for that relay across share off/on toggles so the relay's
+comedia latch keeps matching; a new relay IP or a process restart starts fresh.
+This flag reverts to a fresh ephemeral port on every toggle (the old behaviour
+that made the relay go silent after a restart).
+.SS Performance
+.TP
+.B \-\-cpu
+Force the full software path: CPU scale/convert AND libx264 encode. NVENC is less bit-efficient
+than x264 at the low bitrates the headset requests, so this is the best-quality desktop option
+(at a CPU cost). Default: try the CUDA GPU pipeline (NVENC, 2-pass, high quality preset).
+.TP
+.B \-\-lan\-1x
+Send LAN video once instead of twice \(em halves the uplink on weak Wi-Fi.
+.TP
+.B \-\-vaapi
+Encode on the iGPU via VAAPI instead of NVENC.
+.TP
+.B \-\-kmsgrab
+Capture via DRM/KMS instead of x11grab (zero-copy with \fB\-\-vaapi\fR). Note: the
+computer-control balloon is not composited on this zero-copy path.
+.TP
+.B \-\-sendmmsg
+Batch each NAL's UDP fragments into one syscall.
+.TP
+.BI \-\-max\-bitrate " BPS"
+Hard cap the encode bitrate, overriding the headset.
+.SS Diagnostics
+.TP
+.BI \-\-replay " FILE"
+Replay captured 45002 frames verbatim (protocol testing).
+.TP
+.BR \-v ", " \-\-debug
+Verbose/debug logging.
+.TP
+.B \-\-insecure\-tls
+Skip TLS certificate verification on the Bigscreen cloud/API connections (default: verify against
+the system trust store). For self-signed dev proxies or offline testing only \(em otherwise it
+exposes the account login to man-in-the-middle.
+.TP
+.B \-\-help
+Show usage and exit.
+.SH EXAMPLES
+.TP
+Stream the desktop to any headset that pairs, with the web panel on the default port:
+.B bsdr_agent
+.TP
+Intercept the owner's voice into a virtual mic on a switched LAN:
+.B bsdr_agent \-\-sniff\-mitm
+.TP
+Voice-driven computer control with on-demand vision (set the LLM endpoint in the panel):
+.B bsdr_agent \-\-sniff\-mic \-\-compctl\-vision
+.SH FILES
+.TP
+.B BSDR-Quest-OwnerMic
+Virtual microphone carrying only the headset owner's voice (created by the sniffer).
+.TP
+.B ~/  (web panel)
+http://127.0.0.1:8088 by default \(em Bigscreen login, source picker (file browser, http/https/rtsp
+URLs, .txt playlists), 2D-to-3D mode with deepness/convergence calibration, owner mic (incl. the
+cloud-room fallback and the router companion for Wi-Fi), computer control, internet sharing, and the
+privacy screen-blank toggle.
+.SH NETWORK PORTS
+Discovery UDP 45000, HTTP control 45678, video UDP 45002, audio UDP 45003, DTLS
+input UDP 45004, web panel TCP 8088 (default).
+.SH SEE ALSO
+.BR bsdr_micrelay (1).
+Project documentation:
+.BR README.md ", " docs/computer-control.md ", " docs/macos.md ", " docs/capture-cloud-session.md .
+.SH AUTHOR
+Stefy Lanza <stefy@nexlab.net>.
+.SH COPYRIGHT
+Copyright (C) 2026 Stefy Lanza. GNU General Public License v3 or later.
+.SH BUGS
+After a Bigscreen game update, IL2CPP names/offsets may shift; re-run the protocol
+dump. Report issues to the project tracker.

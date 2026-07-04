@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">bsdrX</string>
+    <string name="cast_start">Start casting to headset</string>
+    <string name="cast_stop">Stop casting</string>
+    <string name="minimize">Minimize to balloon</string>
+    <string name="stream_file">Stream a video file</string>
+    <string name="grant_overlay">Allow the floating control balloon</string>
+    <string name="grant_accessibility">Enable input control (Accessibility)</string>
+    <string name="pairing_code">Pairing code: %1$s</string>
+    <string name="notif_title">bsdrX is casting</string>
+    <string name="notif_text">Streaming this screen to your headset</string>
+    <string name="accessibility_desc">Lets the headset move, tap, scroll and type on this device while casting.</string>
+</resources>

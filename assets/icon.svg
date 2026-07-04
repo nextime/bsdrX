@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b6cff"/>
+      <stop offset="1" stop-color="#1641b6"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+  <!-- monitor / remote screen -->
+  <rect x="56" y="72" width="144" height="92" rx="12" fill="#ffffff"/>
+  <rect x="70" y="86" width="116" height="64" rx="6" fill="#1641b6"/>
+  <!-- cast / stream glyph -->
+  <path d="M86 134 a0 0 0 0 0 0 0" fill="none"/>
+  <circle cx="92" cy="138" r="6" fill="#7fd1ff"/>
+  <path d="M86 122 a16 16 0 0 1 16 16" fill="none" stroke="#7fd1ff" stroke-width="6" stroke-linecap="round"/>
+  <path d="M86 108 a30 30 0 0 1 30 30" fill="none" stroke="#7fd1ff" stroke-width="6" stroke-linecap="round"/>
+  <!-- stand -->
+  <rect x="116" y="164" width="24" height="16" fill="#ffffff"/>
+  <rect x="96" y="180" width="64" height="10" rx="5" fill="#ffffff"/>
+  <!-- BSRD wordmark -->
+  <text x="128" y="222" font-family="DejaVu Sans, Arial, sans-serif" font-size="30" font-weight="700"
+        fill="#ffffff" text-anchor="middle" letter-spacing="2">BSRD</text>
+</svg>
