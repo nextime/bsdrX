@@ -51,6 +51,7 @@
 #include "bsdr/depth.h"
 #include "bsdr/model_store.h"
 #include "bsdr/faceswap.h"
+#include "bsdr/micsub.h"
 #include "bsdr/voice.h"
 #if defined(BSDR_PLATFORM_ANDROID)
 #include "bsdr_android.h"          /* device-mic voice bridge (no sniffer on Android) */
@@ -1113,6 +1114,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
 #if !defined(BSDR_PLATFORM_ANDROID)
     bsdr_thread *mic_thr = NULL;               /* local-mic owner source */
     struct local_mic_ctx mic_ctx = { NULL, 0 };
+    bsdr_micsub *micsub = NULL;                /* owner-mic cloud substitution (MITM/NFQUEUE) */
 #endif
     /* CLI flags seed the desired state; the web UI can flip it live (with a sudo password). */
     if (opt->sniff_mic) { want_sniff = true; want_mitm = opt->sniff_mitm; }
@@ -1249,10 +1251,12 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                                if (a.remote_ip[0]) snprintf(sip, sizeof sip, "%s", a.remote_ip);
                                bsdr_mutex_unlock(a.lock); }
                 if (sip[0]) {
+                    int relay = bsdr_app_get_relay_port(&app);   /* web-UI relay port (Android's only path) */
+                    if (relay <= 0) relay = opt->sniff_remote_port;
                     bsdr_micsniff_cfg sc = { .quest_ip = sip, .iface = opt->sniff_iface,
                                              .gateway_ip = opt->sniff_gw, .mitm = want_mitm,
                                              .password = have_pw ? sniff_pw : NULL,
-                                             .remote_port = opt->sniff_remote_port };
+                                             .remote_port = relay };
                     sniffer = bsdr_micsniff_start(&sc);
                     memset(sniff_pw, 0, sizeof sniff_pw); have_pw = false;   /* one-shot */
                     if (sniffer) bsdr_app_set_sniff_status(&app, true,
@@ -1262,10 +1266,27 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                 }
             }
             /* realtime voice change on the owner mic (gender + effects from the web UI) */
-            if (sniffer) {
-                int vg=0, vr=0, ve=0, vw=0;
-                bsdr_app_get_voicefx(&app, &vg, &vr, &ve, &vw, NULL);
-                bsdr_micsniff_set_voicefx(sniffer, vg, vr, ve, vw);
+            {
+                int vg=0, vr=0, ve=0, vw=0; bool vsub=false;
+                bsdr_app_get_voicefx(&app, &vg, &vr, &ve, &vw, &vsub);
+                if (sniffer) bsdr_micsniff_set_voicefx(sniffer, vg, vr, ve, vw);
+#if !defined(BSDR_PLATFORM_ANDROID)
+                /* Cloud SUBSTITUTION: rewrite the Quest->cloud owner-mic packets in flight so the room
+                 * hears the changed voice. Only possible when we're the MITM (the flow transits us). */
+                int can_sub = sniffer && vsub && bsdr_micsniff_is_mitm(sniffer);
+                if (can_sub && !micsub) {
+                    char qip[64] = "";
+                    bsdr_mutex_lock(a.lock); snprintf(qip, sizeof qip, "%s", a.remote_ip); bsdr_mutex_unlock(a.lock);
+                    if (!qip[0] && quest_ip) snprintf(qip, sizeof qip, "%s", quest_ip);
+                    if (qip[0]) {
+                        micsub = bsdr_micsub_start(qip, 4787);
+                        if (!micsub) bsdr_app_set_sniff_status(&app, true, "active — substitution unavailable (need root/libnetfilter_queue)");
+                    }
+                } else if (!can_sub && micsub) {
+                    bsdr_micsub_stop(micsub); micsub = NULL;
+                }
+                if (micsub) bsdr_micsub_set_voicefx(micsub, vg, vr, ve, vw);
+#endif
             }
         }
         /* --- computer-control reconcile (gated on the owner mic + an LLM endpoint) --- */
@@ -1319,9 +1340,15 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                              COMPCTL_SYSTEM_PROMPT, cc_vision ? COMPCTL_VISION_NOTE : "");
                     bsdr_voice_update_config(a.voice, &vc);
 #if defined(BSDR_PLATFORM_ANDROID)
-                    bsdr_android_set_voice(a.voice);               /* device-mic PCM + bubble taps route here */
+                    if (sniffer) {   /* owner mic via the router companion relay (+ voice FX) */
+                        bsdr_micsniff_set_pcm_sink(sniffer, voice_pcm_sink, a.voice);
+                        bsdr_android_set_voice(NULL);              /* relay is the source, not the device mic */
+                    } else {
+                        bsdr_android_set_voice(a.voice);           /* device-mic PCM + bubble taps route here */
+                    }
                     if (cc_active_prev != 1) { bsdr_android_emit_compctl_active(1); cc_active_prev = 1; }
-                    bsdr_app_set_compctl_status(&app, true, "armed — tap the voice bubble to talk");
+                    bsdr_app_set_compctl_status(&app, true, sniffer ? "armed (relay owner mic) — tap the voice bubble"
+                                                                    : "armed — tap the voice bubble to talk");
 #else
                     if (sniffer) {                                 /* LAN sniffer / router companion */
                         bsdr_micsniff_set_pcm_sink(sniffer, voice_pcm_sink, a.voice);
@@ -1343,6 +1370,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
             } else {                                               /* disarm / not ready */
 #if defined(BSDR_PLATFORM_ANDROID)
                 bsdr_android_set_voice(NULL);
+                if (sniffer) bsdr_micsniff_set_pcm_sink(sniffer, NULL, NULL);
                 if (cc_active_prev != 0) { bsdr_android_emit_compctl_active(0); cc_active_prev = 0; }
                 if (cc_want && !have_llm)
                     bsdr_app_set_compctl_status(&app, false, "set an LLM endpoint first");
@@ -1399,6 +1427,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     if (sniffer) bsdr_micsniff_stop(sniffer);
 #if !defined(BSDR_PLATFORM_ANDROID)
     if (mic_thr) { mic_ctx.stop = 1; bsdr_thread_join(mic_thr); mic_thr = NULL; }
+    if (micsub) { bsdr_micsub_stop(micsub); micsub = NULL; }
 #endif
     teardown_session(&a);
     if (a.voice) bsdr_voice_free(a.voice);

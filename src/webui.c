@@ -23,6 +23,7 @@
 #include "bsdr/winlist.h"
 #include "bsdr/model_store.h"
 #include "bsdr/webcam.h"
+#include "bsdr/tls.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,6 +130,8 @@ static const char PAGE[] =
 "<input id=email class=grow placeholder='Bigscreen email'> "
 "<input id=pw class=grow type=password placeholder=password> "
 "<button class=p onclick=login()>Log in</button></div>"
+"<div id=loginform2 class=row><label style=width:auto;color:var(--muted)><input id=tlsinsecure type=checkbox style=width:auto onchange=tlsToggle()> "
+"Disable TLS certificate verification (insecure — only for a broken/MITM'd CA store)</label></div>"
 "<div id=cloudshare class=row style='margin-top:12px;display:none'>"
 "<span id=sharelbl class=grow>Internet sharing: off</span>"
 "<button id=sharebtn class=p onclick=toggleShare()>Share to Internet</button></div></div>"
@@ -147,6 +150,9 @@ static const char PAGE[] =
 "headset's traffic (be the gateway or a mirror port); <b>MITM</b> ARP-reroutes it through this PC "
 "on a switched LAN. Needs the root password (used once for a helper, never stored).</div>"
 "<div class=row><label style=width:auto><input id=snmitm type=checkbox style=width:auto> Use MITM (ARP)</label></div>"
+"<div class=row><label style=width:auto;color:var(--muted)>Router relay port</label>"
+"<input id=relayport type=number min=0 max=65535 placeholder='e.g. 45099 (bsdr_micrelay)' onchange=relayPortSet() style=width:12em>"
+"<span class=hint style=margin-left:8px>the router companion forwards the mic here — <b>required on Android</b> (no local sniff)</span></div>"
 "<div class=row><input id=snpw type=password class=grow placeholder='root (sudo) password — only if not already root'>"
 "<button id=snbtn class=p onclick=toggleSniff()>Start owner mic</button></div>"
 "<div class=hint><b>On Wi-Fi</b>, MITM can't work (the AP isolates stations). Run the "
@@ -172,9 +178,9 @@ static const char PAGE[] =
 "owner mic everywhere (virtual mic, computer-control, cloud).</div>"
 "<div class=row><label style=width:auto><input id=vsub type=checkbox style=width:auto onchange=voicefx()> "
 "Substitute into the cloud (MITM/relay): stop the headset&#8217;s original voice and inject the changed audio</label></div>"
-"<div class=hint>Requires <b>MITM</b> or the <b>router companion</b> active — that's the only way to "
-"replace the headset&#8594;cloud stream. Otherwise the change is still heard on the local virtual mic "
-"and the cloud-room fallback.</div></div></div>"
+"<div class=hint>Requires <b>MITM</b> active (we rewrite the headset&#8594;cloud packets in flight via "
+"NFQUEUE) and the agent running with <b>root / CAP_NET_ADMIN</b> on Linux. Otherwise the change is "
+"still heard on the local virtual mic and the cloud-room fallback.</div></div></div>"
 
 "<div class=card><h2>Source</h2>"
 "<div class=row>"
@@ -328,6 +334,7 @@ static const char PAGE[] =
 "<script>"
 "async function api(p,b){return fetch(p,{method:b?'POST':'GET',body:b?JSON.stringify(b):null}).then(r=>r.json().catch(()=>({})))}"
 "function login(){api('/api/login',{email:email.value,password:pw.value})}"
+"function tlsToggle(){api('/api/tls',{insecure:tlsinsecure.checked?1:0})}"
 "function logout(){api('/api/logout',{})}"
 "function sel(ip){api('/api/select',{ip:ip})}"
 "let cams=[],camMode='desktop';"
@@ -368,6 +375,7 @@ static const char PAGE[] =
 "function toggleShare(){api('/api/share',{toggle:true})}"
 "function toggleSniff(){let on=snbtn.dataset.on==='1';api('/api/sniff',{want:on?0:1,mitm:snmitm.checked?1:0,password:snpw.value}).then(()=>{snpw.value=''})}"
 "function voicefx(){api('/api/voicefx',{gender:+vgender.value,robot:+vrobot.value,echo:+vecho.value,whisper:+vwhisper.value,substitute:vsub.checked?1:0})}"
+"function relayPortSet(){api('/api/relayport',{port:+relayport.value})}"
 "function faceswap(){api('/api/faceswap',{on:fson.checked?1:0,tier:+fstier.value,source:fssrc.value})}"
 "function voicecfg(){api('/api/voice',{stt:se.value,sttModel:sm.value,sttToken:st.value,llm:le.value,llmModel:lm.value,llmToken:lt.value})}"
 "function toggleCompctl(){let on=ccbtn.dataset.on==='1';api('/api/compctl',{enable:on?0:1,vision:ccvis.checked?1:0})}"
@@ -389,10 +397,13 @@ static const char PAGE[] =
 "async function tick(){let s=await api('/api/status');"
 "cloud.innerHTML=dot(s.cloud.loggedIn)+'<span>'+(s.cloud.loggedIn?('Connected as '+s.cloud.name):('Not connected — '+s.cloud.msg))+'</span>'+(s.cloud.loggedIn?'<button onclick=logout() style=margin-left:auto>Log out</button>':'');"
 "loginform.style.display=s.cloud.loggedIn?'none':'flex';"
+"loginform2.style.display=s.cloud.loggedIn?'none':'flex';"
+"if(document.activeElement!==tlsinsecure)tlsinsecure.checked=!!s.tlsInsecure;"
 "cloudshare.style.display=s.cloud.loggedIn?'flex':'none';"
 "if(s.cloud.loggedIn){let sh=s.cloud.internetSharing;sharelbl.textContent='Internet sharing: '+(sh?'ON':'off');sharebtn.textContent=sh?'Stop sharing':'Share to Internet';sharebtn.className=sh?'danger':'p';}"
 "quest.innerHTML=dot(s.quest.paired)+'<span>'+(s.quest.paired?('Connected: '+s.quest.name+' ('+s.quest.ip+')'):'No headset connected')+'</span>'+(s.quest.streaming?'<span class=pill>streaming</span>':'')+(s.quest.paired?'<button class=danger style=margin-left:auto onclick=disconnect()>Disconnect</button>':'');"
 "if(s.sniff){let sn=s.sniff;sniff.innerHTML=dot(sn.active)+'<span>'+(sn.active?('On — '+(sn.msg||'active')):('Off'+(sn.msg?(' — '+sn.msg):'')))+'</span>';snbtn.dataset.on=sn.want?'1':'0';snbtn.textContent=sn.want?'Stop owner mic':'Start owner mic';snbtn.className=sn.want?'danger':'p';if(document.activeElement!==snmitm)snmitm.checked=sn.mitm;"
+"if(document.activeElement!==relayport&&sn.relayPort!==undefined)relayport.value=sn.relayPort||'';"
 "if(document.activeElement!==vgender&&sn.gender!==undefined){vgender.value=sn.gender;vgv.textContent=sn.gender;}"
 "if(document.activeElement!==vrobot&&sn.robot!==undefined){vrobot.value=sn.robot;vrv.textContent=sn.robot;}"
 "if(document.activeElement!==vecho&&sn.echo!==undefined){vecho.value=sn.echo;vev.textContent=sn.echo;}"
@@ -466,6 +477,10 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/logout") == 0) {
         bsdr_app_logout(a);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/tls") == 0) {
+        double insecure = 0; bsdr_json_get_double(body, "insecure", &insecure);
+        bsdr_tls_set_insecure(insecure != 0);   /* default verifies; toggle for a broken CA store */
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/blank") == 0) {
         double on = 0; bsdr_json_get_double(body, "on", &on);
@@ -553,6 +568,10 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         bsdr_json_get_double(body, "mitm", &mitm);
         bsdr_json_get_str(body, "password", pw, sizeof(pw));   /* transient; feeds `sudo -S` */
         bsdr_app_set_sniff(a, want != 0, mitm != 0, pw[0] ? pw : NULL);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/relayport") == 0) {
+        double port = 0; bsdr_json_get_double(body, "port", &port);
+        bsdr_app_set_relay_port(a, (int)port);   /* router-companion relay port (Android's owner-mic path) */
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/voicefx") == 0) {
         /* realtime owner-mic voice change: gender knob (-100..100) + substitute-to-cloud toggle */

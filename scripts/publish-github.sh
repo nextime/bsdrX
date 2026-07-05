@@ -31,9 +31,24 @@ echo ">> publishing origin @ $SRC to $GH_URL ($([ "$SQUASH" = 1 ] && echo single
 rm -rf "$WORK"; mkdir -p "$WORK"
 git -C "$WORK" init -q -b main
 git -C "$WORK" remote add github "$GH_URL"
+PREV_SRC=""                                    # origin SHA recorded in github's last snapshot
 if [ "$SQUASH" != 1 ]; then                    # rolling: start from github's current main, if any
-  if git -C "$WORK" fetch -q github main 2>/dev/null; then git -C "$WORK" reset -q --hard FETCH_HEAD; fi
+  if git -C "$WORK" fetch -q github main 2>/dev/null; then
+    git -C "$WORK" reset -q --hard FETCH_HEAD
+    # the previous snapshot's message ends with "origin <sha>"; pull it back out to diff against
+    PREV_SRC="$(git -C "$WORK" log -1 --format=%B 2>/dev/null \
+                | grep -oiE 'origin @?[[:space:]]*[0-9a-f]{7,40}' | grep -oiE '[0-9a-f]{7,40}' | head -1 || true)"
+  fi
 fi
+
+# Build a changelog = the origin commit subjects introduced since the last published snapshot
+# (falls back to the most recent commits when there's no prior snapshot to diff against).
+CHANGELOG=""
+if [ -n "$PREV_SRC" ] && git -C "$ROOT" cat-file -e "${PREV_SRC}^{commit}" 2>/dev/null; then
+  CHANGELOG="$(git -C "$ROOT" log --no-merges --reverse --format='- %s' "${PREV_SRC}..HEAD" 2>/dev/null || true)"
+fi
+[ -n "$CHANGELOG" ] || CHANGELOG="$(git -C "$ROOT" log --no-merges -15 --format='- %s' HEAD 2>/dev/null || true)"
+[ -n "$CHANGELOG" ] || CHANGELOG="- (no commit history available)"
 
 # 2. lay down the current tracked tree (HEAD), minus captures/logs
 find "$WORK" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
@@ -47,14 +62,21 @@ if [ -f "$CLOUD_H" ]; then
   [ -z "$leftover" ] || { echo "!! ABORT: API key not blanked (len ${#leftover})" >&2; exit 1; }
 fi
 
-# 4. commit + push
+# 4. commit + push (with a meaningful message summarising the changes in this snapshot)
 git -C "$WORK" add -A
 if git -C "$WORK" diff --cached --quiet; then echo ">> nothing new to publish"; exit 0; fi
+
 if [ "$SQUASH" = 1 ]; then
-  git -C "$WORK" -c user.name="$NAME" -c user.email="$MAIL" commit -q -m "bsdrX — public snapshot ($DATE, origin $SRC)"
-  git -C "$WORK" push -f github main
+  SUBJECT="bsdrX — public snapshot ($DATE)"
+  RANGE_NOTE="Recent changes:"
 else
-  git -C "$WORK" -c user.name="$NAME" -c user.email="$MAIL" commit -q -m "snapshot from origin @ $SRC ($DATE)"
-  git -C "$WORK" push github main
+  SUBJECT="bsdrX snapshot $DATE — $(echo "$CHANGELOG" | grep -c '^- ') change(s)"
+  RANGE_NOTE="$([ -n "$PREV_SRC" ] && echo "Changes since the last snapshot ($PREV_SRC):" || echo "Recent changes:")"
 fi
+
+# NB: the "origin <sha>" trailer is how the NEXT run finds this snapshot's baseline — keep it.
+MSG="$(printf '%s\n\n%s\n%s\n\norigin %s\n' "$SUBJECT" "$RANGE_NOTE" "$CHANGELOG" "$SRC")"
+
+git -C "$WORK" -c user.name="$NAME" -c user.email="$MAIL" commit -q -m "$MSG"
+if [ "$SQUASH" = 1 ]; then git -C "$WORK" push -f github main; else git -C "$WORK" push github main; fi
 echo ">> done."

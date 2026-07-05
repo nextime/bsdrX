@@ -26,7 +26,7 @@
 #include "bsdr/micsniff.h"
 #include "bsdr/log.h"
 
-#if (defined(__linux__) || defined(__APPLE__) || defined(_WIN32)) && defined(BSDR_HAVE_AUDIO)
+#if (defined(__linux__) || defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)) && defined(BSDR_HAVE_AUDIO)
 
 #include "bsdr/audio.h"
 #include "bsdr/voicefx.h"
@@ -39,10 +39,20 @@
 #include <stdint.h>
 #include <opus/opus.h>
 
-#if defined(__linux__) || defined(__APPLE__)
+#if (defined(__linux__) && !defined(__ANDROID__)) || defined(__APPLE__)
 #define POSIX_HELPER 1
 #else
 #define POSIX_HELPER 0
+#endif
+
+#if defined(__ANDROID__)
+/* Android: relay-only owner mic (no local capture). The shared handle_ip below uses BSD sockets +
+ * inet_ntoa, so pull those in (the POSIX_HELPER include block that normally provides them is off). */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <poll.h>
 #endif
 
 #if POSIX_HELPER
@@ -718,6 +728,22 @@ static void stop_capture(struct bsdr_micsniff *s) {
 
 /* ============================================================ public API (all) */
 
+#if defined(__ANDROID__)
+/* Android has no local capture; the router companion (bsdr_micrelay) forwards the Quest's owner-mic
+ * packets over UDP. Receive + run the SAME decode + voice-changer path (handle_ip) as desktop. */
+static void android_relay_main(void *arg) {
+    struct bsdr_micsniff *s = (struct bsdr_micsniff *)arg;
+    unsigned char buf[2048];
+    while (!s->stop) {
+        struct pollfd pfd = { .fd = s->data_fd, .events = POLLIN, .revents = 0 };
+        if (poll(&pfd, 1, 300) <= 0) continue;
+        ssize_t n = recv(s->data_fd, buf, sizeof buf, 0);
+        if (n <= 0) { if (n < 0) break; continue; }
+        handle_ip(s, buf, (int)n);
+    }
+}
+#endif
+
 bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) {
     if (!cfg || !cfg->quest_ip || !cfg->quest_ip[0]) {
         BSDR_WARN("bsdr.micsniff", "no quest_ip given; owner-mic sniffer disabled");
@@ -734,6 +760,24 @@ bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) {
     if (s->quest_be == INADDR_NONE) { BSDR_ERROR("bsdr.micsniff", "bad quest_ip %s", cfg->quest_ip); free(s); return NULL; }
     if (cfg->iface && cfg->iface[0]) snprintf(s->iface, sizeof s->iface, "%s", cfg->iface);
     if (cfg->gateway_ip && cfg->gateway_ip[0]) snprintf(s->gw_ip, sizeof s->gw_ip, "%s", cfg->gateway_ip);
+#if defined(__ANDROID__)
+    /* Android: relay-only — no local capture, no virtual mic. Bind the relay UDP port, decode +
+     * apply voice FX (handle_ip), feed the pcm tap. */
+    if (s->remote_port <= 0) { BSDR_WARN("bsdr.micsniff", "Android owner mic needs the router companion — set the relay port"); free(s); return NULL; }
+    { int err = 0; s->dec = opus_decoder_create(48000, 1, &err);
+      if (!s->dec || err != OPUS_OK) { free(s); return NULL; } }
+    { int fd = socket(AF_INET, SOCK_DGRAM, 0);
+      if (fd < 0) goto fail;
+      int one = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+      struct sockaddr_in aa; memset(&aa, 0, sizeof aa);
+      aa.sin_family = AF_INET; aa.sin_addr.s_addr = htonl(INADDR_ANY); aa.sin_port = htons((uint16_t)s->remote_port);
+      if (bind(fd, (struct sockaddr *)&aa, sizeof aa) != 0) { BSDR_ERROR("bsdr.micsniff", "relay: bind udp %d failed", s->remote_port); close(fd); goto fail; }
+      s->data_fd = fd; }
+    s->thr = bsdr_thread_start(android_relay_main, s);
+    if (!s->thr) { BSDR_ERROR("bsdr.micsniff", "relay thread start failed"); goto fail; }
+    BSDR_INFO("bsdr.micsniff", "Android owner mic: relay on udp %d (quest %s)", s->remote_port, s->quest_ip);
+    return s;
+#else
 #if POSIX_HELPER
     if (s->remote_port <= 0) default_route(s->iface, sizeof s->iface, s->gw_ip, sizeof s->gw_ip);
 #endif
@@ -749,6 +793,7 @@ bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) {
     s->thr = bsdr_thread_start(sniff_main, s);
     if (!s->thr) { BSDR_ERROR("bsdr.micsniff", "sniffer thread start failed"); goto fail; }
     return s;
+#endif
 fail:
     bsdr_micsniff_stop(s);
     return NULL;
@@ -772,29 +817,27 @@ void bsdr_micsniff_stop(bsdr_micsniff *s) {
     if (!s) return;
     s->stop = 1;
     if (s->thr) { bsdr_thread_join(s->thr); s->thr = NULL; }
+#if defined(__ANDROID__)
+    if (s->data_fd >= 0) { close(s->data_fd); s->data_fd = -1; }
+#else
     stop_capture(s);
     if (s->player) { bsdr_audio_player_free(s->player); s->player = NULL; }
+#endif
     if (s->dec) { opus_decoder_destroy(s->dec); s->dec = NULL; }
     if (s->fx) { bsdr_voicefx_free(s->fx); s->fx = NULL; }
+#if !defined(__ANDROID__)
     if (s->sink_mod >= 0 || s->src_mod >= 0) bsdr_virtual_mic_destroy(s->sink_mod, s->src_mod);
+#endif
     free(s);
 }
 
-#else  /* platform without a sniffer (e.g. Android, or no audio) */
+#else  /* no audio backend: the owner mic is unavailable */
 
-bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) {
-    (void)cfg;
-    BSDR_WARN("bsdr.micsniff", "owner-mic sniffer unavailable on this platform/build");
-    return NULL;
-}
+bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) { (void)cfg; return NULL; }
 void bsdr_micsniff_stop(bsdr_micsniff *s) { (void)s; }
 bool bsdr_micsniff_is_mitm(const bsdr_micsniff *s) { (void)s; return false; }
-void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void *user) {
-    (void)s; (void)cb; (void)user;
-}
-void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int gender, int robot, int echo, int whisper) {
-    (void)s; (void)gender; (void)robot; (void)echo; (void)whisper;
-}
+void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void *user) { (void)s; (void)cb; (void)user; }
+void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int g, int r, int e, int w) { (void)s; (void)g; (void)r; (void)e; (void)w; }
 int bsdr_micsniff_helper_main(int argc, char **argv) { (void)argc; (void)argv; return 1; }
 
 #endif

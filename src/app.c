@@ -20,6 +20,7 @@
 #include "bsdr/json.h"
 #include "bsdr/log.h"
 #include "bsdr/model_store.h"
+#include "bsdr/tls.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -339,6 +340,18 @@ void bsdr_app_set_owner_mic_local(bsdr_app *a, bool on) {
     bsdr_mutex_lock(a->lock);
     a->owner_mic_local = on;
     bsdr_mutex_unlock(a->lock);
+}
+
+void bsdr_app_set_relay_port(bsdr_app *a, int port) {
+    bsdr_mutex_lock(a->lock);
+    a->sniff_remote_port = (port > 0 && port < 65536) ? port : 0;
+    bsdr_mutex_unlock(a->lock);
+}
+int bsdr_app_get_relay_port(bsdr_app *a) {
+    bsdr_mutex_lock(a->lock);
+    int p = a->sniff_remote_port;
+    bsdr_mutex_unlock(a->lock);
+    return p;
 }
 
 static int clamp100(int v, int lo) { if (v < lo) return lo; if (v > 100) return 100; return v; }
@@ -795,13 +808,13 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         "\"internetSharing\":%s},"
         "\"quest\":{\"paired\":%s,\"name\":\"%s\",\"ip\":\"%s\",\"streaming\":%s,\"paused\":%s},"
         "\"source\":{\"mode\":\"%s\",\"path\":\"%s\",\"path2\":\"%s\",\"audio\":%s},"
-        "\"blank\":%s,\"cloudMic\":%s,\"ownerMicLocal\":%s,"
+        "\"blank\":%s,\"cloudMic\":%s,\"ownerMicLocal\":%s,\"tlsInsecure\":%s,"
         "\"threed\":{\"mode\":%d,\"deepness\":%d,\"convergence\":%d,\"swap\":%s,\"full\":%s,\"tier\":%d,\"ai\":\"%s\"},"
         "\"quality\":{\"w\":%d,\"h\":%d,\"bitrate\":%d},"
         "\"voice\":{\"stt\":\"%s\",\"sttModel\":\"%s\",\"sttToken\":%s,"
         "\"llm\":\"%s\",\"llmModel\":\"%s\",\"llmToken\":%s},"
         "\"sniff\":{\"want\":%s,\"mitm\":%s,\"active\":%s,\"msg\":\"%s\","
-        "\"gender\":%d,\"robot\":%d,\"echo\":%d,\"whisper\":%d,\"substitute\":%s},"
+        "\"gender\":%d,\"robot\":%d,\"echo\":%d,\"whisper\":%d,\"substitute\":%s,\"relayPort\":%d},"
         "\"compctl\":{\"want\":%s,\"vision\":%s,\"active\":%s,\"msg\":\"%s\"},"
         "\"android\":%s,\"selected\":\"%s\",\"quests\":[",
         a->cloud_logged_in ? "true" : "false", esc_email, esc_name, esc_msg,
@@ -810,7 +823,7 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         a->streaming ? "true" : "false", a->paused ? "true" : "false",
         a->source, a->source_path, a->source_path2, a->audio ? "true" : "false",
         a->blank_want ? "true" : "false", a->cloud_mic_fallback ? "true" : "false",
-        a->owner_mic_local ? "true" : "false",
+        a->owner_mic_local ? "true" : "false", bsdr_tls_is_insecure() ? "true" : "false",
         a->threed_mode, a->threed_deepness, a->threed_convergence,
         a->threed_swap ? "true" : "false", a->threed_full ? "true" : "false", a->threed_tier, esc_ai,
         a->res_w, a->res_h, a->bitrate,
@@ -819,7 +832,7 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         a->sniff_want ? "true" : "false", a->sniff_mitm ? "true" : "false",
         a->sniff_active ? "true" : "false", esc_sniff,
         a->voice_gender, a->voice_robot, a->voice_echo, a->voice_whisper,
-        a->voice_substitute ? "true" : "false",
+        a->voice_substitute ? "true" : "false", a->sniff_remote_port,
         a->compctl_want ? "true" : "false", a->compctl_vision ? "true" : "false",
         a->compctl_active ? "true" : "false", esc_cc,
 #if defined(BSDR_PLATFORM_ANDROID)

@@ -109,6 +109,14 @@ ifeq ($(UNAME_S),Linux)
   endif
 endif
 
+# owner-mic SUBSTITUTION (NFQUEUE payload rewrite) — Linux host only, when libnetfilter_queue is
+# present. Cross builds (windows/osx) override CFLAGS/LDLIBS and never see this -> micsub.c stub.
+HOST_NFQUEUE_OK := $(shell pkg-config --exists libnetfilter_queue 2>/dev/null && echo 1)
+ifeq ($(HOST_NFQUEUE_OK),1)
+  HOST_NFQUEUE_DEF  := -DBSDR_HAVE_NFQUEUE=1
+  HOST_NFQUEUE_LIBS := $(shell pkg-config --libs libnetfilter_queue)
+endif
+
 CC          ?= cc
 AR          ?= ar
 EXEEXT      ?=
@@ -117,9 +125,9 @@ INJECT_SRC  ?= $(HOST_INJECT)
 WINLIST_SRC ?= $(HOST_WINLIST)
 SCTP_SRC    ?=
 MEDIA_SRC   ?= $(HOST_MEDIA_SRC)
-CFLAGS      ?= $(BASE_CFLAGS) $(HOST_OSSL_CFLAGS) $(HOST_MEDIA_DEF) $(HOST_MEDIA_CFLAGS) $(HOST_ONNX_DEF)
+CFLAGS      ?= $(BASE_CFLAGS) $(HOST_OSSL_CFLAGS) $(HOST_MEDIA_DEF) $(HOST_MEDIA_CFLAGS) $(HOST_ONNX_DEF) $(HOST_NFQUEUE_DEF)
 LDFLAGS     ?=
-LDLIBS      ?= $(HOST_OSSL_LIBS) $(HOST_PLATLIBS) $(HOST_MEDIA_LIBS) $(HOST_ONNX_LIBS)
+LDLIBS      ?= $(HOST_OSSL_LIBS) $(HOST_PLATLIBS) $(HOST_MEDIA_LIBS) $(HOST_ONNX_LIBS) $(HOST_NFQUEUE_LIBS)
 BUILD_TESTS ?= yes
 prefix      ?= /usr/local
 bindir      ?= $(prefix)/bin
@@ -180,7 +188,7 @@ CORE_SRC := src/log.c src/net.c src/json.c src/input_decode.c \
             src/dtls.c src/cloud.c src/cloud_stream.c src/app.c src/webui.c \
             src/overlay.c src/httpc.c src/tls.c src/stt.c src/llm.c \
             src/compcontrol.c src/voice.c src/screenshot.c src/threed.c \
-            src/depth_onnx.c src/model_store.c src/webcam.c src/voicefx.c src/faceswap.c \
+            src/depth_onnx.c src/model_store.c src/webcam.c src/voicefx.c src/faceswap.c src/micsub.c \
             $(INJECT_SRC) $(WINLIST_SRC) $(SCTP_SRC) $(MEDIA_SRC)
 # miniz (vendored, third_party) backs model_store.c's zip import; built in every config.
 CORE_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(CORE_SRC)) $(BUILD)/miniz.o

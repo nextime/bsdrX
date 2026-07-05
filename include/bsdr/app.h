@@ -131,6 +131,7 @@ typedef struct bsdr_app {
     char sniff_password[128];     /* transient sudo password from the web UI (cleared after use) */
     bool sniff_active;            /* status: sniffer currently running */
     char sniff_msg[128];          /* status/error line for the web UI */
+    int  sniff_remote_port;       /* router-companion relay port (Android's only owner-mic path) */
     /* realtime voice change on the owner mic: gender -100..100 (0 = off); and, in MITM/relay mode,
      * substitute = stop the Quest->cloud voice and inject the changed audio in its place. */
     int  voice_gender;
@@ -178,6 +179,8 @@ void bsdr_app_get_threed(bsdr_app *a, int *mode, int *deepness, int *convergence
                          int *full, int *tier, char *ai_cmd, size_t ai_len);
 void bsdr_app_set_cloud_mic_fallback(bsdr_app *a, bool on);
 void bsdr_app_set_owner_mic_local(bsdr_app *a, bool on);
+void bsdr_app_set_relay_port(bsdr_app *a, int port);
+int  bsdr_app_get_relay_port(bsdr_app *a);
 /* owner-mic voice change: gender (-100..100), robot/echo/whisper (0..100) + substitute-to-cloud */
 void bsdr_app_set_voicefx(bsdr_app *a, int gender, int robot, int echo, int whisper, bool substitute);
 void bsdr_app_get_voicefx(bsdr_app *a, int *gender, int *robot, int *echo, int *whisper, bool *substitute);

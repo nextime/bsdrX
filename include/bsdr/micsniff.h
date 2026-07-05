@@ -71,9 +71,9 @@ typedef struct {
 /* The sniffer (micsniff.c) is only compiled in audio-enabled desktop builds. For
  * input-only configs (make linux-static, the plain `windows` target, any
  * --disable-audio build) AND on Android (no root -> no promiscuous capture, so
- * micsniff.c is deliberately left out of the NDK build) provide inert stubs so the
- * shared agent flow links; the owner mic is simply unavailable there. */
-#if defined(BSDR_HAVE_AUDIO) && !defined(BSDR_PLATFORM_ANDROID)
+ * shared agent flow links; the owner mic is simply unavailable there. Android has no local packet
+ * capture, but CAN receive the router-companion relay (remote_port) — so it gets the real API too. */
+#if defined(BSDR_HAVE_AUDIO)
 
 int bsdr_micsniff_helper_main(int argc, char **argv);
 
