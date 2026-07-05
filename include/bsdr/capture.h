@@ -40,6 +40,14 @@ typedef struct {
     const char *input_file;/* non-NULL: decode this file instead of grabbing the screen (re-encodes
                             * so an overlay can be composited). Forces the CPU scale path. */
     int loop;              /* file mode: seek back to 0 at EOF */
+    /* Webcam source: when non-NULL (and no input_file), capture a camera instead of the screen via
+     * the platform live-video input (Linux v4l2 "/dev/videoN", Windows dshow "video=Name", macOS
+     * avfoundation index/name). Forces the CPU scale path (same as file mode). */
+    const char *webcam;
+    /* Stereo 3D: a SECOND camera. When both webcam+webcam_right are set the two live feeds are
+     * composited side-by-side (real stereo, left=webcam right=webcam_right) — this bypasses the
+     * depth-based 2D->3D synth. threed_swap swaps the eyes; threed_full = full-res per eye. */
+    const char *webcam_right;
     /* 2D->3D side-by-side. When threed_mode != 0 the capture scales to a source NV12 buffer, then
      * synthesises the SBS frame the encoder gets. threed_full: 1 = full resolution per eye (the
      * encoded frame is twice as wide, each half a full-width eye); 0 = half-width squished eyes. */
@@ -48,6 +56,7 @@ typedef struct {
     int threed_convergence; /* -50..50 */
     int threed_swap;        /* swap L/R */
     int threed_full;        /* 1 = full-res per eye (2x width) */
+    int threed_tier;        /* AI in-process depth tier: 0 external/none, 1 cpu, 2 gpu, 3 hi */
     char threed_ai_cmd[256];/* AI-mode external depth helper command */
 } bsdr_capture_config;
 
@@ -56,6 +65,15 @@ bsdr_capture *bsdr_capture_open(const bsdr_capture_config *cfg);
 /* Composite this overlay onto each frame before encoding (NULL = none). */
 struct bsdr_overlay;
 void bsdr_capture_set_overlay(bsdr_capture *c, struct bsdr_overlay *ov);
+
+/* Run realtime face swap on each frame before encoding (NULL = none). The engine is owned by the
+ * caller (the agent); it's applied on the CPU encode path only, so enabling it forces CPU scale. */
+struct bsdr_faceswap;
+void bsdr_capture_set_faceswap(bsdr_capture *c, struct bsdr_faceswap *fs);
+
+/* Decode an image file (jpg/png/…) to a freshly malloc'd packed-RGB buffer (caller frees). Sets
+ * *w/*h. Returns 0 on success. Used to load the face-swap source image. */
+int bsdr_capture_decode_image_rgb(const char *path, uint8_t **rgb, int *w, int *h);
 
 /* Grab + encode one frame. On a produced access unit, sets *au (valid until the
  * next call), *len, and *rtp_ts (90 kHz). Returns 1 = frame, 0 = none yet,

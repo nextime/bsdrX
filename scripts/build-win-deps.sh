@@ -87,6 +87,20 @@ echo "== FFmpeg (prebuilt mingw, BtbN) =="
   cp "$D"/bin/*.dll "$PREFIX/bin/"
 }
 
+# onnxruntime (in-process depth; CPU/XNNPACK). mingw links onnxruntime.dll directly (-l:), and the
+# DLL ships in the installer. DirectML EP is opt-in (a DirectML-enabled ORT + DirectML.dll).
+ORT_VER=1.20.1
+[ -f "$PREFIX/lib/onnxruntime.dll" ] || {
+  curl -fsSL -o ort-win.zip \
+    "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VER/onnxruntime-win-x64-$ORT_VER.zip"
+  rm -rf ort-dl && mkdir ort-dl && unzip -q -o ort-win.zip -d ort-dl
+  D="$(echo ort-dl/*/)"
+  cp -r "$D"/include/* "$PREFIX/include/"
+  cp "$D"/lib/onnxruntime.dll "$PREFIX/lib/"
+  cp "$D"/lib/onnxruntime.dll "$PREFIX/bin/"
+  rm -f ort-win.zip
+}
+
 echo
 echo "Windows deps ready in: $PREFIX"
 echo "  static: $(cd "$PREFIX/lib" && echo *.a)"

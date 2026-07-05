@@ -39,3 +39,4 @@ __pycache__/
 *.pcapng
 *.log
 /.gh-publish/
+android/app/src/main/jniLibs/

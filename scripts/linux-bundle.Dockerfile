@@ -86,6 +86,14 @@ RUN set -eux; export PKG_CONFIG_PATH="$PFX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"; 
     make -j"$(nproc)" >/tmp/ffmpeg.log 2>&1 && make install >/dev/null 2>&1; \
     cd /tmp; rm -rf ffmpeg-6.1.2
 
+# ---- ONNX Runtime (in-process depth; CPU/XNNPACK). Shipped in the AppImage/.deb lib dir. ----
+RUN set -eux; cd /tmp; ORT_VER=1.20.1; \
+    curl -fsSL -o ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VER/onnxruntime-linux-x64-$ORT_VER.tgz"; \
+    tar xzf ort.tgz; D="onnxruntime-linux-x64-$ORT_VER"; \
+    cp -a "$D"/include/* "$PFX/include/"; \
+    cp -a "$D"/lib/libonnxruntime.so* "$PFX/lib/"; \
+    rm -rf ort.tgz "$D"
+
 # ---- AppImage tooling (FUSE-less: run with APPIMAGE_EXTRACT_AND_RUN=1) ----
 RUN set -eux; mkdir -p /opt/tools; cd /opt/tools; \
     curl -fsSL -o linuxdeploy-x86_64.AppImage \

@@ -222,7 +222,7 @@ static void cloud_video_main(void *arg) {
          * LAN headset does. The capture builds the transform from cfg.threed_*; it needs the CPU NV12
          * path. AI depth is downgraded to the fast heuristic here to avoid a second helper process. */
         int td_mode = 0, td_deep = 0, td_conv = 0, td_swap = 0, td_full = 0;
-        if (cs->app) bsdr_app_get_threed(cs->app, &td_mode, &td_deep, &td_conv, &td_swap, &td_full, NULL, 0);
+        if (cs->app) bsdr_app_get_threed(cs->app, &td_mode, &td_deep, &td_conv, &td_swap, &td_full, NULL, NULL, 0);
         if (td_mode != BSDR_3D_OFF) {
             cfg.cpu_only = 1; cfg.use_vaapi = 0; cfg.use_kmsgrab = 0;
             if (cs->app && cs->app->cpu_only) cfg.encoder = "libx264";

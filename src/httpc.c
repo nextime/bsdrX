@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #if !defined(_WIN32)
 #  include <netdb.h>   /* getaddrinfo */
 #endif
@@ -141,6 +142,114 @@ int bsdr_http_request(const char *method, const char *url,
     resp[total] = '\0';
     conn_close(&c);
     return (int)total;
+}
+
+/* ---- streaming download to file (redirects + chunked) ------------------------------------- */
+/* case-insensitive substring search (headers arrive in mixed case across CDNs) */
+static const char *ci_find(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == nl) return p;
+    }
+    return NULL;
+}
+/* buffered reader: drains leftover header-buffer bytes first, then the connection */
+typedef struct { conn_t *c; const char *lead; int lead_len, lead_pos; } rd_t;
+static int rd_read(rd_t *r, void *b, int n) {
+    if (r->lead_pos < r->lead_len) {
+        int a = r->lead_len - r->lead_pos; if (a > n) a = n;
+        memcpy(b, r->lead + r->lead_pos, (size_t)a); r->lead_pos += a; return a;
+    }
+    return conn_read(r->c, b, n);
+}
+static int rd_fill(rd_t *r, void *b, int n) {   /* read exactly n (or fewer at EOF) */
+    int got = 0; while (got < n) { int k = rd_read(r, (char *)b + got, n - got); if (k <= 0) break; got += k; }
+    return got;
+}
+static int rd_line(rd_t *r, char *out, int cap) {   /* read a CRLF line (out has no CRLF) */
+    int i = 0; char ch;
+    for (;;) { if (rd_read(r, &ch, 1) != 1) return -1; if (ch == '\n') break; if (ch != '\r' && i < cap - 1) out[i++] = ch; }
+    out[i] = 0; return i;
+}
+
+int bsdr_http_download(const char *url, const char *dest_path,
+                       void (*progress)(size_t done, size_t total)) {
+    char cur[2048]; snprintf(cur, sizeof cur, "%s", url);
+    for (int redir = 0; redir < 8; redir++) {
+        int https, port; char host[256], path[1536];
+        if (!parse_url(cur, &https, host, sizeof host, &port, path, sizeof path)) return -1;
+        conn_t c;
+        if (!conn_open(&c, https, host, port)) { BSDR_ERROR("bsdr.http", "connect %s failed", cur); conn_close(&c); return -1; }
+        char req[2048];
+        int n = snprintf(req, sizeof req,
+            "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: bsdrX\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            path, host);
+        if (conn_write(&c, req, n) <= 0) { conn_close(&c); return -1; }
+
+        /* read the header block into hbuf; keep any body bytes that came with it */
+        char hbuf[8192]; int hlen = 0; char *bstart = NULL; int bavail = 0;
+        while (hlen < (int)sizeof(hbuf) - 1) {
+            int r = conn_read(&c, hbuf + hlen, (int)sizeof(hbuf) - 1 - hlen);
+            if (r <= 0) break;
+            hlen += r; hbuf[hlen] = 0;
+            char *he = strstr(hbuf, "\r\n\r\n");
+            if (he) { bstart = he + 4; bavail = hlen - (int)(bstart - hbuf); break; }
+        }
+        if (!bstart) { conn_close(&c); return -1; }
+        int status = 0; { char *sp = strchr(hbuf, ' '); if (sp) status = atoi(sp + 1); }
+
+        if (status >= 300 && status < 400) {                 /* follow redirect */
+            const char *loc = ci_find(hbuf, "\nlocation:");
+            if (!loc) { conn_close(&c); return -1; }
+            loc += 10; while (*loc == ' ' || *loc == '\t') loc++;
+            int i = 0; while (loc[i] && loc[i] != '\r' && loc[i] != '\n' && i < (int)sizeof(cur) - 1) { cur[i] = loc[i]; i++; }
+            cur[i] = 0; conn_close(&c);
+            continue;
+        }
+        if (status != 200) { BSDR_WARN("bsdr.http", "download %s -> HTTP %d", cur, status); conn_close(&c); return -1; }
+
+        int chunked = ci_find(hbuf, "\ntransfer-encoding:") && ci_find(hbuf, "chunked") ? 1 : 0;
+        long clen = -1; { const char *cl = ci_find(hbuf, "\ncontent-length:"); if (cl) clen = atol(cl + 16); }
+
+        FILE *f = fopen(dest_path, "wb");
+        if (!f) { BSDR_ERROR("bsdr.http", "cannot write %s", dest_path); conn_close(&c); return -1; }
+        rd_t rd = { &c, bstart, bavail, 0 };
+        char buf[65536]; size_t done = 0; int ok = 1;
+
+        if (chunked) {
+            for (;;) {
+                char line[64]; if (rd_line(&rd, line, sizeof line) < 0) { ok = 0; break; }
+                long csz = strtol(line, NULL, 16); if (csz <= 0) break;
+                long left = csz;
+                while (left > 0) {
+                    int want = left > (long)sizeof buf ? (int)sizeof buf : (int)left;
+                    int got = rd_fill(&rd, buf, want); if (got <= 0) { ok = 0; break; }
+                    if (fwrite(buf, 1, (size_t)got, f) != (size_t)got) { ok = 0; break; }
+                    left -= got; done += (size_t)got; if (progress) progress(done, 0);
+                }
+                if (!ok) break;
+                char crlf[2]; rd_fill(&rd, crlf, 2);   /* trailing CRLF after the chunk */
+            }
+        } else {
+            for (;;) {
+                int want = (int)sizeof buf;
+                if (clen >= 0) { long rem = clen - (long)done; if (rem <= 0) break; if (rem < want) want = (int)rem; }
+                int got = rd_read(&rd, buf, want);
+                if (got <= 0) break;
+                if (fwrite(buf, 1, (size_t)got, f) != (size_t)got) { ok = 0; break; }
+                done += (size_t)got; if (progress) progress(done, clen > 0 ? (size_t)clen : 0);
+            }
+            if (clen >= 0 && (long)done < clen) ok = 0;   /* truncated */
+        }
+        fclose(f); conn_close(&c);
+        if (!ok) { remove(dest_path); return -1; }
+        BSDR_INFO("bsdr.http", "downloaded %s (%zu bytes)", dest_path, done);
+        return 0;
+    }
+    BSDR_WARN("bsdr.http", "too many redirects for %s", url);
+    return -1;
 }
 
 int bsdr_http_status(const char *resp) {

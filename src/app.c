@@ -19,6 +19,7 @@
 #include "bsdr/cloud_stream.h"
 #include "bsdr/json.h"
 #include "bsdr/log.h"
+#include "bsdr/model_store.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -298,29 +299,32 @@ void bsdr_app_set_blank(bsdr_app *a, bool on) {
 }
 
 void bsdr_app_set_threed(bsdr_app *a, int mode, int deepness, int convergence, int swap, int full,
-                         const char *ai_cmd) {
+                         int tier, const char *ai_cmd) {
     if (mode < 0) mode = 0; else if (mode > 2) mode = 2;
     if (deepness < 0) deepness = 0; else if (deepness > 100) deepness = 100;
     if (convergence < -50) convergence = -50; else if (convergence > 50) convergence = 50;
+    if (tier < 0) tier = 0; else if (tier > 3) tier = 3;
     bsdr_mutex_lock(a->lock);
     a->threed_mode = mode;
     a->threed_deepness = deepness;
     a->threed_convergence = convergence;
     a->threed_swap = swap ? 1 : 0;
     a->threed_full = full ? 1 : 0;
+    a->threed_tier = tier;
     if (ai_cmd) snprintf(a->threed_ai_cmd, sizeof(a->threed_ai_cmd), "%s", ai_cmd);
     a->threed_gen++;
     bsdr_mutex_unlock(a->lock);
 }
 
 void bsdr_app_get_threed(bsdr_app *a, int *mode, int *deepness, int *convergence, int *swap,
-                         int *full, char *ai_cmd, size_t ai_len) {
+                         int *full, int *tier, char *ai_cmd, size_t ai_len) {
     bsdr_mutex_lock(a->lock);
     if (mode) *mode = a->threed_mode;
     if (deepness) *deepness = a->threed_deepness;
     if (convergence) *convergence = a->threed_convergence;
     if (swap) *swap = a->threed_swap;
     if (full) *full = a->threed_full;
+    if (tier) *tier = a->threed_tier;
     if (ai_cmd && ai_len) snprintf(ai_cmd, ai_len, "%s", a->threed_ai_cmd);
     bsdr_mutex_unlock(a->lock);
 }
@@ -328,6 +332,57 @@ void bsdr_app_get_threed(bsdr_app *a, int *mode, int *deepness, int *convergence
 void bsdr_app_set_cloud_mic_fallback(bsdr_app *a, bool on) {
     bsdr_mutex_lock(a->lock);
     a->cloud_mic_fallback = on;
+    bsdr_mutex_unlock(a->lock);
+}
+
+void bsdr_app_set_owner_mic_local(bsdr_app *a, bool on) {
+    bsdr_mutex_lock(a->lock);
+    a->owner_mic_local = on;
+    bsdr_mutex_unlock(a->lock);
+}
+
+static int clamp100(int v, int lo) { if (v < lo) return lo; if (v > 100) return 100; return v; }
+
+void bsdr_app_set_voicefx(bsdr_app *a, int gender, int robot, int echo, int whisper, bool substitute) {
+    bsdr_mutex_lock(a->lock);
+    a->voice_gender = clamp100(gender, -100);
+    a->voice_robot = clamp100(robot, 0);
+    a->voice_echo = clamp100(echo, 0);
+    a->voice_whisper = clamp100(whisper, 0);
+    a->voice_substitute = substitute;
+    bsdr_mutex_unlock(a->lock);
+}
+
+void bsdr_app_get_voicefx(bsdr_app *a, int *gender, int *robot, int *echo, int *whisper, bool *substitute) {
+    bsdr_mutex_lock(a->lock);
+    if (gender) *gender = a->voice_gender;
+    if (robot) *robot = a->voice_robot;
+    if (echo) *echo = a->voice_echo;
+    if (whisper) *whisper = a->voice_whisper;
+    if (substitute) *substitute = a->voice_substitute;
+    bsdr_mutex_unlock(a->lock);
+}
+
+void bsdr_app_set_faceswap(bsdr_app *a, bool on, int tier, const char *source) {
+    bsdr_mutex_lock(a->lock);
+    a->faceswap_on = on;
+    a->faceswap_tier = tier;
+    if (source) snprintf(a->faceswap_source, sizeof a->faceswap_source, "%s", source);
+    a->faceswap_gen++;
+    bsdr_mutex_unlock(a->lock);
+}
+
+void bsdr_app_get_faceswap(bsdr_app *a, bool *on, int *tier, char *source, size_t sl) {
+    bsdr_mutex_lock(a->lock);
+    if (on) *on = a->faceswap_on;
+    if (tier) *tier = a->faceswap_tier;
+    if (source) snprintf(source, sl, "%s", a->faceswap_source);
+    bsdr_mutex_unlock(a->lock);
+}
+
+void bsdr_app_set_faceswap_status(bsdr_app *a, const char *status) {
+    bsdr_mutex_lock(a->lock);
+    snprintf(a->faceswap_status, sizeof a->faceswap_status, "%s", status ? status : "");
     bsdr_mutex_unlock(a->lock);
 }
 
@@ -414,7 +469,9 @@ bool bsdr_app_restore_session(bsdr_app *a) {
     if (!f) return false;
     char access[2048] = "", refresh[2048] = "", email[128] = "", name[128] = "";
     if (!fgets(access, sizeof(access), f))  { fclose(f); return false; }
-    fgets(refresh, sizeof(refresh), f); fgets(email, sizeof(email), f); fgets(name, sizeof(name), f);
+    if (!fgets(refresh, sizeof(refresh), f)) refresh[0] = 0;
+    if (!fgets(email, sizeof(email), f))     email[0] = 0;
+    if (!fgets(name, sizeof(name), f))       name[0] = 0;
     fclose(f);
     /* strip trailing newlines */
     access[strcspn(access, "\r\n")] = 0; refresh[strcspn(refresh, "\r\n")] = 0;
@@ -622,12 +679,22 @@ bool bsdr_app_get_internet_sharing(bsdr_app *a) {
     return v;
 }
 
+/* bumped whenever the operator picks a different headset in the UI, so the agent switches the stream */
+unsigned bsdr_app_select_gen(bsdr_app *a) {
+    bsdr_mutex_lock(a->lock);
+    unsigned g = a->select_gen;
+    bsdr_mutex_unlock(a->lock);
+    return g;
+}
+
 void bsdr_app_select_quest(bsdr_app *a, const char *ip) {
     bsdr_mutex_lock(a->lock);
+    int changed = strcmp(a->selected_quest_ip, ip ? ip : "") != 0;
     snprintf(a->selected_quest_ip, sizeof(a->selected_quest_ip), "%s", ip ? ip : "");
     /* reselecting a blocked Quest lifts the operator-disconnect block */
     if (ip && ip[0] && strcmp(a->blocked_quest_ip, ip) == 0)
         a->blocked_quest_ip[0] = '\0';
+    if (changed) a->select_gen++;   /* agent switches the active stream to the new headset */
     bsdr_mutex_unlock(a->lock);
     BSDR_INFO("bsdr.app", "selected Quest: %s", ip && ip[0] ? ip : "(any)");
 }
@@ -636,6 +703,20 @@ void bsdr_app_set_source(bsdr_app *a, const char *mode, const char *path) {
     bsdr_mutex_lock(a->lock);
     if (mode) snprintf(a->source, sizeof(a->source), "%s", mode);
     if (path) snprintf(a->source_path, sizeof(a->source_path), "%s", path);
+    a->source_gen++;   /* live session reopens capture with the new source */
+    bsdr_mutex_unlock(a->lock);
+}
+
+void bsdr_app_set_source_right(bsdr_app *a, const char *dev) {
+    bsdr_mutex_lock(a->lock);
+    if (dev) snprintf(a->source_path2, sizeof(a->source_path2), "%s", dev);
+    a->source_gen++;
+    bsdr_mutex_unlock(a->lock);
+}
+
+void bsdr_app_get_source_right(bsdr_app *a, char *dev, size_t dl) {
+    bsdr_mutex_lock(a->lock);
+    if (dev) snprintf(dev, dl, "%s", a->source_path2);
     bsdr_mutex_unlock(a->lock);
 }
 
@@ -713,28 +794,32 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         "{\"cloud\":{\"loggedIn\":%s,\"email\":\"%s\",\"name\":\"%s\",\"msg\":\"%s\","
         "\"internetSharing\":%s},"
         "\"quest\":{\"paired\":%s,\"name\":\"%s\",\"ip\":\"%s\",\"streaming\":%s,\"paused\":%s},"
-        "\"source\":{\"mode\":\"%s\",\"path\":\"%s\",\"audio\":%s},"
-        "\"blank\":%s,\"cloudMic\":%s,"
-        "\"threed\":{\"mode\":%d,\"deepness\":%d,\"convergence\":%d,\"swap\":%s,\"full\":%s,\"ai\":\"%s\"},"
+        "\"source\":{\"mode\":\"%s\",\"path\":\"%s\",\"path2\":\"%s\",\"audio\":%s},"
+        "\"blank\":%s,\"cloudMic\":%s,\"ownerMicLocal\":%s,"
+        "\"threed\":{\"mode\":%d,\"deepness\":%d,\"convergence\":%d,\"swap\":%s,\"full\":%s,\"tier\":%d,\"ai\":\"%s\"},"
         "\"quality\":{\"w\":%d,\"h\":%d,\"bitrate\":%d},"
         "\"voice\":{\"stt\":\"%s\",\"sttModel\":\"%s\",\"sttToken\":%s,"
         "\"llm\":\"%s\",\"llmModel\":\"%s\",\"llmToken\":%s},"
-        "\"sniff\":{\"want\":%s,\"mitm\":%s,\"active\":%s,\"msg\":\"%s\"},"
+        "\"sniff\":{\"want\":%s,\"mitm\":%s,\"active\":%s,\"msg\":\"%s\","
+        "\"gender\":%d,\"robot\":%d,\"echo\":%d,\"whisper\":%d,\"substitute\":%s},"
         "\"compctl\":{\"want\":%s,\"vision\":%s,\"active\":%s,\"msg\":\"%s\"},"
         "\"android\":%s,\"selected\":\"%s\",\"quests\":[",
         a->cloud_logged_in ? "true" : "false", esc_email, esc_name, esc_msg,
         a->internet_sharing ? "true" : "false",
         a->quest_paired ? "true" : "false", a->quest_name, a->quest_ip,
         a->streaming ? "true" : "false", a->paused ? "true" : "false",
-        a->source, a->source_path, a->audio ? "true" : "false",
+        a->source, a->source_path, a->source_path2, a->audio ? "true" : "false",
         a->blank_want ? "true" : "false", a->cloud_mic_fallback ? "true" : "false",
+        a->owner_mic_local ? "true" : "false",
         a->threed_mode, a->threed_deepness, a->threed_convergence,
-        a->threed_swap ? "true" : "false", a->threed_full ? "true" : "false", esc_ai,
+        a->threed_swap ? "true" : "false", a->threed_full ? "true" : "false", a->threed_tier, esc_ai,
         a->res_w, a->res_h, a->bitrate,
         a->stt_endpoint, a->stt_model, a->stt_token[0] ? "true" : "false",
         a->llm_endpoint, a->llm_model, a->llm_token[0] ? "true" : "false",
         a->sniff_want ? "true" : "false", a->sniff_mitm ? "true" : "false",
         a->sniff_active ? "true" : "false", esc_sniff,
+        a->voice_gender, a->voice_robot, a->voice_echo, a->voice_whisper,
+        a->voice_substitute ? "true" : "false",
         a->compctl_want ? "true" : "false", a->compctl_vision ? "true" : "false",
         a->compctl_active ? "true" : "false", esc_cc,
 #if defined(BSDR_PLATFORM_ANDROID)
@@ -749,7 +834,34 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
                       i ? "," : "", a->quests[i].ip, a->quests[i].name,
                       (unsigned long long)(now - a->quests[i].last_seen_ms));
     }
-    n += snprintf(out + n, cap - n, "]}");
+    n += snprintf(out + n, cap - n, "],");
+    /* depth-model manager: cache dir, per-tier cached state + size, and any in-flight download */
+    {
+        char mdir[768]; bsdr_model_dir(mdir, sizeof mdir);
+        char emdir[800]; bsdr_json_escape(emdir, sizeof emdir, mdir);
+        bsdr_model_dl dl; bsdr_model_download_state(&dl);
+        char edlerr[160]; bsdr_json_escape(edlerr, sizeof edlerr, dl.err);
+        n += snprintf(out + n, cap - n, "\"models\":{\"dir\":\"%s\",\"tiers\":[", emdir);
+        for (int t = 1; t <= 3; t++) {
+            const bsdr_model_info *mi = bsdr_model_for_tier(t);
+            n += snprintf(out + n, cap - n, "%s{\"tier\":%d,\"name\":\"%s\",\"mb\":%d,\"present\":%s}",
+                          t > 1 ? "," : "", t, mi->name, mi->approx_mb,
+                          bsdr_model_present(t) ? "true" : "false");
+        }
+        n += snprintf(out + n, cap - n,
+                      "],\"dl\":{\"active\":%s,\"tier\":%d,\"pct\":%d,\"done\":%ld,\"total\":%ld,\"ok\":%s,\"err\":\"%s\"}}",
+                      dl.active ? "true" : "false", dl.tier, dl.pct, dl.done, dl.total,
+                      dl.ok ? "true" : "false", edlerr);
+    }
+    {
+        char esrc[600], efst[200];
+        bsdr_json_escape(esrc, sizeof esrc, a->faceswap_source);
+        bsdr_json_escape(efst, sizeof efst, a->faceswap_status);
+        n += snprintf(out + n, cap - n,
+                      ",\"faceswap\":{\"on\":%s,\"tier\":%d,\"source\":\"%s\",\"status\":\"%s\"}",
+                      a->faceswap_on ? "true" : "false", a->faceswap_tier, esrc, efst);
+    }
+    n += snprintf(out + n, cap - n, "}");
     bsdr_mutex_unlock(a->lock);
     return (size_t)n;
 }

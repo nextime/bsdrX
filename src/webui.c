@@ -21,6 +21,8 @@
 #include "bsdr/json.h"
 #include "bsdr/log.h"
 #include "bsdr/winlist.h"
+#include "bsdr/model_store.h"
+#include "bsdr/webcam.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -150,16 +152,50 @@ static const char PAGE[] =
 "<div class=hint><b>On Wi-Fi</b>, MITM can't work (the AP isolates stations). Run the "
 "<b>router companion</b> <b>bsdr_micrelay</b> on your router — it captures the headset's uplink "
 "there and forwards it here (start bsdrX with <code>--sniff-remote PORT</code>). Prebuilt binaries "
-"for common routers are in <b>bsdrX_relay.zip</b>; see bsdr_micrelay(1).</div></div>"
+"for common routers are in <b>bsdrX_relay.zip</b>; see bsdr_micrelay(1).</div>"
+/* realtime voice changer on the owner mic */
+"<div class=sub2><div class=t>Voice changer <span class=badge>realtime</span></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>Gender</label>"
+"<input id=vgender type=range min=-100 max=100 value=0 oninput='vgv.textContent=vgender.value' onchange=voicefx() class=grow>"
+"<span id=vgv style=width:2.5em;text-align:right>0</span></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>Robot</label>"
+"<input id=vrobot type=range min=0 max=100 value=0 oninput='vrv.textContent=vrobot.value' onchange=voicefx() class=grow>"
+"<span id=vrv style=width:2.5em;text-align:right>0</span></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>Echo</label>"
+"<input id=vecho type=range min=0 max=100 value=0 oninput='vev.textContent=vecho.value' onchange=voicefx() class=grow>"
+"<span id=vev style=width:2.5em;text-align:right>0</span></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>Whisper</label>"
+"<input id=vwhisper type=range min=0 max=100 value=0 oninput='vwv.textContent=vwhisper.value' onchange=voicefx() class=grow>"
+"<span id=vwv style=width:2.5em;text-align:right>0</span></div>"
+"<div class=hint>Live, no model, all platforms. <b>Gender</b> shifts pitch+formants (&#8722; deeper / + higher); "
+"<b>Robot</b> = ring-mod timbre; <b>Echo</b> = trailing echo; <b>Whisper</b> = breathy. Applies to the "
+"owner mic everywhere (virtual mic, computer-control, cloud).</div>"
+"<div class=row><label style=width:auto><input id=vsub type=checkbox style=width:auto onchange=voicefx()> "
+"Substitute into the cloud (MITM/relay): stop the headset&#8217;s original voice and inject the changed audio</label></div>"
+"<div class=hint>Requires <b>MITM</b> or the <b>router companion</b> active — that's the only way to "
+"replace the headset&#8594;cloud stream. Otherwise the change is still heard on the local virtual mic "
+"and the cloud-room fallback.</div></div></div>"
 
 "<div class=card><h2>Source</h2>"
 "<div class=row>"
 "<label><input type=radio name=src value=desktop onclick=src('desktop') style=width:auto> Desktop</label> "
-"<label><input type=radio name=src value=file onclick=src('file') style=width:auto> Video file</label></div>"
-"<div class=row><label style=width:auto;color:var(--muted)>Window</label>"
+"<label><input type=radio name=src value=file onclick=src('file') style=width:auto> Video file</label> "
+"<label><input type=radio name=src value=webcam onclick=src('webcam') style=width:auto> Webcam</label> "
+"<label><input type=radio name=src value=webcam3d onclick=src('webcam3d') style=width:auto> Stereo 3D (2 cams)</label></div>"
+"<div class=row id=winrow><label style=width:auto;color:var(--muted)>Window</label>"
 "<select id=win class=grow onchange=selWin()></select>"
 "<button onclick=loadWindows() style=width:auto>&#8635;</button></div>"
-"<div class=row><input id=path class=grow placeholder='/path/to/video.mp4, http(s)://… , rtsp://… , or playlist.txt' onchange=srcpath()>"
+/* Webcam picker: filled from /api/webcams. First select = camera (single) or LEFT eye (stereo);
+ * second select = RIGHT eye, shown only in stereo mode. On platforms that can't enumerate (macOS),
+ * these fall back to a manual device/index field (renderCams). */
+"<div class=row id=camrow style=display:none><label style=width:auto;color:var(--muted)>Camera</label>"
+"<span id=camsel class=grow></span>"
+"<button onclick=loadCams() title='Rescan cameras' style=width:auto>&#8635;</button></div>"
+"<div class=row id=camrowR style=display:none><label style=width:auto;color:var(--muted)>Right eye</label>"
+"<span id=camselR class=grow></span></div>"
+"<div class=hint id=camhint style=display:none>Stream a camera to the headset (and the cloud room). "
+"Stereo 3D uses two cameras side-by-side as a real stereo pair — mount them ~6&#160;cm apart, level.</div>"
+"<div class=row id=filerow><input id=path class=grow placeholder='/path/to/video.mp4, http(s)://… , rtsp://… , or playlist.txt' onchange=srcpath()>"
 "<button onclick=openBrowse() style=width:auto>Browse&#8230;</button>"
 "<button id=pause class=danger onclick=togglePause()>Stop</button></div>"
 "<div class=hint>A video file, an <b>http/https/rtsp URL</b>, or a <b>.txt playlist</b> (one file "
@@ -176,6 +212,22 @@ static const char PAGE[] =
 "<label><input type=radio name=td value=0 onclick=threed() style=width:auto> Off</label> "
 "<label><input type=radio name=td value=1 onclick=threed() style=width:auto> Fast</label> "
 "<label><input type=radio name=td value=2 onclick=threed() style=width:auto> AI</label></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>AI model</label>"
+"<select id=tdtier onchange=threed() class=grow>"
+"<option value=0>External helper (command below)</option>"
+"<option value=1>Built-in \342\200\242 CPU \342\200\224 Depth-Anything V2 Small (~99 MB)</option>"
+"<option value=2>Built-in \342\200\242 small GPU \342\200\224 MiDaS DPT-Hybrid (~490 MB)</option>"
+"<option value=3>Built-in \342\200\242 gaming desktop \342\200\224 MiDaS DPT-Large (~1.3 GB)</option>"
+"<option value=-1 disabled>(auto)</option></select>"
+"<button onclick=dlmodel() style=width:auto title='Download the selected built-in model now'>Download</button></div>"
+"<div class=hint>Built-in tiers run the depth model inside bsdrX (no Python). GPU tiers use the "
+"platform accelerator (DirectML / CoreML / NNAPI / CUDA) and fall back to CPU. Pick a tier and "
+"<b>Download</b> it (or import a zip below); until it lands, 3D uses the fast heuristic.</div>"
+/* Live model manager: per-tier cached/absent state, in-flight download progress, cache location.
+ * Filled by the status poll (renderModels) from status.models. */
+"<div id=tdmodels class=hint style=margin-top:6px>models\342\200\246</div>"
+"<div class=row><input id=tdzip class=grow placeholder='path to a model .zip on this machine'>"
+"<button onclick=impmodel() style=width:auto>Import model zip</button></div>"
 "<div class=row><label style=width:120px;color:var(--muted)>Deepness</label>"
 "<input id=tddeep type=range min=0 max=100 oninput='tddv.textContent=tddeep.value' onchange=threed() class=grow>"
 "<span id=tddv style=width:2.5em;text-align:right>35</span></div>"
@@ -190,6 +242,22 @@ static const char PAGE[] =
 "heuristic if you omit <code>--model</code>). It reads a small grayscale frame on stdin and writes "
 "back a depth map (header <code>BSDD</code>+w+h, then w&#215;h bytes each way), at a reduced rate. "
 "With no command, or if it stalls, 3D falls back to Fast. See <b>bsdr_agent</b>(1).</div></div>"
+
+"<div class=card><h2>Face swap <span class=badge>GPU</span></h2>"
+"<div class=row><label style=width:auto><input id=fson type=checkbox style=width:auto onchange=faceswap()> "
+"Swap faces in the stream to a source image (realtime deepfake)</label></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>Source image</label>"
+"<input id=fssrc class=grow placeholder='/path/to/face.jpg on this machine' onchange=faceswap()>"
+"<button onclick=fsBrowse() style=width:auto>Browse&#8230;</button></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>Compute</label>"
+"<select id=fstier onchange=faceswap() class=grow>"
+"<option value=1>CPU</option><option value=2 selected>GPU (CUDA/DirectML/CoreML/NNAPI)</option>"
+"<option value=3>GPU (high)</option></select></div>"
+"<div id=fsstat class=hint>face swap: off</div>"
+"<div class=hint>Needs the insightface models in the <b>faceswap</b> model dir "
+"(<code>det_10g.onnx</code>, <code>w600k_r50.onnx</code>, <code>inswapper_128.onnx</code>) — they're "
+"non-commercial so bsdrX never ships them; drop them in yourself. Runs on the CPU encode path; use a "
+"GPU tier for realtime. Applies to whatever you're streaming (desktop / webcam / file).</div></div>"
 
 "<div class=card><h2>Voice assistant</h2>"
 "<div class=hint>Configure speech-to-text and (for spoken desktop commands) an LLM here. "
@@ -222,6 +290,8 @@ static const char PAGE[] =
 "MITM) running — the only source of your voice — and an LLM endpoint set above.</div>"
 "<div class=row><label style=width:auto><input id=ccvis type=checkbox style=width:auto onchange=setVision()> "
 "Vision (let the model take a desktop screenshot when a request needs it)</label></div>"
+"<div class=row><label style=width:auto><input id=ownmiclocal type=checkbox style=width:auto onchange=ownMicLocalToggle()> "
+"Use <b>this computer's microphone</b> as the owner mic (no headset sniff/MITM/relay needed).</label></div>"
 "<div class=row><label style=width:auto><input id=cloudmic type=checkbox style=width:auto onchange=cloudmicToggle()> "
 "Owner mic via cloud room when the LAN sniffer/companion isn't available (WiFi). Isolates the owner "
 "(loudest speaker) only while a command is spoken.</label></div>"
@@ -260,7 +330,17 @@ static const char PAGE[] =
 "function login(){api('/api/login',{email:email.value,password:pw.value})}"
 "function logout(){api('/api/logout',{})}"
 "function sel(ip){api('/api/select',{ip:ip})}"
-"function src(m){api('/api/source',{mode:m,path:path.value})}"
+"let cams=[],camMode='desktop';"
+"function srcRows(m){let cam=(m==='webcam'||m==='webcam3d');"
+"winrow.style.display=(m==='desktop')?'flex':'none';filerow.style.display=(m==='file')?'flex':'none';"
+"camrow.style.display=cam?'flex':'none';camrowR.style.display=(m==='webcam3d')?'flex':'none';camhint.style.display=cam?'block':'none';}"
+"function src(m){camMode=m;srcRows(m);"
+"if(m==='webcam'||m==='webcam3d'){loadCams().then(pickCam);}else{api('/api/source',{mode:m,path:path.value});}}"
+"async function loadCams(){let r=await api('/api/webcams');cams=(r&&r.cams)||[];renderCams();}"
+"function camCtl(id,cur){if(cams.length){return '<select id='+id+' class=grow onchange=pickCam()>'+cams.map(function(c){return '<option value=\"'+c.id+'\"'+(c.id===cur?' selected':'')+'>'+c.name+'</option>'}).join('')+'</select>';}"
+"return '<input id='+id+' class=grow onchange=pickCam() value=\"'+(cur||'')+'\" placeholder=\"camera device or index\">';}"
+"function renderCams(){camsel.innerHTML=camCtl('cam',window._cam||'');camselR.innerHTML=camCtl('camR',window._camR||'');}"
+"function pickCam(){let a=document.getElementById('cam'),b=document.getElementById('camR');let d=a?a.value:'',d2=b?b.value:'';window._cam=d;window._camR=d2;api('/api/source',{mode:camMode,path:d,dev2:d2});}"
 "function srcpath(){api('/api/source',{mode:'file',path:path.value})}"
 "function blankToggle(){api('/api/blank',{on:blank.checked?1:0})}"
 "function fbClose(){document.getElementById('fb').style.display='none'}"
@@ -269,7 +349,9 @@ static const char PAGE[] =
 "function dnCopy(b,a){let d=()=>{b.textContent='Copied';setTimeout(()=>b.textContent='Copy',1200)};"
 "if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(a).then(d).catch(()=>{});}else{d();}}"
 "function fbJoin(d,n){return d==='/'?'/'+n:d+'/'+n}"
-"function openBrowse(){let p=path.value||'';let d=p.lastIndexOf('/')>0?p.substring(0,p.lastIndexOf('/')):'';fbBrowse(d)}"
+"let fbTarget='file';"
+"function openBrowse(){fbTarget='file';let p=path.value||'';let d=p.lastIndexOf('/')>0?p.substring(0,p.lastIndexOf('/')):'';fbBrowse(d)}"
+"function fsBrowse(){fbTarget='fs';let p=fssrc.value||'';let d=p.lastIndexOf('/')>0?p.substring(0,p.lastIndexOf('/')):'';fbBrowse(d)}"
 "async function fbBrowse(d){let r=await api('/api/browse?dir='+encodeURIComponent(d));if(!r||r.dir==null)return;"
 "document.getElementById('fb').style.display='block';document.getElementById('fbdir').textContent=r.dir;"
 "let L=document.getElementById('fblist');L.innerHTML='';"
@@ -278,18 +360,31 @@ static const char PAGE[] =
 "(r.entries||[]).sort((a,b)=>(b.dir-a.dir)||a.name.localeCompare(b.name)).forEach(e=>{"
 "if(e.dir)mk('\\uD83D\\uDCC1 '+e.name,()=>fbBrowse(fbJoin(r.dir,e.name)));"
 "else mk('\\uD83C\\uDFAC '+e.name,()=>fbPick(fbJoin(r.dir,e.name)))})}"
-"function fbPick(f){path.value=f;srcpath();fbClose()}"
+"function fbPick(f){if(fbTarget==='fs'){fssrc.value=f;faceswap();}else{path.value=f;srcpath();}fbClose()}"
 "async function loadWindows(){let ws=await api('/api/windows');let e=document.getElementById('win');e.innerHTML='';(ws||[]).forEach((o,i)=>{let p=document.createElement('option');p.value=i;p.textContent=o.title+(o.w?(' ('+o.w+'x'+o.h+')'):'');p.dataset.geo=JSON.stringify(o);e.appendChild(p)})}"
 "function selWin(){let e=document.getElementById('win');let o=JSON.parse(e.options[e.selectedIndex].dataset.geo);api('/api/region',{x:o.x,y:o.y,w:o.w,h:o.h})}"
 "function togglePause(){api('/api/pause',{toggle:true})}"
 "function disconnect(){api('/api/disconnect',{})}"
 "function toggleShare(){api('/api/share',{toggle:true})}"
 "function toggleSniff(){let on=snbtn.dataset.on==='1';api('/api/sniff',{want:on?0:1,mitm:snmitm.checked?1:0,password:snpw.value}).then(()=>{snpw.value=''})}"
+"function voicefx(){api('/api/voicefx',{gender:+vgender.value,robot:+vrobot.value,echo:+vecho.value,whisper:+vwhisper.value,substitute:vsub.checked?1:0})}"
+"function faceswap(){api('/api/faceswap',{on:fson.checked?1:0,tier:+fstier.value,source:fssrc.value})}"
 "function voicecfg(){api('/api/voice',{stt:se.value,sttModel:sm.value,sttToken:st.value,llm:le.value,llmModel:lm.value,llmToken:lt.value})}"
 "function toggleCompctl(){let on=ccbtn.dataset.on==='1';api('/api/compctl',{enable:on?0:1,vision:ccvis.checked?1:0})}"
 "function setVision(){let on=ccbtn.dataset.on==='1';api('/api/compctl',{enable:on?1:0,vision:ccvis.checked?1:0})}"
 "function cloudmicToggle(){api('/api/cloudmic',{on:cloudmic.checked?1:0})}"
-"function threed(){let m=0;for(const r of document.getElementsByName('td'))if(r.checked)m=+r.value;api('/api/threed',{mode:m,deepness:+tddeep.value,convergence:+tdconv.value,swap:tdswap.checked?1:0,full:tdfull.checked?1:0,ai:tdai.value})}"
+"function ownMicLocalToggle(){api('/api/ownmiclocal',{on:ownmiclocal.checked?1:0})}"
+"function threed(){let m=0;for(const r of document.getElementsByName('td'))if(r.checked)m=+r.value;api('/api/threed',{mode:m,deepness:+tddeep.value,convergence:+tdconv.value,swap:tdswap.checked?1:0,full:tdfull.checked?1:0,tier:+tdtier.value,ai:tdai.value})}"
+"function impmodel(){if(!tdzip.value)return;api('/api/model-import',{path:tdzip.value}).then(r=>alert(r&&r.imported>=0?('imported '+r.imported+' model(s)'):'import failed'))}"
+"function dlmodel(){let t=+tdtier.value;if(t<1){alert('Pick a built-in tier (CPU / GPU / desktop) to download.');return;}api('/api/model-download',{tier:t}).then(r=>{if(!r||r.ok!==true)alert('cannot start download'+(r&&r.err?': '+r.err:''))})}"
+"function renderModels(m){if(!m){tdmodels.textContent='';return;}"
+"let d=m.dl,rows=(m.tiers||[]).map(function(x){"
+"let st;if(x.present)st='<span style=color:#3fb950>\\u2713 cached</span>';"
+"else if(d&&d.active&&d.tier===x.tier)st='<span style=color:#d29922>\\u2193 downloading '+(d.pct>=0?d.pct+'%':((d.done/1048576).toFixed(0)+' MB'))+'</span>';"
+"else st='<span style=color:var(--muted)>not downloaded (~'+x.mb+' MB)</span>';"
+"return '<div style=\"display:flex;gap:8px;align-items:center\"><span style=flex:1>'+x.name+'</span>'+st+'</div>';}).join('');"
+"let err=(d&&d.err)?('<div style=color:#f85149>download error: '+d.err+'</div>'):'';"
+"tdmodels.innerHTML=rows+err+'<div style=color:var(--muted);margin-top:4px>cache: '+(m.dir||'?')+'</div>';}"
 "function dot(b){return '<span class=\"dot '+(b?'on':'off')+'\"></span>'}"
 "async function tick(){let s=await api('/api/status');"
 "cloud.innerHTML=dot(s.cloud.loggedIn)+'<span>'+(s.cloud.loggedIn?('Connected as '+s.cloud.name):('Not connected — '+s.cloud.msg))+'</span>'+(s.cloud.loggedIn?'<button onclick=logout() style=margin-left:auto>Log out</button>':'');"
@@ -297,20 +392,35 @@ static const char PAGE[] =
 "cloudshare.style.display=s.cloud.loggedIn?'flex':'none';"
 "if(s.cloud.loggedIn){let sh=s.cloud.internetSharing;sharelbl.textContent='Internet sharing: '+(sh?'ON':'off');sharebtn.textContent=sh?'Stop sharing':'Share to Internet';sharebtn.className=sh?'danger':'p';}"
 "quest.innerHTML=dot(s.quest.paired)+'<span>'+(s.quest.paired?('Connected: '+s.quest.name+' ('+s.quest.ip+')'):'No headset connected')+'</span>'+(s.quest.streaming?'<span class=pill>streaming</span>':'')+(s.quest.paired?'<button class=danger style=margin-left:auto onclick=disconnect()>Disconnect</button>':'');"
-"if(s.sniff){let sn=s.sniff;sniff.innerHTML=dot(sn.active)+'<span>'+(sn.active?('On — '+(sn.msg||'active')):('Off'+(sn.msg?(' — '+sn.msg):'')))+'</span>';snbtn.dataset.on=sn.want?'1':'0';snbtn.textContent=sn.want?'Stop owner mic':'Start owner mic';snbtn.className=sn.want?'danger':'p';if(document.activeElement!==snmitm)snmitm.checked=sn.mitm;}"
+"if(s.sniff){let sn=s.sniff;sniff.innerHTML=dot(sn.active)+'<span>'+(sn.active?('On — '+(sn.msg||'active')):('Off'+(sn.msg?(' — '+sn.msg):'')))+'</span>';snbtn.dataset.on=sn.want?'1':'0';snbtn.textContent=sn.want?'Stop owner mic':'Start owner mic';snbtn.className=sn.want?'danger':'p';if(document.activeElement!==snmitm)snmitm.checked=sn.mitm;"
+"if(document.activeElement!==vgender&&sn.gender!==undefined){vgender.value=sn.gender;vgv.textContent=sn.gender;}"
+"if(document.activeElement!==vrobot&&sn.robot!==undefined){vrobot.value=sn.robot;vrv.textContent=sn.robot;}"
+"if(document.activeElement!==vecho&&sn.echo!==undefined){vecho.value=sn.echo;vev.textContent=sn.echo;}"
+"if(document.activeElement!==vwhisper&&sn.whisper!==undefined){vwhisper.value=sn.whisper;vwv.textContent=sn.whisper;}"
+"if(document.activeElement!==vsub&&sn.substitute!==undefined)vsub.checked=sn.substitute;}"
 "let h='';for(const q of s.quests){let on=s.selected===q.ip;h+=\"<div class=q><span class=nm>\"+(on?'\\u2713 ':'')+q.name+' <span style=color:var(--muted)>'+q.ip+\"</span></span><button onclick=\\\"sel('\"+q.ip+\"')\\\">\"+(on?'Selected':'Use')+'</button></div>'}"
 "if(s.quests.length>1||s.selected)h='<div class=hint style=margin-top:8px>Choose a headset:</div>'+h;quests.innerHTML=h;"
 "for(const r of document.getElementsByName('src'))r.checked=(r.value===s.source.mode);"
-"if(document.activeElement!==path)path.value=s.source.path||'';"
+"if(document.activeElement!==path)path.value=(s.source.mode==='file'?(s.source.path||''):path.value);"
+/* reflect the persisted source: show the right rows, and populate the camera picker once */
+"{let m=s.source.mode;camMode=m;srcRows(m);"
+"if((m==='webcam'||m==='webcam3d')&&!camsel.firstChild){window._cam=s.source.path;window._camR=s.source.path2;loadCams();}}"
 "if(document.activeElement!==blank)blank.checked=!!s.blank;"
 "blankrow.style.display=s.android?'none':'';"   /* screen-blank is desktop-only */
 "if(document.activeElement!==cloudmic)cloudmic.checked=!!s.cloudMic;"
+"if(document.activeElement!==ownmiclocal)ownmiclocal.checked=!!s.ownerMicLocal;"
 "if(s.threed){let t=s.threed;for(const r of document.getElementsByName('td'))r.checked=(+r.value===t.mode);"
 "if(document.activeElement!==tddeep){tddeep.value=t.deepness;tddv.textContent=t.deepness;}"
 "if(document.activeElement!==tdconv){tdconv.value=t.convergence;tdcv.textContent=t.convergence;}"
 "if(document.activeElement!==tdswap)tdswap.checked=!!t.swap;"
 "if(document.activeElement!==tdfull)tdfull.checked=t.full!==false;"
+"if(document.activeElement!==tdtier&&t.tier!==undefined)tdtier.value=t.tier;"
 "if(document.activeElement!==tdai)tdai.value=t.ai||'';}"
+"renderModels(s.models);"
+"if(s.faceswap){let fx=s.faceswap;if(document.activeElement!==fson)fson.checked=fx.on;"
+"if(document.activeElement!==fssrc)fssrc.value=fx.source||'';"
+"if(document.activeElement!==fstier&&fx.tier)fstier.value=fx.tier;"
+"fsstat.textContent='face swap: '+(fx.status||(fx.on?'on':'off'));}"
 "if(document.activeElement!==se)se.value=s.voice.stt||'';"
 "if(document.activeElement!==sm)sm.value=s.voice.sttModel||'';"
 "if(document.activeElement!==le)le.value=s.voice.llm||'';"
@@ -365,31 +475,69 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         double on = 0; bsdr_json_get_double(body, "on", &on);
         bsdr_app_set_cloud_mic_fallback(a, on != 0);   /* owner-mic WiFi fallback via cloud room */
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/ownmiclocal") == 0) {
+        double on = 0; bsdr_json_get_double(body, "on", &on);
+        bsdr_app_set_owner_mic_local(a, on != 0);      /* use this computer's mic as the owner mic */
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/threed") == 0) {
         /* 2D->3D SBS config. Fields: mode 0/1/2, deepness 0..100, convergence -50..50, swap 0/1,
          * ai (helper command). Reopens the capture on the next streamer tick (app bumps threed_gen). */
-        double mode = 0, deep = -1, conv = 0, swap = 0, full = 1; char ai[256] = "";
+        double mode = 0, deep = -1, conv = 0, swap = 0, full = 1, tier = -1; char ai[256] = "";
         int have_ai = bsdr_json_get_str(body, "ai", ai, sizeof(ai));
         bsdr_json_get_double(body, "mode", &mode);
         bsdr_json_get_double(body, "deepness", &deep);
         bsdr_json_get_double(body, "convergence", &conv);
         bsdr_json_get_double(body, "swap", &swap);
         bsdr_json_get_double(body, "full", &full);
-        int cur_deep = 0; bsdr_app_get_threed(a, NULL, &cur_deep, NULL, NULL, NULL, NULL, 0);
+        bsdr_json_get_double(body, "tier", &tier);
+        int cur_deep = 0, cur_tier = 0;
+        bsdr_app_get_threed(a, NULL, &cur_deep, NULL, NULL, NULL, &cur_tier, NULL, 0);
         bsdr_app_set_threed(a, (int)mode, deep >= 0 ? (int)deep : cur_deep, (int)conv, swap != 0,
-                            full != 0, have_ai ? ai : NULL);
+                            full != 0, tier >= 0 ? (int)tier : cur_tier, have_ai ? ai : NULL);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/model-import") == 0) {
+        /* Import depth models from a zip that already exists on this machine (path given by the
+         * operator). Extracts + verifies into the model cache. */
+        char zip[1024] = ""; bsdr_json_get_str(body, "path", zip, sizeof(zip));
+        int n = zip[0] ? bsdr_model_import_zip(zip) : -1;
+        char out[48]; int ol = snprintf(out, sizeof(out), "{\"imported\":%d}", n);
+        respond(c, 200, "application/json", out, ol);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/model-download") == 0) {
+        /* Kick off a background download of the selected built-in tier's depth model. Progress is
+         * reported back through the status JSON (models.dl), polled by the UI. */
+        double tier = 0; bsdr_json_get_double(body, "tier", &tier);
+        int rc = bsdr_model_download_start((int)tier);
+        char out[80];
+        int ol = rc == 0 ? snprintf(out, sizeof(out), "{\"ok\":true}")
+                         : snprintf(out, sizeof(out), "{\"ok\":false,\"err\":\"invalid tier or no URL (import the zip)\"}");
+        respond(c, 200, "application/json", out, ol);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/select") == 0) {
         char ip[64] = "";
         bsdr_json_get_str(body, "ip", ip, sizeof(ip));
         bsdr_app_select_quest(a, ip);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/source") == 0) {
-        char mode[16] = "", p[512] = "";
+        char mode[16] = "", p[512] = "", dev2[256] = "";
         bsdr_json_get_str(body, "mode", mode, sizeof(mode));
-        bsdr_json_get_str(body, "path", p, sizeof(p));
+        bsdr_json_get_str(body, "path", p, sizeof(p));   /* file path/URL, or (webcam) the left camera */
         bsdr_app_set_source(a, mode[0] ? mode : NULL, p);
+        if (bsdr_json_get_str(body, "dev2", dev2, sizeof(dev2)))   /* stereo: the right camera */
+            bsdr_app_set_source_right(a, dev2);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/webcams") == 0) {
+        /* Enumerate the platform's cameras for the source picker (Android does this in Kotlin). */
+        bsdr_webcam_dev devs[16];
+        int nd = bsdr_webcam_list(devs, 16);
+        char out[2048]; int ol = snprintf(out, sizeof(out), "{\"cams\":[");
+        for (int i = 0; i < nd && ol < (int)sizeof(out) - 256; i++) {
+            char eid[300], enm[200];
+            bsdr_json_escape(eid, sizeof eid, devs[i].id);
+            bsdr_json_escape(enm, sizeof enm, devs[i].name);
+            ol += snprintf(out + ol, sizeof(out) - ol, "%s{\"id\":\"%s\",\"name\":\"%s\"}",
+                           i ? "," : "", eid, enm);
+        }
+        ol += snprintf(out + ol, sizeof(out) - ol, "]}");
+        respond(c, 200, "application/json", out, ol);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/pause") == 0) {
         bsdr_app_set_paused(a, !bsdr_app_is_paused(a));
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
@@ -405,6 +553,24 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         bsdr_json_get_double(body, "mitm", &mitm);
         bsdr_json_get_str(body, "password", pw, sizeof(pw));   /* transient; feeds `sudo -S` */
         bsdr_app_set_sniff(a, want != 0, mitm != 0, pw[0] ? pw : NULL);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/voicefx") == 0) {
+        /* realtime owner-mic voice change: gender knob (-100..100) + substitute-to-cloud toggle */
+        double gender = 0, robot = 0, echo = 0, whisper = 0, substitute = 0;
+        bsdr_json_get_double(body, "gender", &gender);
+        bsdr_json_get_double(body, "robot", &robot);
+        bsdr_json_get_double(body, "echo", &echo);
+        bsdr_json_get_double(body, "whisper", &whisper);
+        bsdr_json_get_double(body, "substitute", &substitute);
+        bsdr_app_set_voicefx(a, (int)gender, (int)robot, (int)echo, (int)whisper, substitute != 0);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/faceswap") == 0) {
+        /* realtime face swap: enable + tier + source-image path (server-side) */
+        double on = 0, tier = 2; char src[512] = "";
+        bsdr_json_get_double(body, "on", &on);
+        bsdr_json_get_double(body, "tier", &tier);
+        bsdr_json_get_str(body, "source", src, sizeof(src));
+        bsdr_app_set_faceswap(a, on != 0, (int)tier, src);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/windows") == 0) {
         bsdr_window wins[64];

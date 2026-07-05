@@ -48,6 +48,9 @@
 #include "bsdr/micsniff.h"
 #include "bsdr/overlay.h"
 #include "bsdr/threed.h"
+#include "bsdr/depth.h"
+#include "bsdr/model_store.h"
+#include "bsdr/faceswap.h"
 #include "bsdr/voice.h"
 #if defined(BSDR_PLATFORM_ANDROID)
 #include "bsdr_android.h"          /* device-mic voice bridge (no sniffer on Android) */
@@ -73,6 +76,8 @@ typedef struct {
     volatile int stop;          /* per-session cancel/stop flag */
     char remote_ip[64];
     char src_path[512];         /* stable storage for the file source */
+    char cam_left[256];         /* stable storage for the (left) webcam device */
+    char cam_right[256];        /* stable storage for the right webcam device (stereo 3D) */
     bsdr_app *app;              /* shared web-UI state */
     volatile int settings_dirty;   /* headset changed resolution/bitrate */
     struct bsdr_overlay *overlay;  /* in-VR voice-command balloon (owned by run(); shared into sessions) */
@@ -131,6 +136,26 @@ static const char COMPCTL_VISION_NOTE[] =
 static void voice_pcm_sink(void *user, const int16_t *pcm, int frames, int channels) {
     bsdr_voice_push_pcm((bsdr_voice *)user, pcm, frames, channels);
 }
+
+#if !defined(BSDR_PLATFORM_ANDROID)
+/* Local-mic owner source: capture THIS machine's default microphone and feed it to the voice
+ * pipeline — the alternative to sniffing the Quest's mic (LAN/MITM/relay), for when you just want to
+ * talk into the computer running bsdrX. Cross-platform via bsdr_pa_record_open. */
+struct local_mic_ctx { struct bsdr_voice *voice; volatile int stop; };
+static void local_mic_main(void *arg) {
+    struct local_mic_ctx *c = (struct local_mic_ctx *)arg;
+    bsdr_pa *mic = bsdr_pa_record_open(NULL, 1);   /* default input, mono */
+    if (!mic) { BSDR_WARN("bsdr.agent", "local mic: cannot open default input"); return; }
+    BSDR_INFO("bsdr.agent", "local mic: capturing this computer's microphone as the owner mic");
+    int16_t pcm[960];
+    while (!c->stop) {
+        int n = bsdr_pa_read(mic, pcm, 960);
+        if (n > 0) bsdr_voice_push_pcm(c->voice, pcm, n, 1);
+        else if (n < 0) break;
+    }
+    bsdr_pa_close(mic);
+}
+#endif
 /* voice pipeline state -> balloon visual mode. */
 static void voice_state_map(void *user, int state) {
     struct bsdr_overlay *o = (struct bsdr_overlay *)user;
@@ -483,7 +508,7 @@ static void lan_input_main(void *arg) {
 /* True if 2D->3D is enabled in the app config right now. */
 static int threed_on(agent_t *a) {
     if (!a->app) return 0;
-    int m = 0; bsdr_app_get_threed(a->app, &m, NULL, NULL, NULL, NULL, NULL, 0);
+    int m = 0; bsdr_app_get_threed(a->app, &m, NULL, NULL, NULL, NULL, NULL, NULL, 0);
     return m != BSDR_3D_OFF;
 }
 /* Fill the capture config's 2D->3D fields from the app (call before each bsdr_capture_open). On
@@ -491,15 +516,62 @@ static int threed_on(agent_t *a) {
  * publish the config for the GL pipeline instead and leave the C capture's threed off. */
 static void threed_cfg(agent_t *a, bsdr_capture_config *cfg) {
     if (!a->app) return;
-    int m = 0, deep = 0, conv = 0, swap = 0, full = 0; char ai[256] = "";
-    bsdr_app_get_threed(a->app, &m, &deep, &conv, &swap, &full, ai, sizeof ai);
+    int m = 0, deep = 0, conv = 0, swap = 0, full = 0, tier = 0; char ai[256] = "";
+    bsdr_app_get_threed(a->app, &m, &deep, &conv, &swap, &full, &tier, ai, sizeof ai);
 #if defined(BSDR_PLATFORM_ANDROID)
-    bsdr_android_publish_threed(m, deep, conv, swap, full);   /* GL applies SBS */
+    bsdr_android_publish_threed(m, deep, conv, swap, full, tier);   /* GL applies SBS; tier drives NNAPI depth */
     cfg->threed_mode = 0;
 #else
     cfg->threed_mode = m; cfg->threed_deepness = deep; cfg->threed_convergence = conv;
-    cfg->threed_swap = swap; cfg->threed_full = full;
+    cfg->threed_swap = swap; cfg->threed_full = full; cfg->threed_tier = tier;
     snprintf(cfg->threed_ai_cmd, sizeof cfg->threed_ai_cmd, "%s", ai);
+#endif
+}
+
+/* Fill the capture config's webcam fields from the app source (call before each non-file
+ * bsdr_capture_open). "webcam" -> single camera in cfg->webcam; "webcam3d" -> left+right for the
+ * stereo SBS compositor. Devices are copied into the agent's stable storage so the pointers survive
+ * the capture's lifetime. Returns 1 if a webcam source is active (so the caller skips screen grab). */
+static int webcam_cfg(agent_t *a, bsdr_capture_config *cfg) {
+    cfg->webcam = cfg->webcam_right = NULL;
+    if (!a->app) return 0;
+    char mode[16] = "", left[256] = "";
+    bsdr_app_get_source(a->app, mode, sizeof mode, left, sizeof left);
+    int stereo = strcmp(mode, "webcam3d") == 0;
+    if (strcmp(mode, "webcam") != 0 && !stereo) return 0;
+    snprintf(a->cam_left, sizeof a->cam_left, "%s", left);
+    cfg->webcam = a->cam_left[0] ? a->cam_left : NULL;
+    if (stereo) {
+        bsdr_app_get_source_right(a->app, a->cam_right, sizeof a->cam_right);
+        cfg->webcam_right = a->cam_right[0] ? a->cam_right : NULL;
+    }
+    return cfg->webcam != NULL;
+}
+
+/* Open/close the face-swap engine to match the app state, (re)loading the source image on enable.
+ * Models live in <model cache>/faceswap (det_10g/w600k_r50/inswapper_128, user-supplied). Closes
+ * `cur` first; returns the new engine (or NULL when off/unavailable). */
+static bsdr_faceswap *faceswap_reconcile(agent_t *a, bsdr_faceswap *cur) {
+    if (cur) bsdr_faceswap_close(cur);
+    if (!a->app) return NULL;
+#if defined(BSDR_PLATFORM_ANDROID)
+    return NULL;   /* Android applies face swap in the Kotlin GL pipeline, not this C capture path */
+#else
+    bool on=false; int tier=0; char src[512]="";
+    bsdr_app_get_faceswap(a->app, &on, &tier, src, sizeof src);
+    if (!on) { bsdr_app_set_faceswap_status(a->app, "off"); return NULL; }
+    char dir[768], fsdir[900];
+    bsdr_model_dir(dir, sizeof dir);
+    snprintf(fsdir, sizeof fsdir, "%s/faceswap", dir);
+    bsdr_faceswap *fs = bsdr_faceswap_open(fsdir, tier >= 2);
+    if (!fs) { bsdr_app_set_faceswap_status(a->app, "models missing — put det_10g/w600k_r50/inswapper_128 in the faceswap dir"); return NULL; }
+    if (!src[0]) { bsdr_app_set_faceswap_status(a->app, "set a source image"); return fs; }
+    uint8_t *rgb=NULL; int w=0,h=0;
+    if (bsdr_capture_decode_image_rgb(src, &rgb, &w, &h) != 0) { bsdr_app_set_faceswap_status(a->app, "cannot read source image"); return fs; }
+    int r = bsdr_faceswap_set_source_rgb(fs, rgb, w, h);
+    free(rgb);
+    bsdr_app_set_faceswap_status(a->app, r == 0 ? bsdr_faceswap_status(fs) : "no face found in source image");
+    return fs;
 #endif
 }
 
@@ -524,6 +596,10 @@ static void lan_live_main(agent_t *a) {
      * auto-picks NVENC (2-pass, p7) even when 3D forced the CPU-scale path above. */
     if (user_cpu) cfg.encoder = "libx264";
     threed_cfg(a, &cfg);   /* capture builds the SBS transform from these cfg fields */
+    /* face swap runs on the CPU NV12 frame (like 3D) -> force the CPU scale path when it's on. */
+    bsdr_faceswap *fs_engine = faceswap_reconcile(a, NULL);
+    unsigned my_fs_gen = a->app ? a->app->faceswap_gen : 0;
+    if (fs_engine) { cfg.cpu_only = 1; cfg.use_vaapi = 0; cfg.use_kmsgrab = 0; }
     int rx=0,ry=0,rw=0,rh=0;                           /* capture region; 0s = whole desktop */
     int qw=0,qh=0,qbr=0;                                /* live quality (headset PUT /device) */
     int w=0,h=0; const char *enc="h264";
@@ -563,18 +639,20 @@ static void lan_live_main(agent_t *a) {
                   pl_is ? "playlist entry " : "file ", curpath, w, h, enc?enc:"?",
                   a->remote_ip, BSDR_REMOTE_DESKTOP_PORT);
     } else {
+        int is_cam = webcam_cfg(a, &cfg);   /* webcam source -> sets cfg.webcam[_right]; else screen grab */
         if (a->app) bsdr_app_get_region(a->app, &rx, &ry, &rw, &rh);
         cfg.x = rx; cfg.y = ry; cfg.width = rw; cfg.height = rh;
         if (a->app) bsdr_app_get_quality(a->app, &qw, &qh, &qbr);
         if (qbr > 0) cfg.bitrate = qbr;
         cfg.out_width = qw > 0 ? qw : 0; cfg.out_height = qh > 0 ? qh : 0;
         cap = bsdr_capture_open(&cfg);
-        if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: desktop capture/encode open failed");
+        if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: %s capture/encode open failed",
+                    is_cam ? "webcam" : "desktop");
                     bsdr_udp_close(&udp); return; }
         if (a->overlay) bsdr_capture_set_overlay(cap, a->overlay);   /* voice-command balloon */
         bsdr_capture_info(cap, &w, &h, &enc);
-        BSDR_INFO("bsdr.agent", "LAN LIVE: desktop %dx%d via %s -> %s:%d (XOR-0x14, no DTLS)",
-                  w, h, enc?enc:"?", a->remote_ip, BSDR_REMOTE_DESKTOP_PORT);
+        BSDR_INFO("bsdr.agent", "LAN LIVE: %s %dx%d via %s -> %s:%d (XOR-0x14, no DTLS)",
+                  is_cam ? "webcam" : "desktop", w, h, enc?enc:"?", a->remote_ip, BSDR_REMOTE_DESKTOP_PORT);
     }
     uint16_t tw = (uint16_t)((w+15)&~15), th = (uint16_t)((h+15)&~15);  /* MB-aligned, like the host */
     /* Per-stream id, RANDOM each session. It must change across bsdrX restarts: the Quest keys its
@@ -604,7 +682,28 @@ static void lan_live_main(agent_t *a) {
     bsdr_thread *ithr = bsdr_thread_start(lan_input_main, &ictx);
     unsigned my_seek_gen = a->app->file_seek_gen;
     unsigned my_threed_gen = a->app->threed_gen;
+    if (cap) bsdr_capture_set_faceswap(cap, fs_engine);
     while (!a->stop) {
+        if (cap) bsdr_capture_set_faceswap(cap, fs_engine);   /* re-attach across any reopen below */
+        /* Face swap toggled/retuned from the web UI: reconcile the engine (reload model+source) and,
+         * because it forces the CPU encode path, reopen the capture. */
+        if (a->app && a->app->faceswap_gen != my_fs_gen) {
+            my_fs_gen = a->app->faceswap_gen;
+            fs_engine = faceswap_reconcile(a, fs_engine);
+            int fs_on = fs_engine != NULL, td = threed_on(a);
+            cfg.cpu_only = fs_on || td || user_cpu;
+            if (fs_on || td) { cfg.use_vaapi = 0; cfg.use_kmsgrab = 0; }
+            else { cfg.use_vaapi = a->app->use_vaapi; cfg.use_kmsgrab = a->app->use_kmsgrab; }
+            if (filemode) cfg.encoder = a->file_gpu ? NULL : "libx264";
+            else if (user_cpu) cfg.encoder = "libx264"; else cfg.encoder = NULL;
+            threed_cfg(a, &cfg); if (!filemode) webcam_cfg(a, &cfg);
+            bsdr_capture_close(cap); cap = bsdr_capture_open(&cfg);
+            if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: reopen for faceswap change failed"); break; }
+            if (a->overlay) bsdr_capture_set_overlay(cap, a->overlay);
+            bsdr_capture_set_faceswap(cap, fs_engine);
+            bsdr_capture_info(cap, &w, &h, &enc);
+            tw = (uint16_t)((w+15)&~15); th = (uint16_t)((h+15)&~15);
+        }
         /* Media-bar controls (file mode): apply pause + edge-triggered seek to the capture. */
         if (filemode) {
             bsdr_capture_set_paused(cap, a->app->file_paused);
@@ -625,6 +724,7 @@ static void lan_live_main(agent_t *a) {
             if (filemode) cfg.encoder = a->file_gpu ? NULL : "libx264";
             else if (user_cpu) cfg.encoder = "libx264"; else cfg.encoder = NULL;
             threed_cfg(a, &cfg);
+            if (!filemode) webcam_cfg(a, &cfg);   /* keep the webcam source across the 3D reopen */
             bsdr_capture_close(cap);
             cap = bsdr_capture_open(&cfg);
             if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: reopen for 3D change failed"); break; }
@@ -649,6 +749,7 @@ static void lan_live_main(agent_t *a) {
                 cfg.x=rx; cfg.y=ry; cfg.width=rw; cfg.height=rh;
                 cfg.out_width = qw>0?qw:0; cfg.out_height = qh>0?qh:0;
                 if (qbr>0) cfg.bitrate = qbr;
+                webcam_cfg(a, &cfg);   /* keep the webcam source across the live reconfig reopen */
                 cap = bsdr_capture_open(&cfg);
                 if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: re-open for reconfig failed"); break; }
                 if (a->overlay) bsdr_capture_set_overlay(cap, a->overlay);
@@ -730,6 +831,7 @@ static void lan_live_main(agent_t *a) {
     if (filemode && a->overlay) bsdr_overlay_set_visible(a->overlay, false);
     a->file_mode = 0;
     if (cap) bsdr_capture_close(cap);
+    if (fs_engine) bsdr_faceswap_close(fs_engine);
     bsdr_udp_close(&udp);
     BSDR_INFO("bsdr.agent", "LAN live stopped (%u NALs sent)", frame_num);
 }
@@ -774,10 +876,12 @@ static void screen_set_blank(int on) { (void)on; }
 
 /* start the session worker. lock held. */
 static void spawn_worker_locked(agent_t *a) {
-    if (a->app) {   /* web UI source picker: "file" -> path, "desktop" -> capture */
+    if (a->app) {   /* web UI source picker: "file" -> path; "desktop"/"webcam"/"webcam3d" -> live capture */
         char mode[16] = "";
         bsdr_app_get_source(a->app, mode, sizeof(mode), a->src_path, sizeof(a->src_path));
-        if (strcmp(mode, "file") == 0 && a->src_path[0]) a->video_file = a->src_path;
+        /* Only file mode sets video_file; clear it for every live source so a switch away from a
+         * file (e.g. file -> webcam) actually leaves file mode on the next (re)spawn. */
+        a->video_file = (strcmp(mode, "file") == 0 && a->src_path[0]) ? a->src_path : NULL;
     }
     a->stop = 0;
     a->worker = bsdr_thread_start(worker_main, a);
@@ -908,7 +1012,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     if (opt->threed_mode) bsdr_app_set_threed(&app, opt->threed_mode,
             opt->threed_deepness > 0 ? opt->threed_deepness : app.threed_deepness,
             opt->threed_convergence, opt->threed_swap,
-            opt->threed_full, opt->threed_ai_cmd);  /* --threed (light half-SBS unless --threed-full) */
+            opt->threed_full, opt->threed_tier, opt->threed_ai_cmd);  /* --threed (half-SBS unless --threed-full) */
     if (opt->use_vaapi) app.use_vaapi = true;             /* --vaapi: encode on the iGPU */
     if (opt->use_kmsgrab) app.use_kmsgrab = true;         /* --kmsgrab: DRM/KMS capture */
 #ifdef BSDR_HAVE_CAPTURE
@@ -1006,6 +1110,10 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     bsdr_micsniff *sniffer = NULL;
     bool  want_sniff = false, want_mitm = false, have_pw = false;
     char  sniff_pw[128] = {0};
+#if !defined(BSDR_PLATFORM_ANDROID)
+    bsdr_thread *mic_thr = NULL;               /* local-mic owner source */
+    struct local_mic_ctx mic_ctx = { NULL, 0 };
+#endif
     /* CLI flags seed the desired state; the web UI can flip it live (with a sudo password). */
     if (opt->sniff_mic) { want_sniff = true; want_mitm = opt->sniff_mitm; }
 
@@ -1021,8 +1129,91 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
 
     int tick = 0;
     int screen_blanked = 0;
+    unsigned my_source_gen = app.source_gen;
+    unsigned my_select_gen = bsdr_app_select_gen(&app);
+#if defined(BSDR_PLATFORM_ANDROID)
+    unsigned my_threed_gen_main = app.threed_gen - 1;   /* force an initial publish */
+    unsigned my_fs_gen_main = app.faceswap_gen - 1;
+#endif
     while (g_running) {
         bsdr_sleep_ms(200);
+
+        /* Headset picked/changed in the web UI ("Use"): switch the stream to it. If a session is
+         * running to a different headset, tear it down; then start streaming to the selected one
+         * (its receiver is up once it has been discovered/paired). Empty selection = accept any,
+         * leave the current session alone. */
+        if (bsdr_app_select_gen(&app) != my_select_gen) {
+            my_select_gen = bsdr_app_select_gen(&app);
+            char sel[64] = "";
+            bsdr_mutex_lock(app.lock);
+            snprintf(sel, sizeof sel, "%s", app.selected_quest_ip);
+            bsdr_mutex_unlock(app.lock);
+            bsdr_mutex_lock(a.lock);
+            int running = a.worker != NULL;
+            int differ = sel[0] && strcmp(a.remote_ip, sel) != 0;
+            bsdr_mutex_unlock(a.lock);
+            if (sel[0] && (differ || !running)) {
+                BSDR_INFO("bsdr.agent", "headset selected -> streaming to %s", sel);
+                teardown_session(&a);
+                if (a.app) { bsdr_app_set_paired(a.app, true, "selected headset", sel);
+                             bsdr_app_set_streaming(a.app, true); }
+                bsdr_mutex_lock(a.lock);
+                snprintf(a.remote_ip, sizeof a.remote_ip, "%s", sel);
+                spawn_worker_locked(&a);
+                bsdr_mutex_unlock(a.lock);
+            }
+        }
+
+#if !defined(BSDR_PLATFORM_ANDROID)
+        /* Source switched in the web UI (desktop <-> webcam <-> stereo <-> file): restart the live
+         * session so lan_live_main re-derives the source. Only if a session is actually running (a
+         * Quest is streaming); otherwise the next /start picks up the new source on its own. */
+        if (app.source_gen != my_source_gen) {
+            my_source_gen = app.source_gen;
+            bsdr_mutex_lock(a.lock);
+            int running = a.worker != NULL && a.remote_ip[0];
+            bsdr_mutex_unlock(a.lock);
+            if (running) {
+                BSDR_INFO("bsdr.agent", "source changed -> restarting live session");
+                teardown_session(&a);
+                bsdr_mutex_lock(a.lock);
+                spawn_worker_locked(&a);
+                bsdr_mutex_unlock(a.lock);
+            }
+        }
+#endif
+
+#if defined(BSDR_PLATFORM_ANDROID)
+        /* Publish 2D->3D config to the Kotlin GL SBS pipeline independent of a LAN streaming
+         * session: on Android the encoder runs (and SBS/neural depth apply) even before a Quest
+         * pairs, so the config must reach nativePollThreed from this always-on loop — not only via
+         * lan_live_main, which needs an active Quest session. */
+        if (app.threed_gen != my_threed_gen_main) {
+            my_threed_gen_main = app.threed_gen;
+            int m = 0, deep = 0, conv = 0, swap = 0, full = 0, tier = 0;
+            bsdr_app_get_threed(&app, &m, &deep, &conv, &swap, &full, &tier, NULL, 0);
+            bsdr_android_publish_threed(m, deep, conv, swap, full, tier);
+            BSDR_INFO("bsdr.agent", "3D published to GL: mode=%d tier=%d deep=%d", m, tier, deep);
+        }
+        /* Publish the source choice (desktop/webcam/webcam3d + devices) to the Kotlin capture switch. */
+        if (app.source_gen != my_source_gen) {
+            my_source_gen = app.source_gen;
+            char smode[16] = "", sdev[256] = "", sdev2[256] = "";
+            bsdr_app_get_source(&app, smode, sizeof smode, sdev, sizeof sdev);
+            bsdr_app_get_source_right(&app, sdev2, sizeof sdev2);
+            bsdr_android_publish_source(smode, sdev, sdev2);
+            BSDR_INFO("bsdr.agent", "source published to capture: %s dev='%s'%s", smode, sdev,
+                      sdev2[0] ? " (+right)" : "");
+        }
+        /* Publish the face-swap config (enable/tier/source image) to the Kotlin GL faceswap stage. */
+        if (app.faceswap_gen != my_fs_gen_main) {
+            my_fs_gen_main = app.faceswap_gen;
+            bool fson = false; int fstier = 0; char fssrc[512] = "";
+            bsdr_app_get_faceswap(&app, &fson, &fstier, fssrc, sizeof fssrc);
+            bsdr_android_publish_faceswap(fson ? 1 : 0, fstier, fssrc);
+            BSDR_INFO("bsdr.agent", "faceswap published: on=%d tier=%d", fson, fstier);
+        }
+#endif
 
         /* Privacy screen-blank reconcile: black out the local monitor while the Quest is connected
          * (so bystanders can't see the desktop), and restore it the instant the Quest disconnects
@@ -1070,6 +1261,12 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                            bsdr_app_set_sniff_status(&app, false, "failed — check password / permissions"); }
                 }
             }
+            /* realtime voice change on the owner mic (gender + effects from the web UI) */
+            if (sniffer) {
+                int vg=0, vr=0, ve=0, vw=0;
+                bsdr_app_get_voicefx(&app, &vg, &vr, &ve, &vw, NULL);
+                bsdr_micsniff_set_voicefx(sniffer, vg, vr, ve, vw);
+            }
         }
         /* --- computer-control reconcile (gated on the owner mic + an LLM endpoint) --- */
         {
@@ -1081,10 +1278,11 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
 #if defined(BSDR_PLATFORM_ANDROID)
             bool armable = cc_want && have_llm;                     /* device mic is the voice source */
 #else
-            /* Owner-mic source: the LAN sniffer / router companion, or — as a WiFi fallback — the
-             * cloud room audio (voice-activity duck isolates the owner during a command). */
+            /* Owner-mic source, in priority: the LAN sniffer / router companion; else this computer's
+             * own microphone (owner_mic_local); else — as a WiFi fallback — the cloud room audio. */
             bool cloud_fb = (sniffer == NULL) && app.cloud_mic_fallback && app.internet_sharing;
-            bool armable = cc_want && have_llm && (sniffer != NULL || cloud_fb);
+            bool local_mic = (sniffer == NULL) && app.owner_mic_local;
+            bool armable = cc_want && have_llm && (sniffer != NULL || local_mic || cloud_fb);
 #endif
             if (armable) {
                 if (!a.voice) {                                    /* create once, keep for the run */
@@ -1128,7 +1326,13 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                     if (sniffer) {                                 /* LAN sniffer / router companion */
                         bsdr_micsniff_set_pcm_sink(sniffer, voice_pcm_sink, a.voice);
                         bsdr_app_set_room_pcm_sink(&app, NULL, NULL);
+                        if (mic_thr) { mic_ctx.stop = 1; bsdr_thread_join(mic_thr); mic_thr = NULL; }
                         bsdr_app_set_compctl_status(&app, true, "armed — click the balloon in VR to talk");
+                    } else if (local_mic) {                        /* this computer's microphone */
+                        bsdr_app_set_room_pcm_sink(&app, NULL, NULL);
+                        if (!mic_thr) { mic_ctx.voice = a.voice; mic_ctx.stop = 0;
+                                        mic_thr = bsdr_thread_start(local_mic_main, &mic_ctx); }
+                        bsdr_app_set_compctl_status(&app, true, "armed (this computer's mic) — click the balloon");
                     } else {                                       /* cloud room fallback (WiFi) */
                         bsdr_app_set_room_pcm_sink(&app, voice_pcm_sink, a.voice);
                         bsdr_app_set_compctl_status(&app, true, "armed (owner mic via cloud room) — click the balloon");
@@ -1148,8 +1352,9 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                 if (a.overlay) bsdr_overlay_set_balloon(a.overlay, false);
                 if (sniffer) bsdr_micsniff_set_pcm_sink(sniffer, NULL, NULL);
                 bsdr_app_set_room_pcm_sink(&app, NULL, NULL);
-                if (cc_want && sniffer == NULL && !(app.cloud_mic_fallback && app.internet_sharing))
-                    bsdr_app_set_compctl_status(&app, false, "waiting for the owner mic (LAN sniff/companion, or enable the cloud fallback + internet sharing)");
+                if (mic_thr) { mic_ctx.stop = 1; bsdr_thread_join(mic_thr); mic_thr = NULL; }
+                if (cc_want && sniffer == NULL && !app.owner_mic_local && !(app.cloud_mic_fallback && app.internet_sharing))
+                    bsdr_app_set_compctl_status(&app, false, "waiting for the owner mic — enable owner-mic sniff/MITM, this computer's mic, or the cloud fallback");
                 else if (cc_want && !have_llm)
                     bsdr_app_set_compctl_status(&app, false, "set an LLM endpoint first");
                 else
@@ -1192,6 +1397,9 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     if (screen_blanked) screen_set_blank(0);   /* never exit with the local screen left black */
     g_screen_blanked = 0;
     if (sniffer) bsdr_micsniff_stop(sniffer);
+#if !defined(BSDR_PLATFORM_ANDROID)
+    if (mic_thr) { mic_ctx.stop = 1; bsdr_thread_join(mic_thr); mic_thr = NULL; }
+#endif
     teardown_session(&a);
     if (a.voice) bsdr_voice_free(a.voice);
     if (voice_inj) bsdr_injector_destroy(voice_inj);   /* voice borrows it; we own it */
@@ -1238,6 +1446,15 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--threed-swap") == 0) opt.threed_swap = 1;
         else if (strcmp(argv[i], "--threed-full") == 0) opt.threed_full = 1;
         else if (strcmp(argv[i], "--threed-ai") == 0 && i + 1 < argc) { opt.threed_ai_cmd = argv[++i]; if (!opt.threed_mode) opt.threed_mode = BSDR_3D_AI; }
+        else if (strcmp(argv[i], "--threed-tier") == 0 && i + 1 < argc) { opt.threed_tier = (int)bsdr_depth_tier_parse(argv[++i]); if (!opt.threed_mode) opt.threed_mode = BSDR_3D_AI; }
+        else if (strcmp(argv[i], "--threed-model-dir") == 0 && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("BSDR_MODEL_DIR", argv[++i]);   /* mingw has no setenv */
+#else
+            setenv("BSDR_MODEL_DIR", argv[++i], 1);
+#endif
+        }
+        else if (strcmp(argv[i], "--threed-model-import") == 0 && i + 1 < argc) { int nimp = bsdr_model_import_zip(argv[++i]); fprintf(stderr, "imported %d model(s) from %s\n", nimp < 0 ? 0 : nimp, argv[i]); exit(nimp > 0 ? 0 : 1); }
         else if (strcmp(argv[i], "--replay") == 0 && i + 1 < argc) opt.replay_file = argv[++i];
         else if (strcmp(argv[i], "--quest_ip") == 0 && i + 1 < argc) opt.quest_ip = argv[++i];
         else if (strcmp(argv[i], "--ui-port") == 0 && i + 1 < argc) opt.webui_port = atoi(argv[++i]);
@@ -1297,6 +1514,11 @@ int main(int argc, char **argv) {
 "  --threed-full        Full resolution per eye: render 3D at 2x resolution (same screen shape).\n"
 "                       Sharper but ~4x the pixels (high CPU + bandwidth). Default: light half-SBS.\n"
 "  --threed-ai CMD      External depth-estimator command for --threed ai (implies ai mode).\n"
+"  --threed-tier T      In-process (built-in) AI depth, no external helper. T = cpu|gpu|hi:\n"
+"                       cpu = Depth-Anything-V2-Small; gpu/hi = MiDaS (small/large GPU). The\n"
+"                       model is fetched on first use (or import it, below). Implies ai mode.\n"
+"  --threed-model-dir D Directory to cache/read depth models (default: per-OS cache dir).\n"
+"  --threed-model-import ZIP  Import depth model(s) from a distributed zip into the cache, then exit-safe.\n"
 "  --no-video           Don't stream video (input/control only).\n"
 "  --no-audio           Don't stream desktop audio or expose the headset mic.\n"
 "\n"

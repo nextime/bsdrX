@@ -30,6 +30,8 @@
 
 #include "bsdr/agentlib.h"
 #include "bsdr/log.h"
+#include "bsdr/depth.h"
+#include "bsdr/faceswap.h"
 #include "bsdr_android.h"
 
 static JavaVM       *g_vm;
@@ -146,6 +148,25 @@ static void *agent_thread(void *arg) {
 /* ---- Kotlin -> native (NativeBridge) -------------------------------------*/
 #define NB(name) Java_net_nexlab_bsdrandroid_NativeBridge_##name
 
+/* Point the depth-model cache/download at an app-writable dir (the C default /data/local/tmp is not
+ * app-readable on modern Android). Call before nativeStart. */
+JNIEXPORT void JNICALL NB(nativeSetModelDir)(JNIEnv *env, jobject thiz, jstring dir) {
+    (void)thiz;
+    if (!dir) return;
+    const char *s = (*env)->GetStringUTFChars(env, dir, NULL);
+    if (s) { setenv("BSDR_MODEL_DIR", s, 1); (*env)->ReleaseStringUTFChars(env, dir, s); }
+}
+
+/* Android has no $HOME, so the cloud-session file (app.c session_path) is never written and the login
+ * is lost on every restart/update. Point $HOME at the app's INTERNAL files dir — private and
+ * preserved across app updates. Call before nativeStart. */
+JNIEXPORT void JNICALL NB(nativeSetConfigHome)(JNIEnv *env, jobject thiz, jstring dir) {
+    (void)thiz;
+    if (!dir) return;
+    const char *s = (*env)->GetStringUTFChars(env, dir, NULL);
+    if (s) { setenv("HOME", s, 1); (*env)->ReleaseStringUTFChars(env, dir, s); }
+}
+
 JNIEXPORT void JNICALL NB(nativeStart)(JNIEnv *env, jobject thiz,
                                        jint w, jint h, jint fps, jint bitrate, jint uiPort) {
     if (g_agent_running) return;
@@ -224,14 +245,157 @@ JNIEXPORT jboolean JNICALL NB(nativePollVideoWant)(JNIEnv *env, jobject thiz, ji
     return JNI_TRUE;
 }
 
-/* 2D->3D config poll: out = [mode, deepness, convergence, swap, full]. TRUE if changed. */
+/* 2D->3D config poll: out = [mode, deepness, convergence, swap, full, tier]. TRUE if changed. */
 JNIEXPORT jboolean JNICALL NB(nativePollThreed)(JNIEnv *env, jobject thiz, jintArray out) {
     (void)thiz;
-    int mode = 0, deep = 0, conv = 0, swap = 0, full = 0;
-    if (!bsdr_android_poll_threed(&mode, &deep, &conv, &swap, &full)) return JNI_FALSE;
-    jint v[5] = { mode, deep, conv, swap, full };
-    (*env)->SetIntArrayRegion(env, out, 0, 5, v);
+    int mode = 0, deep = 0, conv = 0, swap = 0, full = 0, tier = 0;
+    if (!bsdr_android_poll_threed(&mode, &deep, &conv, &swap, &full, &tier)) return JNI_FALSE;
+    jint v[6] = { mode, deep, conv, swap, full, tier };
+    (*env)->SetIntArrayRegion(env, out, 0, 6, v);
     return JNI_TRUE;
+}
+
+/* Poll the source choice; returns "mode|dev|dev2" (empty string if unchanged since last poll) so
+ * BsdrService can switch between screen capture and Camera2. */
+JNIEXPORT jstring JNICALL NB(nativePollSource)(JNIEnv *env, jobject thiz) {
+    (void)thiz;
+    char mode[16] = "", dev[256] = "", dev2[256] = "";
+    if (!bsdr_android_poll_source(mode, sizeof mode, dev, sizeof dev, dev2, sizeof dev2))
+        return (*env)->NewStringUTF(env, "");
+    char joined[560];
+    snprintf(joined, sizeof joined, "%s|%s|%s", mode, dev, dev2);
+    return (*env)->NewStringUTF(env, joined);
+}
+
+/* Kotlin (CameraManager) publishes the enumerated cameras for the web-UI /api/webcams. `ids` and
+ * `names` are parallel string arrays. */
+JNIEXPORT void JNICALL NB(nativePublishCameras)(JNIEnv *env, jobject thiz,
+                                                jobjectArray ids, jobjectArray names) {
+    (void)thiz;
+    int n = ids ? (int)(*env)->GetArrayLength(env, ids) : 0;
+    if (n > 8) n = 8;
+    bsdr_webcam_dev devs[8];
+    memset(devs, 0, sizeof devs);
+    for (int i = 0; i < n; i++) {
+        jstring jid = (jstring)(*env)->GetObjectArrayElement(env, ids, i);
+        jstring jnm = (jstring)(*env)->GetObjectArrayElement(env, names, i);
+        const char *sid = jid ? (*env)->GetStringUTFChars(env, jid, NULL) : NULL;
+        const char *snm = jnm ? (*env)->GetStringUTFChars(env, jnm, NULL) : NULL;
+        snprintf(devs[i].id,   sizeof devs[i].id,   "%s", sid ? sid : "");
+        snprintf(devs[i].name, sizeof devs[i].name, "%s", snm ? snm : "");
+        if (sid) (*env)->ReleaseStringUTFChars(env, jid, sid);
+        if (snm) (*env)->ReleaseStringUTFChars(env, jnm, snm);
+        if (jid) (*env)->DeleteLocalRef(env, jid);
+        if (jnm) (*env)->DeleteLocalRef(env, jnm);
+    }
+    bsdr_android_set_cameras(devs, n);
+}
+
+/* ---- in-process neural depth (NNAPI): the Kotlin GL pipeline reads back a small grayscale frame
+ * and calls this to fill a depth grid the SBS shader samples. A single persistent engine is kept,
+ * reopened when the tier changes. Returns TRUE if `out` was filled (w*h floats, 0..1, near=1). */
+static bsdr_depth *g_depth;
+static int         g_depth_tier;
+static pthread_mutex_t g_depth_lock = PTHREAD_MUTEX_INITIALIZER;
+
+JNIEXPORT jboolean JNICALL NB(nativeDepth)(JNIEnv *env, jobject thiz,
+                                           jint tier, jbyteArray gray, jint w, jint h, jfloatArray out) {
+    (void)thiz;
+    if (tier <= 0 || w <= 0 || h <= 0) return JNI_FALSE;
+    if ((jint)((*env)->GetArrayLength(env, gray)) < w * h) return JNI_FALSE;
+    if ((jint)((*env)->GetArrayLength(env, out))  < w * h) return JNI_FALSE;
+
+    jboolean ok = JNI_FALSE;
+    pthread_mutex_lock(&g_depth_lock);
+    if (!g_depth || g_depth_tier != tier) {
+        if (g_depth) { bsdr_depth_close(g_depth); g_depth = NULL; }
+        g_depth = bsdr_depth_open((bsdr_depth_tier)tier);
+        g_depth_tier = tier;
+        if (g_depth) BSDR_INFO("bsdr.jni", "depth engine: %s", bsdr_depth_status(g_depth));
+        else BSDR_WARN("bsdr.jni", "depth engine open failed (tier=%d) — model missing? falling back to GL heuristic", tier);
+    }
+    if (g_depth) {
+        jbyte  *g = (*env)->GetByteArrayElements(env, gray, NULL);
+        jfloat *o = (*env)->GetFloatArrayElements(env, out, NULL);
+        if (g && o && bsdr_depth_infer(g_depth, (const uint8_t *)g, w, h, (float *)o) == 0) ok = JNI_TRUE;
+        if (o) (*env)->ReleaseFloatArrayElements(env, out, o, ok ? 0 : JNI_ABORT);
+        if (g) (*env)->ReleaseByteArrayElements(env, gray, g, JNI_ABORT);
+    }
+    pthread_mutex_unlock(&g_depth_lock);
+    return ok;
+}
+
+/* ---- face swap (GL readback -> C ONNX swap -> re-upload). One engine, guarded. ---------------- */
+static bsdr_faceswap *g_fs;
+static int            g_fs_tier;
+static pthread_mutex_t g_fs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Open/close the engine to match `on`. `dir` = the faceswap model dir; tier picks CPU/GPU(NNAPI).
+ * Returns true if the engine is loaded (still needs a source image before it swaps anything). */
+JNIEXPORT jboolean JNICALL NB(nativeFaceswapConfig)(JNIEnv *env, jobject thiz,
+                                                    jboolean on, jstring dir, jint tier) {
+    (void)thiz;
+    jboolean ok = JNI_FALSE;
+    pthread_mutex_lock(&g_fs_lock);
+    if (!on) {
+        if (g_fs) { bsdr_faceswap_close(g_fs); g_fs = NULL; }
+    } else if (!g_fs || g_fs_tier != tier) {
+        if (g_fs) { bsdr_faceswap_close(g_fs); g_fs = NULL; }
+        const char *d = dir ? (*env)->GetStringUTFChars(env, dir, NULL) : NULL;
+        g_fs = bsdr_faceswap_open(d ? d : "", tier >= 2);
+        g_fs_tier = tier;
+        if (d) (*env)->ReleaseStringUTFChars(env, dir, d);
+        if (g_fs) BSDR_INFO("bsdr.jni", "faceswap engine: %s", bsdr_faceswap_status(g_fs));
+        else BSDR_WARN("bsdr.jni", "faceswap engine open failed (models missing?)");
+    }
+    ok = g_fs != NULL;
+    pthread_mutex_unlock(&g_fs_lock);
+    return ok;
+}
+
+/* Set the identity to paste from a packed-RGB source image (decoded in Kotlin). */
+JNIEXPORT jboolean JNICALL NB(nativeFaceswapSource)(JNIEnv *env, jobject thiz,
+                                                    jbyteArray rgb, jint w, jint h) {
+    (void)thiz;
+    if (w <= 0 || h <= 0 || (jint)((*env)->GetArrayLength(env, rgb)) < w*h*3) return JNI_FALSE;
+    jboolean ok = JNI_FALSE;
+    pthread_mutex_lock(&g_fs_lock);
+    if (g_fs) {
+        jbyte *p = (*env)->GetByteArrayElements(env, rgb, NULL);
+        if (p && bsdr_faceswap_set_source_rgb(g_fs, (const uint8_t *)p, w, h) == 0) ok = JNI_TRUE;
+        if (p) (*env)->ReleaseByteArrayElements(env, rgb, p, JNI_ABORT);
+    }
+    pthread_mutex_unlock(&g_fs_lock);
+    return ok;
+}
+
+/* Swap every detected face in the packed-RGB frame IN PLACE. Returns faces swapped (>=0), -1 if not
+ * ready. Called from the GL worker thread. */
+JNIEXPORT jint JNICALL NB(nativeFaceswapProcess)(JNIEnv *env, jobject thiz,
+                                                 jbyteArray rgb, jint w, jint h) {
+    (void)thiz;
+    if (w <= 0 || h <= 0 || (jint)((*env)->GetArrayLength(env, rgb)) < w*h*3) return -1;
+    int n = -1;
+    pthread_mutex_lock(&g_fs_lock);
+    if (g_fs && bsdr_faceswap_ready(g_fs)) {
+        jbyte *p = (*env)->GetByteArrayElements(env, rgb, NULL);
+        if (p) { n = bsdr_faceswap_process_rgb(g_fs, (uint8_t *)p, w, h);
+                 (*env)->ReleaseByteArrayElements(env, rgb, p, n > 0 ? 0 : JNI_ABORT); }
+    }
+    pthread_mutex_unlock(&g_fs_lock);
+    return n;
+}
+
+/* Poll the faceswap config the agent published (from the web-UI card): "on|tier|sourcePath", or ""
+ * if unchanged since the last poll. */
+JNIEXPORT jstring JNICALL NB(nativePollFaceswap)(JNIEnv *env, jobject thiz) {
+    (void)thiz;
+    int on = 0, tier = 0; char src[512] = "";
+    if (!bsdr_android_poll_faceswap(&on, &tier, src, sizeof src))
+        return (*env)->NewStringUTF(env, "");
+    char joined[560];
+    snprintf(joined, sizeof joined, "%d|%d|%s", on, tier, src);
+    return (*env)->NewStringUTF(env, joined);
 }
 
 /* ---- voice computer control: Kotlin -> native ----------------------------*/

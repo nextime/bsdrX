@@ -93,6 +93,10 @@ bool bsdr_micsniff_is_mitm(const bsdr_micsniff *s);
  * call on a live sniffer; safe on NULL. */
 void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void *user);
 
+/* Realtime voice change applied to the decoded owner voice before it reaches the virtual mic / cloud
+ * / command tap. gender -100..100 (pitch/formant), robot/echo/whisper 0..100. Safe on a live sniffer. */
+void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int gender, int robot, int echo, int whisper);
+
 #else  /* no audio backend: inert stubs */
 
 static inline int  bsdr_micsniff_helper_main(int argc, char **argv) { (void)argc; (void)argv; return 1; }
@@ -100,6 +104,7 @@ static inline bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) {
 static inline void bsdr_micsniff_stop(bsdr_micsniff *s) { (void)s; }
 static inline bool bsdr_micsniff_is_mitm(const bsdr_micsniff *s) { (void)s; return false; }
 static inline void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void *user) { (void)s; (void)cb; (void)user; }
+static inline void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int g, int r, int e, int w) { (void)s;(void)g;(void)r;(void)e;(void)w; }
 
 #endif /* BSDR_HAVE_AUDIO */
 

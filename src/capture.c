@@ -19,6 +19,7 @@
 #include "bsdr/protocol.h"
 #include "bsdr/overlay.h"
 #include "bsdr/threed.h"
+#include "bsdr/faceswap.h"
 #include "bsdr/platform.h"
 #include "bsdr/log.h"
 
@@ -63,7 +64,20 @@ struct bsdr_capture {
     AVFilterContext *fg_src, *fg_sink;
     AVFrame *gpu;               /* CUDA NV12 frame out of the filter graph */
     /* ---- file-source playback (cfg.input_file) ---- */
+    /* realtime face swap (borrowed engine, CPU path): NV12 <-> RGB24 scratch + scalers */
+    struct bsdr_faceswap *faceswap;
+    struct SwsContext *fs_to_rgb, *fs_from_rgb;
+    uint8_t *fs_rgb;
     int is_file;                /* decoding a file rather than grabbing the screen */
+    int is_webcam;              /* capturing a camera (live, like screen; CPU scale path) */
+    int is_stereo;              /* two cameras composited side-by-side (real stereo SBS) */
+    /* ---- stereo right-eye input (is_stereo): a second full decode+scale pipeline ---- */
+    AVFormatContext *fmt2;
+    AVCodecContext *dec2;
+    struct SwsContext *sws2;
+    AVFrame *raw2;
+    int eye_w, eye_h;           /* per-eye scaled size; left/right written into c->yuv halves */
+    int sbs_swap;               /* write left cam into the right half and vice-versa */
     int loop;
     AVRational file_tb;         /* video stream time_base (for PTS->wall-clock pacing) */
     double duration_s;          /* file duration in seconds (0 = unknown) */
@@ -81,6 +95,63 @@ void bsdr_capture_set_overlay(bsdr_capture *c, struct bsdr_overlay *ov) {
     c->overlay = ov;
 }
 
+void bsdr_capture_set_faceswap(bsdr_capture *c, struct bsdr_faceswap *fs) {
+    if (c) c->faceswap = fs;
+}
+
+int bsdr_capture_decode_image_rgb(const char *path, uint8_t **rgb, int *w, int *h) {
+    if (!path || !rgb || !w || !h) return -1;
+    AVFormatContext *fmt = NULL; int rc = -1;
+    if (avformat_open_input(&fmt, path, NULL, NULL) != 0) return -1;
+    if (avformat_find_stream_info(fmt, NULL) < 0) goto done;
+    int vs = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (vs < 0) goto done;
+    const AVCodec *dec = avcodec_find_decoder(fmt->streams[vs]->codecpar->codec_id);
+    if (!dec) goto done;
+    AVCodecContext *cc = avcodec_alloc_context3(dec);
+    if (!cc) goto done;
+    avcodec_parameters_to_context(cc, fmt->streams[vs]->codecpar);
+    if (avcodec_open2(cc, dec, NULL) < 0) { avcodec_free_context(&cc); goto done; }
+    AVPacket *pk = av_packet_alloc(); AVFrame *fr = av_frame_alloc();
+    while (av_read_frame(fmt, pk) >= 0) {
+        if (pk->stream_index == vs && avcodec_send_packet(cc, pk) == 0 &&
+            avcodec_receive_frame(cc, fr) == 0) { av_packet_unref(pk); break; }
+        av_packet_unref(pk);
+    }
+    if (fr->width > 0) {
+        int iw = fr->width, ih = fr->height;
+        struct SwsContext *sw = sws_getContext(iw, ih, cc->pix_fmt, iw, ih, AV_PIX_FMT_RGB24, SWS_BILINEAR, NULL, NULL, NULL);
+        uint8_t *buf = malloc((size_t)iw * ih * 3);
+        if (sw && buf) {
+            uint8_t *dst[1] = { buf }; int ds[1] = { iw*3 };
+            sws_scale(sw, (const uint8_t *const *)fr->data, fr->linesize, 0, ih, dst, ds);
+            *rgb = buf; *w = iw; *h = ih; rc = 0;
+        } else free(buf);
+        if (sw) sws_freeContext(sw);
+    }
+    av_frame_free(&fr); av_packet_free(&pk); avcodec_free_context(&cc);
+done:
+    avformat_close_input(&fmt);
+    return rc;
+}
+
+/* Face swap on the pre-encode NV12 frame (CPU path): NV12 -> RGB24 -> swap in place -> NV12. Scalers
+ * are built lazily at the frame size. A no-op until a source identity is set. */
+static void apply_faceswap(bsdr_capture *c, AVFrame *f) {
+    if (!c->faceswap || !bsdr_faceswap_ready(c->faceswap)) return;
+    int w = f->width, h = f->height;
+    if (!c->fs_rgb) {
+        c->fs_to_rgb   = sws_getContext(w,h,AV_PIX_FMT_NV12, w,h,AV_PIX_FMT_RGB24, SWS_BILINEAR,NULL,NULL,NULL);
+        c->fs_from_rgb = sws_getContext(w,h,AV_PIX_FMT_RGB24, w,h,AV_PIX_FMT_NV12, SWS_BILINEAR,NULL,NULL,NULL);
+        c->fs_rgb = malloc((size_t)w*h*3);
+        if (!c->fs_to_rgb || !c->fs_from_rgb || !c->fs_rgb) return;
+    }
+    uint8_t *rgb[1] = { c->fs_rgb }; int rs[1] = { w*3 };
+    sws_scale(c->fs_to_rgb, (const uint8_t *const *)f->data, f->linesize, 0, h, rgb, rs);
+    bsdr_faceswap_process_rgb(c->faceswap, c->fs_rgb, w, h);
+    sws_scale(c->fs_from_rgb, (const uint8_t *const *)rgb, rs, 0, h, f->data, f->linesize);
+}
+
 static int open_encoder(bsdr_capture *c, const bsdr_capture_config *cfg,
                         int w, int h) {
     const char *try_names[6];
@@ -91,6 +162,9 @@ static int open_encoder(bsdr_capture *c, const bsdr_capture_config *cfg,
     else { try_names[n++] = "h264_nvenc"; try_names[n++] = "h264_amf";
            try_names[n++] = "h264_qsv";   try_names[n++] = "h264_mf";
            try_names[n++] = "libx264"; }
+#elif defined(__APPLE__)
+    /* Apple VideoToolbox HW encode -> software x264 fallback */
+    else { try_names[n++] = "h264_videotoolbox"; try_names[n++] = "libx264"; }
 #else
     else { try_names[n++] = "h264_nvenc"; try_names[n++] = "libx264"; }
 #endif
@@ -143,6 +217,17 @@ static int open_encoder(bsdr_capture *c, const bsdr_capture_config *cfg,
             } else {
                 av_opt_set(enc->priv_data, "tune", "ll", 0);  /* low latency (no lookahead/B-frames) */
                 enc->rc_buffer_size = cfg->bitrate;           /* ~1s VBV */
+            }
+        } else if (strstr(try_names[i], "videotoolbox")) {
+            /* Apple VideoToolbox HW H.264. It ignores the nvenc/x264 private options, so give it
+             * its own: High profile to match the Quest consumer, realtime low-latency mode, and a
+             * software fallback so a headless/VM macOS host still encodes. Single slice per frame is
+             * VideoToolbox's default, so no thread_count fiddling (unlike the x264 branch). */
+            av_opt_set(enc->priv_data, "profile", "high", 0);
+            av_opt_set_int(enc->priv_data, "allow_sw", 1, 0);   /* fall back to SW if no HW encoder */
+            if (!cfg->input_file) {
+                av_opt_set_int(enc->priv_data, "realtime", 1, 0);
+                av_opt_set_int(enc->priv_data, "prio_speed", 1, 0);
             }
         } else {
             /* 'veryfast' (not 'ultrafast'): ultrafast disables CABAC + 8x8dct, forcing the SPS to
@@ -370,6 +455,32 @@ static int setup_vaapi(bsdr_capture *c, const bsdr_capture_config *cfg, int ow, 
     return 0;
 }
 
+/* Open one camera via the platform live-video input into *fmt. Shared by the single and stereo
+ * paths. We don't pin resolution/framerate (a mismatch makes the device open fail); the camera's
+ * native mode is taken and the scaler resizes to the output. Returns 0 on success. */
+static int open_webcam(AVFormatContext **fmt, const char *dev) {
+    const AVInputFormat *ifmt;
+    AVDictionary *o = NULL;
+    const char *url = dev;
+#if defined(_WIN32)
+    char buf[300];
+    ifmt = av_find_input_format("dshow");
+    if (strncmp(dev, "video=", 6) != 0) { snprintf(buf, sizeof buf, "video=%s", dev); url = buf; }
+    av_dict_set(&o, "rtbufsize", "128M", 0);    /* absorb bursty USB webcam delivery */
+#elif defined(__APPLE__)
+    ifmt = av_find_input_format("avfoundation");  /* url = device index or name (cameras enum first) */
+    av_dict_set(&o, "framerate", "30", 0);
+#else
+    ifmt = av_find_input_format("v4l2");
+    if (!ifmt) ifmt = av_find_input_format("video4linux2");
+#endif
+    if (!ifmt) { BSDR_ERROR("bsdr.capture", "no webcam input backend on this platform"); av_dict_free(&o); return -1; }
+    int rc = avformat_open_input(fmt, url, ifmt, &o);
+    av_dict_free(&o);
+    if (rc != 0) { BSDR_ERROR("bsdr.capture", "cannot open webcam '%s' (in use, or wrong device?)", dev); return -1; }
+    return 0;
+}
+
 bsdr_capture *bsdr_capture_open(const bsdr_capture_config *cfg_in) {
     bsdr_capture_config cfg = *cfg_in;
     if (!cfg.display) cfg.display = getenv("DISPLAY") ? getenv("DISPLAY") : ":0";
@@ -406,6 +517,30 @@ bsdr_capture *bsdr_capture_open(const bsdr_capture_config *cfg_in) {
         goto have_input;
     }
 
+    /* ---- Webcam source: capture a camera via the platform live-video input. Like the file source it
+     * re-encodes on the CPU scale path so the overlay + 2D->3D compose. We deliberately DON'T pin the
+     * camera's resolution/framerate (a mismatch makes the device open fail) — take the camera's native
+     * mode and let the scaler resize to the output size. Stereo (webcam_right) is handled in
+     * setup_stereo() further down; here we open the single/left camera. ---- */
+    if (cfg.webcam) {
+        c->is_webcam = 1;
+        cfg.cpu_only = 1; cfg.use_vaapi = 0; cfg.use_kmsgrab = 0;
+        if (open_webcam(&c->fmt, cfg.webcam) != 0) { bsdr_capture_close(c); return NULL; }
+        if (cfg.webcam_right && cfg.webcam_right[0]) {
+            if (open_webcam(&c->fmt2, cfg.webcam_right) == 0) {
+                c->is_stereo = 1;
+                c->sbs_swap = cfg.threed_swap;
+                cfg.threed_mode = 0;   /* real stereo composites two feeds -> bypass depth-based SBS */
+            } else {
+                BSDR_WARN("bsdr.capture", "stereo right camera '%s' failed -> single-camera 2D",
+                          cfg.webcam_right);
+            }
+        }
+        BSDR_INFO("bsdr.capture", "webcam source: %s%s", cfg.webcam,
+                  c->is_stereo ? " + right eye (stereo SBS)" : "");
+        goto have_input;
+    }
+
     AVDictionary *opts = NULL;
     char vsize[32];
     if (cfg.width > 0 && cfg.height > 0) {
@@ -431,6 +566,26 @@ bsdr_capture *bsdr_capture_open(const bsdr_capture_config *cfg_in) {
     const char *url = "desktop";
     if (avformat_open_input(&c->fmt, url, ifmt, &opts) != 0) {
         BSDR_ERROR("bsdr.capture", "cannot open gdigrab desktop");
+        av_dict_free(&opts); goto fail;
+    }
+#elif defined(__APPLE__)
+    /* macOS: avfoundation screen grab. It captures a whole display chosen by device index (screens
+     * enumerate after cameras) and has NO grab-time region crop, so the web-UI x/y/w/h region is not
+     * applied here — the CPU scale path downsizes the full display to the output size. cfg.display is
+     * an X11 string on other platforms; reinterpret a bare number as a screen index, else default to
+     * the first screen. draw_mouse/video_size (set above) are x11grab/gdigrab options; drop them and
+     * use avfoundation's capture_cursor + the display's native size. */
+    av_dict_set(&opts, "video_size", NULL, 0);   /* pass the native display size through; scale later */
+    av_dict_set(&opts, "draw_mouse", NULL, 0);
+    av_dict_set(&opts, "capture_cursor", "1", 0);
+    cfg.cpu_only = 1;                             /* no VAAPI/CUDA on macOS -> CPU sws -> videotoolbox */
+    const AVInputFormat *ifmt = av_find_input_format("avfoundation");
+    if (!ifmt) { BSDR_ERROR("bsdr.capture", "avfoundation not available"); av_dict_free(&opts); goto fail; }
+    char avdev[32];
+    int scr = (cfg.display && cfg.display[0] >= '0' && cfg.display[0] <= '9') ? atoi(cfg.display) : 0;
+    snprintf(avdev, sizeof(avdev), "Capture screen %d", scr);
+    if (avformat_open_input(&c->fmt, avdev, ifmt, &opts) != 0) {
+        BSDR_ERROR("bsdr.capture", "cannot open avfoundation \"%s\" (grant Screen Recording permission?)", avdev);
         av_dict_free(&opts); goto fail;
     }
 #else
@@ -485,6 +640,19 @@ have_input:;
     avcodec_parameters_to_context(c->dec, par);
     if (avcodec_open2(c->dec, dec, NULL) < 0) goto fail;
 
+    if (c->is_stereo) {   /* second camera: its own decode pipeline (scaled into the right eye) */
+        if (avformat_find_stream_info(c->fmt2, NULL) < 0) { BSDR_ERROR("bsdr.capture", "stereo: no info from right cam"); goto fail; }
+        AVCodecParameters *p2 = c->fmt2->streams[0]->codecpar;
+        const AVCodec *d2 = avcodec_find_decoder(p2->codec_id);
+        if (!d2) { BSDR_ERROR("bsdr.capture", "stereo: no decoder for right cam"); goto fail; }
+        c->dec2 = avcodec_alloc_context3(d2);
+        if (!c->dec2) goto fail;
+        avcodec_parameters_to_context(c->dec2, p2);
+        if (avcodec_open2(c->dec2, d2, NULL) < 0) { BSDR_ERROR("bsdr.capture", "stereo: right cam decoder open failed"); goto fail; }
+        c->raw2 = av_frame_alloc();
+        if (!c->raw2) goto fail;
+    }
+
     /* Target dims: 0 means "derive from source". If only one is given, scale the
      * other to preserve the desktop's aspect ratio (so e.g. 720p on a 16:10 or
      * ultrawide desktop is not stretched). The Quest sizes its surface from the
@@ -515,9 +683,22 @@ have_input:;
      * VAAPI/CUDA branches below are skipped for it. The packed output is the same size as the source
      * (half-SBS), so the encoder is sized to ow x oh. */
     int enc_w = ow, enc_h = oh;
-    if (cfg.threed_mode) {
+    if (c->is_stereo) {
+        /* Real stereo SBS: two eyes packed into one frame. Default = half-SBS (each eye squished to
+         * ow/2, encoded frame stays ow wide, the format the Quest reads as SBS). threed_full = each
+         * eye at full ow (encoded frame 2x wide), sharper but ~2x the pixels -> bump the bitrate. */
+        if (cfg.threed_full && (long)ow * 2 <= 3840) {
+            c->eye_w = ow & ~1; c->eye_h = oh & ~1;
+            long br = (long)cfg.bitrate * 2; if (br > 24000000) br = 24000000;
+            if (br > cfg.bitrate) cfg.bitrate = (int)br;
+        } else {
+            c->eye_w = (ow / 2) & ~1; c->eye_h = oh & ~1;
+        }
+        enc_w = c->eye_w * 2; enc_h = c->eye_h;
+    } else if (cfg.threed_mode) {
         bsdr_threed_config tc = { .mode = cfg.threed_mode, .deepness = cfg.threed_deepness,
-                                  .convergence = cfg.threed_convergence, .swap = cfg.threed_swap };
+                                  .convergence = cfg.threed_convergence, .swap = cfg.threed_swap,
+                                  .tier = cfg.threed_tier };
         snprintf(tc.ai_cmd, sizeof tc.ai_cmd, "%s", cfg.threed_ai_cmd);
         c->threed = bsdr_threed_create(ow, oh, &tc);
         if (c->threed) enc_w = bsdr_threed_out_width(c->threed);
@@ -539,8 +720,17 @@ have_input:;
     if (open_encoder(c, &cfg, enc_w, enc_h) < 0) {
         BSDR_ERROR("bsdr.capture", "no usable H.264 encoder"); goto fail;
     }
-    c->sws = sws_getContext(c->dec->width, c->dec->height, c->dec->pix_fmt,
-                            ow, oh, AV_PIX_FMT_NV12, SWS_BILINEAR, NULL, NULL, NULL);
+    if (c->is_stereo) {
+        /* each camera scales to a per-eye NV12 tile (written into the two halves of c->yuv) */
+        c->sws  = sws_getContext(c->dec->width,  c->dec->height,  c->dec->pix_fmt,
+                                 c->eye_w, c->eye_h, AV_PIX_FMT_NV12, SWS_BILINEAR, NULL, NULL, NULL);
+        c->sws2 = sws_getContext(c->dec2->width, c->dec2->height, c->dec2->pix_fmt,
+                                 c->eye_w, c->eye_h, AV_PIX_FMT_NV12, SWS_BILINEAR, NULL, NULL, NULL);
+        if (!c->sws2) { BSDR_ERROR("bsdr.capture", "stereo: right sws alloc failed"); goto fail; }
+    } else {
+        c->sws = sws_getContext(c->dec->width, c->dec->height, c->dec->pix_fmt,
+                                ow, oh, AV_PIX_FMT_NV12, SWS_BILINEAR, NULL, NULL, NULL);
+    }
     c->yuv = av_frame_alloc();
     if (!c->sws || !c->yuv) { BSDR_ERROR("bsdr.capture", "sws/frame alloc failed"); goto fail; }
     c->yuv->format = AV_PIX_FMT_NV12; c->yuv->width = enc_w; c->yuv->height = enc_h;
@@ -598,10 +788,32 @@ static int cap_encode_yuv(bsdr_capture *c, const uint8_t **au, size_t *len, uint
                                c->yuv->data[0], c->yuv->linesize[0],
                                c->yuv->data[1], c->yuv->linesize[1]);
     c->yuv->pts = c->frame_index;
+    apply_faceswap(c, c->yuv);
     if (avcodec_send_frame(c->enc, c->yuv) < 0) return 0;
     if (avcodec_receive_packet(c->enc, c->opkt) == 0) {
         *au = c->opkt->data; *len = c->opkt->size;
         *rtp_ts = (uint32_t)(c->frame_index++ * BSDR_VIDEO_CLOCK_HZ / c->fps);
+        return 1;
+    }
+    return 0;
+}
+
+/* Stereo: read one decoded frame from (fmt,dec) and scale it into the c->yuv half at x-offset
+ * dst_x (an NV12 sub-rectangle — Y and interleaved-UV both start at byte dst_x). Returns 1 on a
+ * composed eye, 0 if no frame yet, <0 if the camera ended. */
+static int read_scale_eye(bsdr_capture *c, AVFormatContext *fmt, AVCodecContext *dec,
+                          AVFrame *raw, struct SwsContext *sws, int dst_x) {
+    for (int tries = 0; tries < 256; tries++) {
+        if (av_read_frame(fmt, c->ipkt) < 0) return -1;
+        if (c->ipkt->stream_index != 0) { av_packet_unref(c->ipkt); continue; }
+        int sr = avcodec_send_packet(dec, c->ipkt);
+        av_packet_unref(c->ipkt);
+        if (sr < 0) continue;
+        if (avcodec_receive_frame(dec, raw) != 0) continue;
+        uint8_t *dst[4] = { c->yuv->data[0] + dst_x, c->yuv->data[1] + dst_x, NULL, NULL };
+        int dls[4] = { c->yuv->linesize[0], c->yuv->linesize[1], 0, 0 };
+        sws_scale(sws, (const uint8_t *const *)raw->data, raw->linesize, 0, dec->height, dst, dls);
+        av_frame_unref(raw);
         return 1;
     }
     return 0;
@@ -615,6 +827,31 @@ int bsdr_capture_frame(bsdr_capture *c, const uint8_t **au, size_t *len,
         *au = c->opkt->data; *len = c->opkt->size;
         *rtp_ts = (uint32_t)(c->frame_index++ * BSDR_VIDEO_CLOCK_HZ / c->fps);
         return 1;
+    }
+
+    if (c->is_stereo) {
+        /* compose one frame from BOTH cameras: left cam -> left half, right cam -> right half
+         * (swapped if requested). Each eye is a scaled NV12 tile written into c->yuv. */
+        int lx = c->sbs_swap ? c->eye_w : 0;
+        int rx = c->sbs_swap ? 0 : c->eye_w;
+        int a = read_scale_eye(c, c->fmt,  c->dec,  c->raw,  c->sws,  lx);
+        int b = read_scale_eye(c, c->fmt2, c->dec2, c->raw2, c->sws2, rx);
+        if (a < 0 || b < 0) return -1;
+        if (a == 0 || b == 0) return 0;
+        if (c->overlay)
+            bsdr_overlay_render_nv12(c->overlay, c->yuv->data[0], c->yuv->linesize[0],
+                                     c->yuv->data[1], c->yuv->linesize[1],
+                                     c->yuv->width, c->yuv->height);
+        c->yuv->pts = c->frame_index;
+        c->have_frame = 1;
+        apply_faceswap(c, c->yuv);
+        if (avcodec_send_frame(c->enc, c->yuv) < 0) return 0;
+        if (avcodec_receive_packet(c->enc, c->opkt) == 0) {
+            *au = c->opkt->data; *len = c->opkt->size;
+            *rtp_ts = (uint32_t)(c->frame_index++ * BSDR_VIDEO_CLOCK_HZ / c->fps);
+            return 1;
+        }
+        return 0;
     }
 
     if (c->is_file) {
@@ -692,6 +929,7 @@ read_frame:
         c->yuv->pts = c->frame_index;   /* monotonic */
         c->have_frame = 1;              /* c->yuv/src now hold a frame we can re-encode while paused */
         av_frame_unref(c->raw);
+        apply_faceswap(c, c->yuv);      /* deepfake the encoder frame (CPU path only) */
         enc_in = c->yuv;
     }
     if (avcodec_send_frame(c->enc, enc_in) < 0) return 0;
@@ -737,15 +975,22 @@ void bsdr_capture_close(bsdr_capture *c) {
     if (c->opkt) { av_packet_unref(c->opkt); av_packet_free(&c->opkt); }
     if (c->ipkt) { av_packet_unref(c->ipkt); av_packet_free(&c->ipkt); }
     if (c->raw) av_frame_free(&c->raw);
+    if (c->raw2) av_frame_free(&c->raw2);
     if (c->yuv) av_frame_free(&c->yuv);
     if (c->src) av_frame_free(&c->src);
     if (c->gpu) av_frame_free(&c->gpu);
     if (c->sws) sws_freeContext(c->sws);
+    if (c->sws2) sws_freeContext(c->sws2);
+    if (c->fs_to_rgb) sws_freeContext(c->fs_to_rgb);
+    if (c->fs_from_rgb) sws_freeContext(c->fs_from_rgb);
+    free(c->fs_rgb);
     if (c->enc) avcodec_free_context(&c->enc);
     if (c->fg) avfilter_graph_free(&c->fg);
     if (c->hw_device) av_buffer_unref(&c->hw_device);
     if (c->dec) avcodec_free_context(&c->dec);
+    if (c->dec2) avcodec_free_context(&c->dec2);
     if (c->fmt) avformat_close_input(&c->fmt);
+    if (c->fmt2) avformat_close_input(&c->fmt2);
     if (c->threed) bsdr_threed_close(c->threed);
     free(c);
 }

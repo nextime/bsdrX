@@ -8,6 +8,8 @@
  * Nearest sampling and a tiny depth grid keep it to a few linear passes over the frame.
  */
 #include "bsdr/threed.h"
+#include "bsdr/depth.h"
+#include "bsdr/model_store.h"
 #include "bsdr/log.h"
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +50,12 @@ struct bsdr_threed {
     float   *depth;  /* current depth grid (temporally smoothed) */
     float   *dnew;   /* freshly estimated grid before smoothing */
     uint64_t frames;
+
+    /* in-process neural depth (depth.h / ONNX Runtime), cross-platform. tier 0 = use the
+     * co-process/heuristic; 1/2/3 = CPU/GPU/HI. Opened lazily; falls back on failure. */
+    int          tier;
+    int          depth_gave_up;   /* 1 once we stopped trying the in-process engine this session */
+    bsdr_depth  *engine;
 
 #ifndef _WIN32
     /* AI co-process */
@@ -171,21 +179,42 @@ static void heuristic_depth(bsdr_threed *t) {
     }
 }
 
+/* smooth a freshly estimated t->dnew into t->depth (damps per-estimate flicker) and return. */
+static void smooth_into_depth(bsdr_threed *t) {
+    int np = t->dw * t->dh;
+    for (int i = 0; i < np; i++) t->depth[i] = 0.5f * t->depth[i] + 0.5f * t->dnew[i];
+}
+
 static void update_depth(bsdr_threed *t, const uint8_t *sy, int stride) {
-#ifndef _WIN32
-    /* AI depth co-process is POSIX-only; Windows always uses the heuristic. */
-    int use_ai = (t->cfg.mode == BSDR_3D_AI) && !t->ai_dead;
-    if (use_ai && (t->frames % AI_EVERY) != 0 && t->frames > 0) return;   /* reuse last AI grid */
-#endif
+    int ai = (t->cfg.mode == BSDR_3D_AI);
+    /* Any AI source recomputes only every AI_EVERY frames and reuses the grid in between. */
+    if (ai && (t->frames % AI_EVERY) != 0 && t->frames > 0) return;
     build_gray(t, sy, stride);
-#ifndef _WIN32
-    if (use_ai && ai_depth(t) == 0) {
-        /* temporal smoothing to damp per-estimate flicker */
-        int np = t->dw * t->dh;
-        for (int i = 0; i < np; i++) t->depth[i] = 0.5f * t->depth[i] + 0.5f * t->dnew[i];
-        return;
+
+    /* 1) in-process neural depth (cross-platform), when a tier is selected. */
+    if (ai && t->tier > 0 && !t->depth_gave_up && bsdr_depth_available()) {
+        if (!t->engine) {
+            t->engine = bsdr_depth_open((bsdr_depth_tier)t->tier);   /* kicks a bg download if uncached */
+            if (!t->engine) {
+                /* Only give up permanently if the model IS present but still won't load (no ORT / bad
+                 * model). If it's merely absent, a background download is underway — keep retrying so
+                 * neural depth kicks in the moment the download lands (heuristic covers the gap). */
+                if (bsdr_model_present(t->tier)) {
+                    t->depth_gave_up = 1;
+                    BSDR_WARN("bsdr.threed", "in-process depth (tier %d) unavailable -> co-process/heuristic", t->tier);
+                }
+            }
+            else BSDR_INFO("bsdr.threed", "in-process depth: %s", bsdr_depth_status(t->engine));
+        }
+        if (t->engine && bsdr_depth_infer(t->engine, t->gray, t->dw, t->dh, t->dnew) == 0) {
+            smooth_into_depth(t); return;
+        }
     }
+#ifndef _WIN32
+    /* 2) external depth co-process (POSIX only). */
+    if (ai && !t->ai_dead && ai_depth(t) == 0) { smooth_into_depth(t); return; }
 #endif
+    /* 3) built-in heuristic. */
     heuristic_depth(t);
     memcpy(t->depth, t->dnew, (size_t)t->dw * t->dh * sizeof(float));
 }
@@ -204,6 +233,7 @@ bsdr_threed *bsdr_threed_create(int src_w, int src_h, const bsdr_threed_config *
     bsdr_threed *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->cfg = *cfg;
+    t->tier = cfg->tier;
     t->sw = src_w; t->sh = src_h;
     t->out_w = src_w;   /* half-SBS: packed output == source frame size (correct-aspect screen) */
     t->dw = src_w > DEPTH_W ? DEPTH_W : (src_w & ~1);
@@ -282,6 +312,7 @@ void bsdr_threed_close(bsdr_threed *t) {
 #ifndef _WIN32
     ai_stop(t);
 #endif
+    bsdr_depth_close(t->engine);
     free(t->gray); free(t->depth); free(t->dnew);
     free(t);
 }

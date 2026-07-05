@@ -29,6 +29,7 @@
 #if (defined(__linux__) || defined(__APPLE__) || defined(_WIN32)) && defined(BSDR_HAVE_AUDIO)
 
 #include "bsdr/audio.h"
+#include "bsdr/voicefx.h"
 #include "bsdr/platform.h"
 #include "micsniff_capture.h"
 
@@ -106,6 +107,11 @@ struct bsdr_micsniff {
     bsdr_audio_player *player;
     OpusDecoder *dec;
 
+    /* realtime voice changer (gender shift) applied to the decoded owner voice before it reaches the
+     * virtual mic / the cloud / the command tap. 0 = off. */
+    bsdr_voicefx *fx;
+    bsdr_voicefx_params fxp;
+
     /* optional voice-command tap (set by the agent while computer-control is on) */
     bsdr_micsniff_pcm_cb pcm_cb;
     void        *pcm_user;
@@ -153,6 +159,15 @@ static void build_arp(uint8_t f[42], int op, const uint8_t smac[6], uint32_t sip
     f[18] = 6; f[19] = 4; f[20] = (uint8_t)(op >> 8); f[21] = (uint8_t)op;
     memcpy(f + 22, smac, 6); memcpy(f + 28, &sip, 4);
     memcpy(f + 32, tmac, 6); memcpy(f + 38, &tip, 4);
+}
+
+/* Realtime voice change on the decoded owner voice (in place), lazily creating/reconfiguring the DSP
+ * when the gender knob changes. A gender of 0 is a no-op. 48 kHz mono, as decoded from the Opus. */
+static void micsniff_apply_fx(struct bsdr_micsniff *s, int16_t *pcm, int frames) {
+    if (!s->fxp.gender && !s->fxp.robot && !s->fxp.echo && !s->fxp.whisper) return;
+    if (!s->fx) { s->fx = bsdr_voicefx_new(48000); if (!s->fx) return; }
+    bsdr_voicefx_set_params(s->fx, &s->fxp);
+    bsdr_voicefx_process(s->fx, pcm, frames);
 }
 
 /* Parse one captured IPv4 datagram: strip the 8B [ssrc][frame_id] trailer, dedupe the 2x send,
@@ -206,6 +221,7 @@ static void handle_ip(struct bsdr_micsniff *s, const uint8_t *ip, int len) {
         struct in_addr a; a.s_addr = dst_be;
         BSDR_INFO("bsdr.micsniff", "locked owner-mic flow: %s -> %s:%u ssrc=%u (mono Opus)",
                   s->quest_ip, inet_ntoa(a), dport, ssrc);
+        micsniff_apply_fx(s, probe, fr);
         if (s->player) bsdr_audio_player_push(s->player, probe, fr);
         if (s->pcm_cb) s->pcm_cb(s->pcm_user, probe, fr, 1);
         s->decoded++;
@@ -218,6 +234,7 @@ static void handle_ip(struct bsdr_micsniff *s, const uint8_t *ip, int len) {
     int16_t pcm[5760];
     int fr = opus_decode(s->dec, pl, olen, pcm, 5760, 0);
     if (fr <= 0) return;
+    micsniff_apply_fx(s, pcm, fr);
     if (s->player) bsdr_audio_player_push(s->player, pcm, fr);
     if (s->pcm_cb) s->pcm_cb(s->pcm_user, pcm, fr, 1);
     if ((++s->decoded % 500) == 0)
@@ -745,6 +762,12 @@ void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void 
     s->pcm_cb = cb;   /* set user before cb so the sniffer thread never sees a stale pair */
 }
 
+void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int gender, int robot, int echo, int whisper) {
+    if (!s) return;
+    if (gender < -100) gender = -100; else if (gender > 100) gender = 100;
+    s->fxp.gender = gender; s->fxp.robot = robot; s->fxp.echo = echo; s->fxp.whisper = whisper;
+}
+
 void bsdr_micsniff_stop(bsdr_micsniff *s) {
     if (!s) return;
     s->stop = 1;
@@ -752,6 +775,7 @@ void bsdr_micsniff_stop(bsdr_micsniff *s) {
     stop_capture(s);
     if (s->player) { bsdr_audio_player_free(s->player); s->player = NULL; }
     if (s->dec) { opus_decoder_destroy(s->dec); s->dec = NULL; }
+    if (s->fx) { bsdr_voicefx_free(s->fx); s->fx = NULL; }
     if (s->sink_mod >= 0 || s->src_mod >= 0) bsdr_virtual_mic_destroy(s->sink_mod, s->src_mod);
     free(s);
 }
@@ -767,6 +791,9 @@ void bsdr_micsniff_stop(bsdr_micsniff *s) { (void)s; }
 bool bsdr_micsniff_is_mitm(const bsdr_micsniff *s) { (void)s; return false; }
 void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void *user) {
     (void)s; (void)cb; (void)user;
+}
+void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int gender, int robot, int echo, int whisper) {
+    (void)s; (void)gender; (void)robot; (void)echo; (void)whisper;
 }
 int bsdr_micsniff_helper_main(int argc, char **argv) { (void)argc; (void)argv; return 1; }
 

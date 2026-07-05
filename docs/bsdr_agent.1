@@ -83,6 +83,22 @@ heuristic if no model is given, e.g.
 .RB ( "python3 scripts/bsdr-depth-helper.py --model midas_v21_small.onnx" ).
 Without a command \(em or if the helper stalls or dies \(em 3D falls back to \fBfast\fR. All 3D
 options are also settable live from the web panel.
+.TP
+.BI \-\-threed\-tier " T"
+Use bsdrX's \fBbuilt-in\fR neural depth (no external helper or Python), in one of three tiers
+(implies \fBai\fR mode). \fBcpu\fR = Depth-Anything-V2-Small (runs on any CPU); \fBgpu\fR = MiDaS
+DPT-Hybrid on a small GPU; \fBhi\fR = MiDaS DPT-Large on a strong GPU. GPU tiers use the platform
+accelerator (DirectML on Windows, CoreML on macOS, NNAPI on Android, CUDA on NVIDIA) and fall back
+to CPU. The model is downloaded and cached on first use, or imported from a distributed zip (see
+below). Falls back to the external helper, then \fBfast\fR, if the model or ONNX Runtime is
+unavailable.
+.TP
+.BI \-\-threed\-model\-dir " DIR"
+Directory used to cache and look up depth models (default: the per-OS cache directory).
+.TP
+.BI \-\-threed\-model\-import " ZIP"
+Import depth model(s) from a distributed model zip into the cache, then exit. Accepts a per-model
+zip or the all-models zip; each model is verified against its checksum. Use this for offline hosts.
 .SS Headset
 .TP
 .BI \-\-quest_ip " IP"

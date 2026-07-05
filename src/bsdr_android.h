@@ -27,6 +27,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "bsdr/webcam.h"
 
 /* One-time init for the shim globals (mutexes). Call from the JNI start path
  * before the agent thread is spawned. Idempotent. */
@@ -48,8 +49,22 @@ int  bsdr_android_capture_want(int *width, int *height, int *fps, int *bitrate);
 /* 2D->3D: the agent publishes the current SBS config here; the JNI bridge polls it and drives the
  * Kotlin GL pipeline (MediaProjection -> SBS shader -> MediaCodec). mode 0=off/1=fast/2=ai (ai is
  * treated as fast on Android). poll returns 1 if changed since the last poll. */
-void bsdr_android_publish_threed(int mode, int deepness, int convergence, int swap, int full);
-int  bsdr_android_poll_threed(int *mode, int *deepness, int *convergence, int *swap, int *full);
+void bsdr_android_publish_threed(int mode, int deepness, int convergence, int swap, int full, int tier);
+int  bsdr_android_poll_threed(int *mode, int *deepness, int *convergence, int *swap, int *full, int *tier);
+
+/* ---- webcam source + camera list --------------------------------------------
+ * The agent publishes the operator's source choice (desktop/webcam/webcam3d + device ids); the JNI
+ * bridge polls it and switches the Kotlin capture (screen vs Camera2). Kotlin (CameraManager)
+ * publishes the camera list back via bsdr_android_set_cameras for the web-UI /api/webcams. */
+void bsdr_android_publish_source(const char *mode, const char *dev, const char *dev2);
+int  bsdr_android_poll_source(char *mode, size_t ml, char *dev, size_t dl, char *dev2, size_t d2l);
+void bsdr_android_set_cameras(const bsdr_webcam_dev *cams, int n);
+int  bsdr_android_cameras(bsdr_webcam_dev *out, int max);
+
+/* face swap: the agent publishes the web-UI card's enable/tier/source; the JNI bridge polls it and
+ * drives the Kotlin GL faceswap stage (readback -> C ONNX swap -> re-upload). */
+void bsdr_android_publish_faceswap(int on, int tier, const char *source);
+int  bsdr_android_poll_faceswap(int *on, int *tier, char *source, size_t sl);
 
 /* ---- audio: Kotlin AudioRecord -> audio_android capture -------------------*/
 /* Interleaved int16 system-audio PCM (AudioPlaybackCapture) into the agent. */

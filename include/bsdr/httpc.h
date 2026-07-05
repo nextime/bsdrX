@@ -36,4 +36,11 @@ int bsdr_http_request(const char *method, const char *url,
 int bsdr_http_status(const char *resp);
 const char *bsdr_http_body(const char *resp);   /* points past the headers, or NULL */
 
+/* Stream a GET of `url` to the file `dest_path` (truncated/created), following up to 8 redirects
+ * and decoding chunked transfer-encoding. Suitable for large files (models) that don't fit in RAM.
+ * `progress` (may be NULL) is called with (bytes_done, total_or_0). Returns 0 on success, -1 on
+ * failure (connect/redirect/HTTP-status/write error). */
+int bsdr_http_download(const char *url, const char *dest_path,
+                       void (*progress)(size_t done, size_t total));
+
 #endif /* BSDR_HTTPC_H */

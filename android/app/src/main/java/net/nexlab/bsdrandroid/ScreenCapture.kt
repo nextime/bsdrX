@@ -45,7 +45,19 @@ class ScreenCapture(
     private var tdConv = 0
     private var tdSwap = 0
     private var tdFull = 1
-    private val td = IntArray(5)
+    private var tdTier = 0
+    private val td = IntArray(6)
+    @Volatile private var fsOn = false   // face swap active (routes through the GL stage)
+
+    /** Enable/disable the GL face-swap stage. Recreates the codec if that changes whether a GL stage
+     *  is needed at all (it's shared with SBS). */
+    fun setFaceswap(on: Boolean) {
+        if (fsOn == on) return
+        val needRecreate = (tdMode == 0)   // without 3D, turning fs on/off adds/removes the GL stage
+        fsOn = on
+        sbs?.setFaceswap(on)
+        if (needRecreate) { closeCodec(); openCodec() }
+    }
 
     fun start() {
         if (running) return
@@ -83,30 +95,40 @@ class ScreenCapture(
         codec = c
         /* 2D->3D: when enabled, splice a GL SBS stage between the projection (rendered at the display
          * size) and the encoder input (encW wide). On any GL failure, fall back to a flat encode. */
-        val target: Surface = if (tdMode != 0) {
+        val target: Surface = if (tdMode != 0 || fsOn) {
             try {
                 SbsGlPipeline(codecSurface, width, encW, height).also {
-                    it.setParams(tdMode, tdDeep, tdConv, tdSwap)
+                    it.setParams(tdMode, tdDeep, tdConv, tdSwap, tdTier)
+                    it.setFaceswap(fsOn)
                     sbs = it
                 }.inputSurface
             } catch (e: Exception) {
-                Log.w(TAG, "SBS pipeline unavailable -> flat: ${e.message}")
+                Log.w(TAG, "GL pipeline unavailable -> flat: ${e.message}")
                 sbs = null
                 codecSurface
             }
         } else codecSurface
-        display = projection.createVirtualDisplay(
-            "bsdr-screen", width, height, dpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, target, null, null)
+        // Android 14+ forbids calling createVirtualDisplay more than once on the same MediaProjection.
+        // Create it ONCE and, on every later codec recreate (resolution / 3D toggle), just resize it
+        // and re-point it at the new encoder surface.
+        val d = display
+        if (d == null) {
+            display = projection.createVirtualDisplay(
+                "bsdr-screen", width, height, dpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, target, null, null)
+        } else {
+            d.resize(width, height, dpi)
+            d.surface = target
+        }
     }
 
     private fun closeCodec() {
-        try { display?.release() } catch (_: Exception) {}
+        try { display?.surface = null } catch (_: Exception) {}   // detach before releasing the surface (keep the display)
         try { sbs?.release() } catch (_: Exception) {}   // stop GL before releasing the codec surface
         try { codec?.stop() } catch (_: Exception) {}
         try { codec?.release() } catch (_: Exception) {}
         try { surface?.release() } catch (_: Exception) {}
-        display = null; sbs = null; codec = null; surface = null
+        sbs = null; codec = null; surface = null
     }
 
     /** Live bitrate via setParameters; resolution change requires a codec recreate. */
@@ -134,12 +156,12 @@ class ScreenCapture(
             if (NativeBridge.nativePollVideoWant(want)) applyWant(want[0], want[1], want[2], want[3])
             if (NativeBridge.nativePollThreed(td)) {
                 val wasOn = tdMode != 0
-                tdMode = td[0]; tdDeep = td[1]; tdConv = td[2]; tdSwap = td[3]; tdFull = td[4]
+                tdMode = td[0]; tdDeep = td[1]; tdConv = td[2]; tdSwap = td[3]; tdFull = td[4]; tdTier = td[5]
                 if ((tdMode != 0) != wasOn) {   // on/off recreates the pipeline; params retune live
                     Log.i(TAG, "2D->3D ${if (tdMode != 0) "on" else "off"} (recreating)")
                     closeCodec(); openCodec()
                 } else {
-                    sbs?.setParams(tdMode, tdDeep, tdConv, tdSwap)
+                    sbs?.setParams(tdMode, tdDeep, tdConv, tdSwap, tdTier)
                 }
             }
             val idx = try { c.dequeueOutputBuffer(info, 10_000) } catch (e: Exception) { -1 }
@@ -155,10 +177,21 @@ class ScreenCapture(
         }
     }
 
+    /** Pause encoding but KEEP the VirtualDisplay (its createVirtualDisplay can't be re-issued on the
+     *  same MediaProjection). Used when switching the source to a webcam; resume() with start(). */
+    fun pause() {
+        if (!running) return
+        running = false
+        try { thread?.join(500) } catch (_: InterruptedException) {}
+        closeCodec()   // keeps `display`; its surface is detached
+    }
+
     fun stop() {
         running = false
         try { thread?.join(500) } catch (_: InterruptedException) {}
         closeCodec()
+        try { display?.release() } catch (_: Exception) {}   // release the VirtualDisplay only on full stop
+        display = null
     }
 
     companion object { private const val TAG = "bsdr.capture" }

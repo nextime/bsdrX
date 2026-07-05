@@ -60,16 +60,13 @@ full agent on Linux and quietly drops any feature whose libraries are missing.
 
 ```bash
 ./configure              # detects host OS, OpenSSL, and media deps
-make                     # -> build/bsdr_agent
+make                     # -> build/bsdr_agent  (full media; errors if deps missing)
 make check               # build + run the test suite
 sudo make install        # -> $(prefix) (bin, man page; DESTDIR honored)
 man bsdr_agent           # full option reference
 
-./configure --disable-media     # input-only agent; also --disable-video/-audio/-sctp
-make linux-static               # static Linux binary (core agent, no media)
-
 # CMake is supported too:
-cmake -S . -B build -DBSDR_ENABLE_VIDEO=ON -DBSDR_ENABLE_AUDIO=ON && cmake --build build -j
+cmake -S . -B build -DBSDR_ENABLE_VIDEO=ON -DBSDR_ENABLE_AUDIO=ON -DBSDR_ENABLE_SCTP=ON && cmake --build build -j
 ```
 
 **Dependencies** (Debian/Ubuntu names): `libssl-dev` (always); for media add

@@ -11,6 +11,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- streaming a local file to the headset is a dataSync foreground service -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- webcam source: camera capture from the foreground service (Android 14+ typed FGS) -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- the floating "balloon" control overlay that survives app-switching -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
@@ -40,7 +44,7 @@
         <service
             android:name=".BsdrService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection|dataSync" />
+            android:foregroundServiceType="mediaProjection|dataSync|camera" />
 
         <!-- receives marshalled input from the headset and dispatches gestures/text -->
         <service

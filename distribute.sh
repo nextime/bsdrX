@@ -10,6 +10,7 @@
 #   ./distribute.sh                 # clean + build all four
 #   ./distribute.sh linux windows   # only the named platforms
 #   SKIP=osx ./distribute.sh        # build all except osx
+#   ./distribute.sh --no-cache osx  # force a from-scratch rebuild of the docker image(s)
 #
 # Key env overrides:
 #   WIN_DEPS   mingw dep prefix (default: ../win-deps or ./win-deps if present)
@@ -17,6 +18,9 @@
 #   ANDROID_VARIANT   debug|release (default: debug)
 #   OSXCROSS_DIR   docker-osxcross checkout (default: /storage/osxcross/docker-osxcross)
 #   NO_CLEAN=1     skip the clean step
+#   NO_CACHE=1     (or --no-cache) rebuild the docker images from scratch, ignoring
+#                  layer cache AND any already-tagged image — use after editing a
+#                  Dockerfile / dep script so stale baked deps don't get reused
 #
 # Failures on one platform do NOT abort the others; a summary is printed at the end.
 
@@ -54,6 +58,22 @@ secs()  { local s=$1; printf '%dm%02ds' $((s/60)) $((s%60)); }
 record(){ RESULTS+=("$1|$2|$3"); }   # platform|status|detail
 # rename a produced artifact to a version-stamped name in dist/
 vmv(){ [ -f "$DIST/$1" ] && mv -f "$DIST/$1" "$DIST/$2" && ok "packaged $2"; }
+
+# ---- flags -------------------------------------------------------------------
+# Extract --no-cache (leaving the positional platform args intact). Also honored
+# via NO_CACHE=1 in the environment.
+NO_CACHE="${NO_CACHE:-0}"
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --no-cache) NO_CACHE=1 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+# docker build flag + a message tag; when set we also FORCE a rebuild of an
+# already-tagged image (below) so --no-cache actually takes effect.
+NC=""; [ "$NO_CACHE" = 1 ] && NC="--no-cache"
 
 # ---- platform selection ------------------------------------------------------
 ALL=(linux windows osx android relay)
@@ -155,9 +175,9 @@ build_linux(){
   banner "Linux bundle  ->  dist/bsdrX.zip"
   local t0=$SECONDS
   if ! docker_ok; then err "docker not available/running — cannot build the Linux bundle"; record linux SKIP "docker unavailable"; return; fi
-  if ! $DOCKER image inspect "$LINUX_IMAGE" >/dev/null 2>&1; then
-    log "  building docker image ${C}$LINUX_IMAGE${Z} (first run: compiles a minimal ffmpeg — several minutes)…"
-    if ! $DOCKER build -f "$ROOT/scripts/linux-bundle.Dockerfile" -t "$LINUX_IMAGE" "$ROOT/scripts"; then
+  if [ -n "$NC" ] || ! $DOCKER image inspect "$LINUX_IMAGE" >/dev/null 2>&1; then
+    log "  building docker image ${C}$LINUX_IMAGE${Z}${NC:+ (--no-cache)} (compiles a minimal ffmpeg — several minutes)…"
+    if ! $DOCKER build $NC -f "$ROOT/scripts/linux-bundle.Dockerfile" -t "$LINUX_IMAGE" "$ROOT/scripts"; then
       err "image build failed"; record linux FAIL "image build"; return; fi
     ok "image $LINUX_IMAGE built"
   else ok "reusing image $LINUX_IMAGE"; fi
@@ -192,18 +212,19 @@ build_osx(){
   banner "macOS bundle  ->  dist/bsdrX-osx.zip"
   local t0=$SECONDS
   if ! docker_ok; then err "docker not available/running — cannot build the macOS bundle"; record osx SKIP "docker unavailable"; return; fi
-  if ! $DOCKER image inspect "$OSX_IMAGE" >/dev/null 2>&1; then
-    # need an osxcross base first
+  if [ -n "$NC" ] || ! $DOCKER image inspect "$OSX_IMAGE" >/dev/null 2>&1; then
+    # need an osxcross base first (the heavy SDK carrier — only (re)built when it's
+    # actually missing; --no-cache does not force-rebuild an existing base).
     if ! $DOCKER image inspect osxcross:local >/dev/null 2>&1; then
       if [ -d "$OSXCROSS_DIR" ]; then
-        log "  building osxcross base image (docker buildx bake in $OSXCROSS_DIR)…"
-        if ! ( cd "$OSXCROSS_DIR" && $DOCKER buildx bake ); then err "osxcross base build failed"; record osx FAIL "osxcross base"; return; fi
+        log "  building osxcross base image (docker buildx bake in $OSXCROSS_DIR)${NC:+ (--no-cache)}…"
+        if ! ( cd "$OSXCROSS_DIR" && $DOCKER buildx bake $NC ); then err "osxcross base build failed"; record osx FAIL "osxcross base"; return; fi
       else
         err "no osxcross:local image and no $OSXCROSS_DIR — set OSXCROSS_DIR to your docker-osxcross checkout"; record osx SKIP "no osxcross"; return
       fi
     fi
-    log "  building docker image ${C}$OSX_IMAGE${Z} (cross-builds darwin openssl/opus/srtp2/usrsctp/pcap)…"
-    if ! $DOCKER build -f "$ROOT/scripts/osx-bundle.Dockerfile" -t "$OSX_IMAGE" "$ROOT/scripts"; then
+    log "  building docker image ${C}$OSX_IMAGE${Z}${NC:+ (--no-cache)} (cross-builds darwin openssl/opus/srtp2/usrsctp/pcap/ffmpeg)…"
+    if ! $DOCKER build $NC -f "$ROOT/scripts/osx-bundle.Dockerfile" -t "$OSX_IMAGE" "$ROOT/scripts"; then
       err "image build failed"; record osx FAIL "image build"; return; fi
     ok "image $OSX_IMAGE built"
   else ok "reusing image $OSX_IMAGE"; fi
@@ -250,12 +271,25 @@ build_relay(){
   else err "build-micrelay.sh failed"; record relay FAIL "relay script"; fi
 }
 
+# ---- depth model zips (opt-in: heavy ~2GB download; NOT in the default set) ---
+# Produces dist/bsdrX-model-{cpu,gpu,hi}.zip + bsdrX-models.zip that users import via the web UI
+# "Import model zip" or --threed-model-import. Run explicitly: ./distribute.sh models
+build_models(){
+  banner "Depth model zips  ->  dist/bsdrX-model-*.zip"
+  local t0=$SECONDS
+  if ! have curl || ! have zip; then err "curl/zip needed"; record models SKIP "no curl/zip"; return; fi
+  if OUT="$DIST" bash "$ROOT/scripts/build-model-zips.sh"; then
+    record models OK "$(secs $((SECONDS-t0)))"
+  else err "build-model-zips.sh failed"; record models FAIL "model script"; fi
+}
+
 # ---- run selected platforms --------------------------------------------------
 [ -n "${WANT[linux]:-}"   ] && build_linux
 [ -n "${WANT[windows]:-}" ] && build_windows
 [ -n "${WANT[osx]:-}"     ] && build_osx
 [ -n "${WANT[android]:-}" ] && build_android
 [ -n "${WANT[relay]:-}"   ] && build_relay
+[ -n "${WANT[models]:-}"  ] && build_models
 
 # ---- summary -----------------------------------------------------------------
 printf '\n%s========================================================================%s\n' "$C" "$Z"

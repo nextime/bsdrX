@@ -41,12 +41,18 @@ class BubbleOverlay(private val ctx: Context, private val onStop: () -> Unit) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
-    private fun params(w: Int, h: Int) = WindowManager.LayoutParams(
-        w, h, overlayType,
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-        PixelFormat.TRANSLUCENT
-    ).apply { gravity = Gravity.TOP or Gravity.START; x = 24; y = 160 }
+    /** Overlay window params. `focusable` must be true for the expanded panel so that tapping a
+     *  form field in its WebView can take input focus and raise the soft keyboard — a NOT_FOCUSABLE
+     *  overlay can never show the IME. The collapsed icon stays non-focusable so it doesn't grab the
+     *  Back button / steal focus from the app underneath while it's just idling. */
+    private fun params(w: Int, h: Int, focusable: Boolean = false): WindowManager.LayoutParams {
+        var flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+        if (!focusable) flags = flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        return WindowManager.LayoutParams(w, h, overlayType, flags, PixelFormat.TRANSLUCENT).apply {
+            gravity = Gravity.TOP or Gravity.START; x = 24; y = 160
+            if (focusable) softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        }
+    }
 
     fun show() {
         if (collapsed != null || expanded != null) return
@@ -72,10 +78,17 @@ class BubbleOverlay(private val ctx: Context, private val onStop: () -> Unit) {
     private fun showExpanded() {
         removeAll()
         val view = LayoutInflater.from(ctx).inflate(R.layout.bubble_expanded, null)
-        val lp = params(dp(320), dp(440))
+        val lp = params(dp(320), dp(440), focusable = true)   // focusable -> form fields raise the IME
         view.findViewById<WebView>(R.id.bubbleWeb).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
+            isFocusable = true
+            isFocusableInTouchMode = true
+            // an overlay WebView needs an explicit tap-to-focus nudge before the keyboard will show
+            setOnTouchListener { v, e ->
+                if (e.action == MotionEvent.ACTION_UP && !v.hasFocus()) v.requestFocus()
+                false
+            }
             loadUrl("http://127.0.0.1:${NativeBridge.UI_PORT}/")
         }
         view.findViewById<Button>(R.id.bubbleStop).setOnClickListener { onStop() }

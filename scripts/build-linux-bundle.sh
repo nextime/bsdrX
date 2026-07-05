@@ -41,9 +41,29 @@ make clean >/dev/null 2>&1 || true
 # Explicit vars (not ./configure autodetect) so we pin OUR deps and set an rpath
 # that finds the bundled libs at $ORIGIN/../lib.
 BASE_CFLAGS="-std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude"
-MEDIA_SRC="src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/audio.c src/micsniff.c src/micsniff_capture.c"
+MEDIA_SRC="src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/fileaudio.c src/audio.c src/micsniff.c src/micsniff_capture.c"
 MEDIA_DEF="-DBSDR_ENABLE_SCTP=1 -DBSDR_ENABLE_VIDEO=1 -DBSDR_HAVE_CAPTURE=1 -DBSDR_ENABLE_AUDIO=1 -DBSDR_HAVE_AUDIO=1 -DBSDR_HAVE_PCAP=1"
+
+# Guard: the list above is a hand-pinned copy of the Makefile's canonical media
+# list (MEDIA_SRC_ALL). If a new media unit is added there but not here, the
+# bundle fails to link (as threed.c/fileaudio.c once did). Assert they agree,
+# treating sctp.c specially since we pass it as SCTP_SRC (below), not in
+# MEDIA_SRC. `make print-media-src` emits MEDIA_SRC_ALL, which is dependency-
+# INDEPENDENT — so this holds even in this container where the deps live under a
+# private prefix and pkg-config autodetection would come up empty.
+want="$(make -s print-media-src)"
+have="$(printf '%s\n' $MEDIA_SRC src/sctp.c | LC_ALL=C sort)"
+if [ "$want" != "$have" ]; then
+  echo "ERROR: bundle MEDIA_SRC has drifted from the Makefile's MEDIA_SRC_ALL." >&2
+  echo "  Reconcile scripts/build-linux-bundle.sh with the Makefile (diff want-vs-have):" >&2
+  diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") >&2 || true
+  exit 1
+fi
 MEDIA_LIBS="-lusrsctp -lsrtp2 -lavdevice -lavfilter -lavformat -lavcodec -lavutil -lswscale -lswresample -lopus -lpulse-simple -lpulse -lpcap -lX11 -lssl -lcrypto -lpthread"
+# in-process depth via ONNX Runtime (shipped in the bundle's lib dir; $ORIGIN/../lib rpath finds it)
+if [ -f "$BSDRX_DEPS/include/onnxruntime_c_api.h" ]; then
+  MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_ONNX=1"; MEDIA_LIBS="$MEDIA_LIBS -lonnxruntime"
+fi
 
 make all BUILD=build-bundle EXEEXT= BUILD_TESTS=no \
   INJECT_SRC=src/inject_linux.c WINLIST_SRC=src/winlist.c \

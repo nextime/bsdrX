@@ -62,6 +62,7 @@ typedef struct bsdr_app {
     int quest_count;
     char selected_quest_ip[64];   /* "" => accept any */
     char blocked_quest_ip[64];    /* disconnected by operator; refused until reselected */
+    volatile unsigned select_gen; /* bumped when the operator picks a different headset */
     /* live connection */
     bool quest_paired;
     char quest_name[128];
@@ -70,8 +71,10 @@ typedef struct bsdr_app {
     bool paused;                  /* web stop/restart */
     bool disconnect_req;          /* operator asked to drop the paired Quest */
     /* source */
-    char source[16];              /* "desktop" | "file" */
-    char source_path[512];
+    char source[16];              /* "desktop" | "file" | "webcam" | "webcam3d" */
+    char source_path[512];        /* file path/URL, or (webcam) the primary/left camera device */
+    char source_path2[512];       /* webcam3d: the right-eye camera device */
+    volatile unsigned source_gen; /* bump when the source changes so the live session reopens capture */
     /* In-VR media-bar playback controls for file streaming — shared by the LAN video+audio threads,
      * the input thread, and the cloud audio sender. Edge-triggered seek via a generation counter. */
     volatile int file_paused;     /* play/pause */
@@ -86,12 +89,14 @@ typedef struct bsdr_app {
     int threed_convergence;       /* -50..50 screen-plane bias */
     int threed_swap;              /* swap L/R eyes */
     int threed_full;              /* 1 = full resolution per eye (2x-wide encode); default on */
+    int threed_tier;              /* AI mode in-process depth tier: 0 external/none, 1 cpu, 2 gpu, 3 hi */
     char threed_ai_cmd[256];      /* external depth helper command (AI mode) */
     volatile unsigned threed_gen; /* bumped on any 3D change so the streamer reopens the capture */
     /* Owner-mic cloud fallback: when the LAN sniffer / router companion isn't available (e.g. WiFi),
      * use the cloud room audio as the compctl owner mic. A voice-activity duck isolates the owner
      * (loudest speaker) only while a command is captured. See cloud_stream.c / audio.c. */
     bool cloud_mic_fallback;
+    bool owner_mic_local;         /* use THIS machine's microphone as the owner mic (no sniff/relay) */
     volatile int cloud_mic_duck;  /* armed by the agent while a voice command is being captured */
     void (*room_pcm_cb)(void *user, const int16_t *pcm, int frames, int channels);
     void *room_pcm_user;          /* set-user-before-cb; cloud thread reads without a lock */
@@ -126,6 +131,20 @@ typedef struct bsdr_app {
     char sniff_password[128];     /* transient sudo password from the web UI (cleared after use) */
     bool sniff_active;            /* status: sniffer currently running */
     char sniff_msg[128];          /* status/error line for the web UI */
+    /* realtime voice change on the owner mic: gender -100..100 (0 = off); and, in MITM/relay mode,
+     * substitute = stop the Quest->cloud voice and inject the changed audio in its place. */
+    int  voice_gender;
+    int  voice_robot;
+    int  voice_echo;
+    int  voice_whisper;
+    bool voice_substitute;
+    /* realtime face swap: enable + tier (0 auto/cpu,2 gpu,3 hi) + source image path; gen bumps on
+     * change so the live session reopens the capture (face swap forces the CPU encode path). */
+    bool faceswap_on;
+    int  faceswap_tier;
+    char faceswap_source[512];
+    volatile unsigned faceswap_gen;
+    char faceswap_status[128];
 } bsdr_app;
 
 void bsdr_app_init(bsdr_app *a);
@@ -154,10 +173,18 @@ void bsdr_app_set_streaming(bsdr_app *a, bool streaming);
 void bsdr_app_set_blank(bsdr_app *a, bool on);   /* privacy screen-blank toggle */
 /* 2D->3D config (clamped; takes effect on the next capture reopen). ai_cmd may be NULL to keep. */
 void bsdr_app_set_threed(bsdr_app *a, int mode, int deepness, int convergence, int swap, int full,
-                         const char *ai_cmd);
+                         int tier, const char *ai_cmd);
 void bsdr_app_get_threed(bsdr_app *a, int *mode, int *deepness, int *convergence, int *swap,
-                         int *full, char *ai_cmd, size_t ai_len);
+                         int *full, int *tier, char *ai_cmd, size_t ai_len);
 void bsdr_app_set_cloud_mic_fallback(bsdr_app *a, bool on);
+void bsdr_app_set_owner_mic_local(bsdr_app *a, bool on);
+/* owner-mic voice change: gender (-100..100), robot/echo/whisper (0..100) + substitute-to-cloud */
+void bsdr_app_set_voicefx(bsdr_app *a, int gender, int robot, int echo, int whisper, bool substitute);
+void bsdr_app_get_voicefx(bsdr_app *a, int *gender, int *robot, int *echo, int *whisper, bool *substitute);
+/* face swap: enable + tier + source-image path (bumps faceswap_gen for a live capture reopen) */
+void bsdr_app_set_faceswap(bsdr_app *a, bool on, int tier, const char *source);
+void bsdr_app_get_faceswap(bsdr_app *a, bool *on, int *tier, char *source, size_t sl);
+void bsdr_app_set_faceswap_status(bsdr_app *a, const char *status);
 void bsdr_app_set_room_pcm_sink(bsdr_app *a, void (*cb)(void *, const int16_t *, int, int), void *user);
 
 /* cloud login (blocking HTTPS); updates cloud_* fields */
@@ -185,7 +212,11 @@ void bsdr_app_feed_cloud_video(bsdr_app *a, const uint8_t *au, size_t len, int w
 
 /* setters from the web UI */
 void bsdr_app_select_quest(bsdr_app *a, const char *ip);
+unsigned bsdr_app_select_gen(bsdr_app *a);
 void bsdr_app_set_source(bsdr_app *a, const char *mode, const char *path);
+/* Stereo webcam: set/get the right-eye camera device (used when source mode is "webcam3d"). */
+void bsdr_app_set_source_right(bsdr_app *a, const char *dev);
+void bsdr_app_get_source_right(bsdr_app *a, char *dev, size_t dl);
 void bsdr_app_set_paused(bsdr_app *a, bool paused);
 bool bsdr_app_is_paused(bsdr_app *a);
 /* operator-initiated disconnect: request from the web UI, consume in the main loop */

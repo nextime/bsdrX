@@ -5,7 +5,7 @@
 #   * bsdrX-osx.zip containing the .app, README.md and LICENSE.md
 #
 # Runs inside the osxcross build image (crazymax/osxcross + cross-built darwin
-# openssl/opus/srtp2/usrsctp/pcap under /opt/ossl-<arch>). See the notes in
+# openssl/opus/srtp2/usrsctp/pcap/ffmpeg under /opt/ossl-<arch>). See the notes in
 # scripts/build-linux-bundle.sh for the container pattern. Example:
 #
 #   docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/out bsdrx-osx-full \
@@ -39,6 +39,17 @@ APP="$WORK/bsdrX.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$UNI" "$APP/Contents/MacOS/bsdr_agent"
 chmod +x "$APP/Contents/MacOS/bsdr_agent"
+
+# in-process depth: ship the ONNX Runtime dylib (universal) in Frameworks. The agent links it with
+# rpath @executable_path/../Frameworks (dylib install_name is @rpath/libonnxruntime.1.20.1.dylib).
+# Skip gracefully if ORT wasn't in the deps (agent then falls back to the external helper/heuristic).
+ORT_X="/opt/ossl-x86_64/lib/libonnxruntime.1.20.1.dylib"
+ORT_A="/opt/ossl-arm64/lib/libonnxruntime.1.20.1.dylib"
+if [ -f "$ORT_X" ] && [ -f "$ORT_A" ]; then
+  mkdir -p "$APP/Contents/Frameworks"
+  lipo -create "$ORT_X" "$ORT_A" -output "$APP/Contents/Frameworks/libonnxruntime.1.20.1.dylib"
+  echo ">> bundled onnxruntime (universal) in Frameworks"
+fi
 # icon: build .icns from the PNG set if png2icns is available (optional polish)
 if command -v png2icns >/dev/null 2>&1; then
   png2icns "$APP/Contents/Resources/bsdrX.icns" assets/bsdrx-256.png assets/bsdrx-128.png >/dev/null 2>&1 || true

@@ -27,7 +27,9 @@
 #include "bsdr/threed.h"
 #include "bsdr/platform.h"
 #include "bsdr/log.h"
+#include "bsdr/webcam.h"
 #include "bsdr_android.h"
+#include <string.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -60,7 +62,7 @@ static int g_want_gen, g_want_seen;
 
 /* 2D->3D config, published to the JNI bridge (the Kotlin GL pipeline applies SBS on the
  * MediaProjection frame before MediaCodec, since C never sees a raw frame here). */
-static int g_td_mode, g_td_deep, g_td_conv, g_td_swap, g_td_full;
+static int g_td_mode, g_td_deep, g_td_conv, g_td_swap, g_td_full, g_td_tier;
 static int g_td_gen, g_td_seen;
 
 void bsdr_android_capture_init(void) {
@@ -102,6 +104,13 @@ bsdr_capture *bsdr_capture_open(const bsdr_capture_config *cfg) {
 
 void bsdr_capture_set_overlay(bsdr_capture *c, struct bsdr_overlay *ov) {
     (void)c; (void)ov;   /* overlay deferred on Android (web UI is the control surface) */
+}
+
+/* Face swap on Android runs in the Kotlin GL path (not this C capture); accept + no-op so the shared
+ * agent links. Image decode needs ffmpeg (absent on Android) -> unavailable. */
+void bsdr_capture_set_faceswap(bsdr_capture *c, struct bsdr_faceswap *fs) { (void)c; (void)fs; }
+int bsdr_capture_decode_image_rgb(const char *p, uint8_t **rgb, int *w, int *h) {
+    (void)p; (void)rgb; (void)w; (void)h; return -1;
 }
 
 /* 2D->3D can't be applied here: Android capture hands us frames that MediaCodec already ENCODED on
@@ -152,18 +161,19 @@ void bsdr_android_push_video(const uint8_t *au, size_t len, int64_t pts_us, int 
     bsdr_mutex_unlock(c->lock);
 }
 
-void bsdr_android_publish_threed(int mode, int deepness, int convergence, int swap, int full) {
+void bsdr_android_publish_threed(int mode, int deepness, int convergence, int swap, int full, int tier) {
     if (!g_lock) bsdr_android_capture_init();
     bsdr_mutex_lock(g_lock);
     if (mode != g_td_mode || deepness != g_td_deep || convergence != g_td_conv ||
-        swap != g_td_swap || full != g_td_full) {
-        g_td_mode = mode; g_td_deep = deepness; g_td_conv = convergence; g_td_swap = swap; g_td_full = full;
+        swap != g_td_swap || full != g_td_full || tier != g_td_tier) {
+        g_td_mode = mode; g_td_deep = deepness; g_td_conv = convergence; g_td_swap = swap;
+        g_td_full = full; g_td_tier = tier;
         g_td_gen++;
     }
     bsdr_mutex_unlock(g_lock);
 }
 
-int bsdr_android_poll_threed(int *mode, int *deepness, int *convergence, int *swap, int *full) {
+int bsdr_android_poll_threed(int *mode, int *deepness, int *convergence, int *swap, int *full, int *tier) {
     if (!g_lock) return 0;
     int changed = 0;
     bsdr_mutex_lock(g_lock);
@@ -174,10 +184,103 @@ int bsdr_android_poll_threed(int *mode, int *deepness, int *convergence, int *sw
         if (convergence) *convergence = g_td_conv;
         if (swap)        *swap        = g_td_swap;
         if (full)        *full        = g_td_full;
+        if (tier)        *tier        = g_td_tier;
         changed = 1;
     }
     bsdr_mutex_unlock(g_lock);
     return changed;
+}
+
+/* ---- webcam source (published to the Kotlin capture switch) + camera list (from Kotlin) ---------
+ * On Android the raw frame lives in the Kotlin capture path, so the C side just relays the operator's
+ * source choice (desktop/webcam/webcam3d + device ids) to Kotlin via a polled generation counter,
+ * and caches the CameraManager-enumerated list for the web-UI /api/webcams (bsdr_webcam_list). */
+static char g_src_mode[16], g_src_dev[256], g_src_dev2[256];
+static int  g_src_gen, g_src_seen;
+
+void bsdr_android_publish_source(const char *mode, const char *dev, const char *dev2) {
+    if (!g_lock) bsdr_android_capture_init();
+    char m[16] = "", d[256] = "", d2[256] = "";
+    snprintf(m, sizeof m, "%s", mode ? mode : "");
+    snprintf(d, sizeof d, "%s", dev ? dev : "");
+    snprintf(d2, sizeof d2, "%s", dev2 ? dev2 : "");
+    bsdr_mutex_lock(g_lock);
+    if (strcmp(m, g_src_mode) || strcmp(d, g_src_dev) || strcmp(d2, g_src_dev2)) {
+        snprintf(g_src_mode, sizeof g_src_mode, "%s", m);
+        snprintf(g_src_dev,  sizeof g_src_dev,  "%s", d);
+        snprintf(g_src_dev2, sizeof g_src_dev2, "%s", d2);
+        g_src_gen++;
+    }
+    bsdr_mutex_unlock(g_lock);
+}
+
+int bsdr_android_poll_source(char *mode, size_t ml, char *dev, size_t dl, char *dev2, size_t d2l) {
+    if (!g_lock) return 0;
+    int changed = 0;
+    bsdr_mutex_lock(g_lock);
+    if (g_src_gen != g_src_seen) {
+        g_src_seen = g_src_gen;
+        if (mode) snprintf(mode, ml, "%s", g_src_mode);
+        if (dev)  snprintf(dev,  dl, "%s", g_src_dev);
+        if (dev2) snprintf(dev2, d2l, "%s", g_src_dev2);
+        changed = 1;
+    }
+    bsdr_mutex_unlock(g_lock);
+    return changed;
+}
+
+#define BSDR_CAM_MAX 8
+static bsdr_webcam_dev g_cams[BSDR_CAM_MAX];
+static int g_cam_n;
+
+void bsdr_android_set_cameras(const bsdr_webcam_dev *cams, int n) {
+    if (!g_lock) bsdr_android_capture_init();
+    if (n > BSDR_CAM_MAX) n = BSDR_CAM_MAX;
+    bsdr_mutex_lock(g_lock);
+    for (int i = 0; i < n; i++) g_cams[i] = cams[i];
+    g_cam_n = n < 0 ? 0 : n;
+    bsdr_mutex_unlock(g_lock);
+}
+
+/* ---- face swap config (published to the Kotlin GL faceswap stage) ---- */
+static int  g_fs_on, g_fs_tier;
+static char g_fs_src[512];
+static int  g_fs_gen, g_fs_seen;
+
+void bsdr_android_publish_faceswap(int on, int tier, const char *source) {
+    if (!g_lock) bsdr_android_capture_init();
+    char s[512] = ""; snprintf(s, sizeof s, "%s", source ? source : "");
+    bsdr_mutex_lock(g_lock);
+    if (on != g_fs_on || tier != g_fs_tier || strcmp(s, g_fs_src)) {
+        g_fs_on = on; g_fs_tier = tier; snprintf(g_fs_src, sizeof g_fs_src, "%s", s);
+        g_fs_gen++;
+    }
+    bsdr_mutex_unlock(g_lock);
+}
+
+int bsdr_android_poll_faceswap(int *on, int *tier, char *source, size_t sl) {
+    if (!g_lock) return 0;
+    int changed = 0;
+    bsdr_mutex_lock(g_lock);
+    if (g_fs_gen != g_fs_seen) {
+        g_fs_seen = g_fs_gen;
+        if (on) *on = g_fs_on;
+        if (tier) *tier = g_fs_tier;
+        if (source) snprintf(source, sl, "%s", g_fs_src);
+        changed = 1;
+    }
+    bsdr_mutex_unlock(g_lock);
+    return changed;
+}
+
+/* Consumed by webcam.c's Android branch (bsdr_webcam_list). */
+int bsdr_android_cameras(bsdr_webcam_dev *out, int max) {
+    if (!g_lock || !out) return 0;
+    bsdr_mutex_lock(g_lock);
+    int n = g_cam_n < max ? g_cam_n : max;
+    for (int i = 0; i < n; i++) out[i] = g_cams[i];
+    bsdr_mutex_unlock(g_lock);
+    return n;
 }
 
 int bsdr_android_capture_want(int *width, int *height, int *fps, int *bitrate) {

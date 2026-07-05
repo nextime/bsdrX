@@ -71,6 +71,7 @@ typedef struct {
     int  threed_convergence;      /* --threed-convergence: screen-plane bias -50..50 */
     int  threed_swap;             /* --threed-swap: swap L/R eyes */
     int  threed_full;             /* --threed-full: full resolution per eye (default: light half-SBS) */
+    int  threed_tier;             /* --threed-tier: in-process depth 0 none/ext, 1 cpu, 2 gpu, 3 hi */
     const char *threed_ai_cmd;    /* --threed-ai: external depth-estimator command (AI mode) */
     int webui_port;          /* local control UI port; 0 = no UI */
     bool open_browser;       /* auto-open the control UI (desktop only) */

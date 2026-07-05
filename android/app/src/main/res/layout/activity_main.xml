@@ -41,6 +41,14 @@
             android:text="@string/minimize" />
     </LinearLayout>
 
+    <!-- permission status panel, filled by MainActivity.renderPermissions() -->
+    <LinearLayout
+        android:id="@+id/perms"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_marginTop="6dp" />
+
     <!-- the same control web UI the desktop serves, embedded (no external browser) -->
     <WebView
         android:id="@+id/web"

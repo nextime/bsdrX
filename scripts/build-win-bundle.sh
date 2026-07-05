@@ -39,6 +39,9 @@ for dll in avcodec-63 avformat-63 avutil-61 avdevice-63 avfilter-12 swscale-10 s
   f="$WIN_DEPS/bin/$dll.dll"
   [ -f "$f" ] && cp "$f" "$STAGE/" || echo "   (warn: $dll.dll not in $WIN_DEPS/bin)"
 done
+# onnxruntime (in-process depth) — ship it if the deps include it (+ DirectML.dll if present)
+[ -f "$WIN_DEPS/bin/onnxruntime.dll" ] && cp "$WIN_DEPS/bin/onnxruntime.dll" "$STAGE/"
+[ -f "$WIN_DEPS/bin/DirectML.dll" ] && cp "$WIN_DEPS/bin/DirectML.dll" "$STAGE/"
 WP=$(dirname "$(command -v "$WIN_HOST-gcc")")/../"$WIN_HOST"/lib/libwinpthread-1.dll
 [ -f "$WP" ] || WP=/usr/"$WIN_HOST"/lib/libwinpthread-1.dll
 cp "$WP" "$STAGE/"

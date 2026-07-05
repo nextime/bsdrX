@@ -33,6 +33,11 @@ set(CORE_SRC
   # transport / media (shared, OS-agnostic)
   ${CORE}/sctp.c ${CORE}/srtp_util.c ${CORE}/video.c
   ${CORE}/threed.c                      # 2D->3D SBS core (agent.c refs it; not applied on the HW path)
+  ${CORE}/depth_onnx.c ${CORE}/model_store.c   # in-process neural depth (ONNX Runtime, NNAPI)
+  ${CORE}/webcam.c                      # camera enumeration (Android returns none; Kotlin enumerates)
+  ${CORE}/voicefx.c                     # realtime voice changer (gender shift) DSP
+  ${CORE}/faceswap.c                    # realtime face swap (SCRFD + ArcFace + inswapper, ONNX)
+  ${REPO}/third_party/miniz/miniz.c     # model-zip import
   ${CORE}/audio.c                       # Opus RTP/SRTP half (Pulse half #ifdef'd out)
   # Android platform shims (replace capture.c / inject_*.c / pulse half / winlist / filesrc)
   ${CORE}/capture_android.c ${CORE}/audio_android.c ${CORE}/inject_android.c
@@ -43,14 +48,15 @@ set(CORE_SRC
 add_library(bsdr_agent SHARED ${CORE_SRC})
 
 target_include_directories(bsdr_agent PRIVATE
-  ${REPO}/include ${CORE} ${DEPS}/include)
+  ${REPO}/include ${CORE} ${DEPS}/include ${REPO}/third_party/miniz)
 
 target_compile_definitions(bsdr_agent PRIVATE
   BSDR_PLATFORM_ANDROID=1
   BSDR_NO_CLI_MAIN=1            # agent.c main() excluded; JNI calls bsdr_agent_run()
   BSDR_ENABLE_SCTP=1
   BSDR_ENABLE_VIDEO=1 BSDR_HAVE_CAPTURE=1
-  BSDR_ENABLE_AUDIO=1 BSDR_HAVE_AUDIO=1)
+  BSDR_ENABLE_AUDIO=1 BSDR_HAVE_AUDIO=1
+  BSDR_HAVE_ONNX=1)            # in-process depth via ONNX Runtime (NNAPI EP)
 
 # prebuilt static deps
 add_library(ssl     STATIC IMPORTED)
@@ -66,6 +72,12 @@ set_target_properties(usrsctp PROPERTIES IMPORTED_LOCATION ${DEPS}/lib/libusrsct
 
 find_library(log_lib log)
 
+# ONNX Runtime for the in-process depth tiers (NNAPI EP). The onnxruntime-android AAR ships no
+# prefab metadata, so build-android-deps.sh extracts its headers + libonnxruntime.so into
+# ${DEPS} (and the .so into src/main/jniLibs so it lands in the APK). Link it as a shared import.
+add_library(onnxruntime SHARED IMPORTED)
+set_target_properties(onnxruntime PROPERTIES IMPORTED_LOCATION ${DEPS}/lib/libonnxruntime.so)
+
 # srtp2/ssl ordering matters for the static link; group them.
 target_link_libraries(bsdr_agent
-  opus srtp2 usrsctp ssl crypto ${log_lib})
+  opus srtp2 usrsctp ssl crypto onnxruntime ${log_lib})

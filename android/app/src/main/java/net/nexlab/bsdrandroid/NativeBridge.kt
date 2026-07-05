@@ -39,6 +39,26 @@ object NativeBridge {
     /** Poll 2D->3D config: out = [mode, deepness, convergence, swap, full]. True if changed. */
     external fun nativePollThreed(out: IntArray): Boolean
 
+    /** Poll the source choice as "mode|dev|dev2" (empty string if unchanged since the last poll).
+     *  mode = desktop | file | webcam | webcam3d; dev/dev2 = camera ids for webcam modes. */
+    external fun nativePollSource(): String
+    /** Publish the CameraManager-enumerated cameras for the web-UI /api/webcams (parallel arrays). */
+    external fun nativePublishCameras(ids: Array<String>, names: Array<String>)
+
+    // ---- face swap (GL readback -> C ONNX swap -> re-upload) -----------------
+    /** Poll the faceswap config as "on|tier|sourcePath" (empty if unchanged). */
+    external fun nativePollFaceswap(): String
+    /** Open/close the faceswap engine (dir = model dir, tier picks CPU/GPU). True if loaded. */
+    external fun nativeFaceswapConfig(on: Boolean, dir: String, tier: Int): Boolean
+    /** Set the identity from a packed-RGB source image. True if a face was found. */
+    external fun nativeFaceswapSource(rgb: ByteArray, w: Int, h: Int): Boolean
+    /** Swap faces in a packed-RGB frame in place; returns faces swapped (>=0) or -1 if not ready. */
+    external fun nativeFaceswapProcess(rgb: ByteArray, w: Int, h: Int): Int
+
+    /** In-process neural depth: feed a w*h grayscale frame, fill out[w*h] with depth (0..1, near=1).
+     *  Returns false if the tier's model/engine isn't ready (caller falls back to the GL heuristic). */
+    external fun nativeDepth(tier: Int, gray: ByteArray, w: Int, h: Int, out: FloatArray): Boolean
+
     // ---- voice computer control (device mic) --------------------------------
     /** Mono int16 device-mic PCM into the voice VAD (fed while compctl is armed). */
     external fun nativePushVoiceMic(pcm: ShortArray, frames: Int)
@@ -63,6 +83,16 @@ object NativeBridge {
 
     @Volatile var running: Boolean = false
         private set
+
+    /** Where depth models are cached/downloaded (app files dir). Set once before the first start(). */
+    private external fun nativeSetModelDir(dir: String)
+    @Volatile private var modelDirSet = false
+    fun setModelDir(dir: String) { if (!modelDirSet) { modelDirSet = true; nativeSetModelDir(dir) } }
+
+    /** Point $HOME at the app's internal files dir so the cloud session persists across updates. */
+    private external fun nativeSetConfigHome(dir: String)
+    @Volatile private var homeSet = false
+    fun setConfigHome(dir: String) { if (!homeSet) { homeSet = true; nativeSetConfigHome(dir) } }
 
     fun start(width: Int, height: Int, fps: Int, bitrate: Int) {
         if (running) return

@@ -130,15 +130,20 @@ fi
 if [ "$enable_video" = yes ]; then
     miss=
     have_pkg libsrtp2 || miss="libsrtp2"
-    if [ "$target" = linux ]; then
+    if [ "$target" = linux ] || [ "$target" = macos ]; then
+        # ffmpeg drives desktop capture/encode on both Linux (x11grab/nvenc) and macOS
+        # (avfoundation/videotoolbox); the RTP sender (video.c) alone needs no ffmpeg.
         have_pkg libavcodec libavformat libavdevice libswscale libswresample libavfilter || miss="$miss ffmpeg"
     fi
     if [ -n "$miss" ]; then echo "configure: video deps missing ($miss) -> video disabled"; enable_video=no; fi
 fi
 if [ "$enable_audio" = yes ]; then
-    if [ "$target" != linux ] || ! have_pkg opus libpulse-simple; then
-        echo "configure: audio deps missing (opus/libpulse) -> audio disabled"; enable_audio=no
-    fi
+    # Linux audio = Opus + PulseAudio; macOS audio = Opus + CoreAudio (no PulseAudio).
+    case "$target" in
+        linux) have_pkg opus libpulse-simple || { echo "configure: audio deps missing (opus/libpulse) -> audio disabled"; enable_audio=no; } ;;
+        macos) have_pkg opus                 || { echo "configure: audio deps missing (opus) -> audio disabled"; enable_audio=no; } ;;
+        *)     echo "configure: audio not supported on target $target -> audio disabled"; enable_audio=no ;;
+    esac
 fi
 
 # --- optional SCTP ---------------------------------------------------------
@@ -165,11 +170,17 @@ fi
 if [ "$enable_video" = yes ]; then
     MEDIA_SRC="$MEDIA_SRC src/video.c"
     MEDIA_DEF="$MEDIA_DEF -DBSDR_ENABLE_VIDEO=1"
-    if [ "$target" = linux ]; then
-        MEDIA_SRC="$MEDIA_SRC src/capture.c src/threed.c src/filesrc.c src/fileaudio.c"
+    if [ "$target" = linux ] || [ "$target" = macos ]; then
+        # Desktop capture + local-file streaming + 2D->3D (all ffmpeg): Linux via
+        # x11grab/kmsgrab + nvenc/vaapi/x264, macOS via avfoundation + h264_videotoolbox.
+        MEDIA_SRC="$MEDIA_SRC src/capture.c src/filesrc.c src/fileaudio.c"   # threed.c is in the Makefile's CORE_SRC
         MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_CAPTURE=1"
         MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags libavcodec libavformat libavdevice libavutil libswscale libswresample libavfilter 2>/dev/null)"
         MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS libavcodec libavformat libavdevice libavutil libswscale libswresample libavfilter 2>/dev/null)"
+        if [ "$target" = macos ]; then
+            # ffmpeg's avfoundation input device + h264_videotoolbox encoder link these frameworks.
+            MEDIA_LIBS="$MEDIA_LIBS -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework AVFoundation -framework Foundation -framework CoreServices"
+        fi
     fi
 fi
 if [ "$enable_audio" = yes ] && [ "$target" = macos ]; then

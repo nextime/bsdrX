@@ -31,6 +31,15 @@ else()
   set(BSDR_INJECT_SRC src/inject_null.c)
 endif()
 
+# ---- platform-specific window-list backend (webui.c needs bsdr_list_windows) -
+if(WIN32)
+  set(BSDR_WINLIST_SRC src/winlist_win.c)
+elseif(UNIX AND NOT APPLE)
+  set(BSDR_WINLIST_SRC src/winlist.c)        # X11 window list
+else()
+  set(BSDR_WINLIST_SRC src/winlist_null.c)   # macOS / other: null impl
+endif()
+
 # ---- core library ----------------------------------------------------------
 set(BSDR_CORE_SRC
   src/log.c
@@ -41,18 +50,21 @@ set(BSDR_CORE_SRC
   src/control.c
   src/udp_transport.c
   src/dtls.c
-  src/transport.c
   src/cloud.c
+  src/cloud_stream.c
   src/app.c
   src/webui.c
   src/overlay.c
   src/httpc.c
+  src/tls.c
   src/stt.c
   src/llm.c
   src/compcontrol.c
   src/voice.c
   src/screenshot.c
-  ${BSDR_INJECT_SRC})
+  src/threed.c            # bsdr_threed_mode_parse is called by agent.c main() in every build
+  ${BSDR_INJECT_SRC}
+  ${BSDR_WINLIST_SRC})
 
 if(BSDR_ENABLE_SCTP)
   list(APPEND BSDR_CORE_SRC src/sctp.c)
@@ -63,12 +75,17 @@ if(BSDR_ENABLE_VIDEO OR BSDR_ENABLE_AUDIO)
 endif()
 if(BSDR_ENABLE_VIDEO)
   list(APPEND BSDR_CORE_SRC src/video.c)
-  if(UNIX AND NOT APPLE)
-    list(APPEND BSDR_CORE_SRC src/capture.c src/filesrc.c)  # NVENC + file demux
+  if(UNIX)
+    # desktop capture + local-file streaming (ffmpeg): Linux x11grab/nvenc,
+    # macOS avfoundation/videotoolbox. threed.c is in the core list above.
+    list(APPEND BSDR_CORE_SRC src/capture.c src/filesrc.c src/fileaudio.c)
   endif()
 endif()
-if(BSDR_ENABLE_AUDIO AND UNIX AND NOT APPLE)
-  list(APPEND BSDR_CORE_SRC src/audio.c src/micsniff.c src/micsniff_capture.c)   # Opus + PulseAudio; owner-mic sniffer
+if(BSDR_ENABLE_AUDIO AND UNIX)
+  list(APPEND BSDR_CORE_SRC src/audio.c src/micsniff.c src/micsniff_capture.c)   # Opus DSP + owner-mic sniffer
+  if(APPLE)
+    list(APPEND BSDR_CORE_SRC src/audio_coreaudio.c)   # macOS CoreAudio I/O (Linux uses PulseAudio in audio.c)
+  endif()
   find_library(PCAP_LIB pcap)   # portable capture engine; AF_PACKET fallback if absent
   if(PCAP_LIB)
     add_compile_definitions(BSDR_HAVE_PCAP=1)
@@ -89,6 +106,10 @@ else()
 endif()
 if(APPLE)
   target_link_libraries(bsdr_core PUBLIC "-framework CoreGraphics" "-framework CoreFoundation")
+elseif(UNIX)
+  find_package(X11 REQUIRED)   # screenshot.c / winlist.c / x11grab capture
+  target_include_directories(bsdr_core PUBLIC ${X11_INCLUDE_DIR})
+  target_link_libraries(bsdr_core PUBLIC ${X11_LIBRARIES})
 endif()
 
 if(BSDR_ENABLE_SCTP)
@@ -105,20 +126,31 @@ if(BSDR_ENABLE_VIDEO OR BSDR_ENABLE_AUDIO)
 endif()
 if(BSDR_ENABLE_VIDEO)
   target_compile_definitions(bsdr_core PUBLIC BSDR_ENABLE_VIDEO=1)
-  if(UNIX AND NOT APPLE)
+  if(UNIX)
     pkg_check_modules(FFMPEG REQUIRED
-      libavcodec libavformat libavdevice libavutil libswscale)
+      libavcodec libavformat libavdevice libavutil libswscale libswresample libavfilter)
     target_compile_definitions(bsdr_core PUBLIC BSDR_HAVE_CAPTURE=1)
     target_include_directories(bsdr_core PUBLIC ${FFMPEG_INCLUDE_DIRS})
     target_link_libraries(bsdr_core PUBLIC ${FFMPEG_LIBRARIES})
+    if(APPLE)
+      # ffmpeg's avfoundation grab + h264_videotoolbox encode link these frameworks
+      target_link_libraries(bsdr_core PUBLIC "-framework VideoToolbox" "-framework CoreMedia"
+        "-framework CoreVideo" "-framework AVFoundation" "-framework Foundation" "-framework CoreServices")
+    endif()
   endif()
 endif()
-if(BSDR_ENABLE_AUDIO AND UNIX AND NOT APPLE)
+if(BSDR_ENABLE_AUDIO AND UNIX)
   pkg_check_modules(OPUS REQUIRED opus)
-  pkg_check_modules(PULSE REQUIRED libpulse-simple)
   target_compile_definitions(bsdr_core PUBLIC BSDR_ENABLE_AUDIO=1 BSDR_HAVE_AUDIO=1)
-  target_include_directories(bsdr_core PUBLIC ${OPUS_INCLUDE_DIRS} ${PULSE_INCLUDE_DIRS})
-  target_link_libraries(bsdr_core PUBLIC ${OPUS_LIBRARIES} ${PULSE_LIBRARIES})
+  target_include_directories(bsdr_core PUBLIC ${OPUS_INCLUDE_DIRS})
+  target_link_libraries(bsdr_core PUBLIC ${OPUS_LIBRARIES})
+  if(APPLE)
+    target_link_libraries(bsdr_core PUBLIC "-framework CoreAudio" "-framework AudioToolbox" "-framework CoreFoundation")
+  else()
+    pkg_check_modules(PULSE REQUIRED libpulse-simple)
+    target_include_directories(bsdr_core PUBLIC ${PULSE_INCLUDE_DIRS})
+    target_link_libraries(bsdr_core PUBLIC ${PULSE_LIBRARIES})
+  endif()
   if(PCAP_LIB)
     target_link_libraries(bsdr_core PUBLIC ${PCAP_LIB})   # owner-mic sniffer capture backend
   endif()

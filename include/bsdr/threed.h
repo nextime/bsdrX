@@ -30,6 +30,7 @@ typedef struct {
     int deepness;      /* 0..100 "depth amount": max eye disparity as a fraction of frame width */
     int convergence;   /* -50..50: move the zero-parallax (screen) plane nearer/farther for comfort */
     int swap;          /* 1 = pack right|left instead of left|right (headset eye-order fix) */
+    int tier;          /* AI mode: in-process depth tier 0=none(use ai_cmd) 1=cpu 2=gpu 3=hi (see depth.h) */
     char ai_cmd[256];  /* AI mode: shell command of the external depth helper (operator-configured) */
 } bsdr_threed_config;
 

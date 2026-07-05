@@ -1,14 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The collapsed "balloon": a small draggable icon that floats over other apps. -->
+<!-- The collapsed "balloon" styled as a small floating screen/monitor: a dark rounded tile with a
+     bezel, the app glyph, a label, and a green LIVE dot. Draggable; tap to open the control panel. -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="wrap_content"
-    android:layout_height="wrap_content">
+    android:layout_height="wrap_content"
+    android:padding="6dp">
 
-    <ImageView
+    <LinearLayout
         android:id="@+id/bubbleIcon"
-        android:layout_width="56dp"
-        android:layout_height="56dp"
+        android:layout_width="88dp"
+        android:layout_height="58dp"
+        android:orientation="vertical"
+        android:gravity="center"
         android:elevation="8dp"
-        android:src="@drawable/ic_bubble"
-        android:contentDescription="@string/app_name" />
+        android:background="@drawable/bg_screen_tile">
+
+        <ImageView
+            android:layout_width="22dp"
+            android:layout_height="22dp"
+            android:src="@drawable/ic_bubble"
+            android:contentDescription="@string/app_name" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="@string/app_name"
+            android:textColor="#FFCBD5E1"
+            android:textSize="10sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <!-- LIVE dot, top-right corner of the screen tile -->
+    <View
+        android:layout_width="10dp"
+        android:layout_height="10dp"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="8dp"
+        android:background="@drawable/dot_live" />
 </FrameLayout>

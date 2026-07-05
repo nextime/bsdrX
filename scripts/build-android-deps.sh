@@ -20,6 +20,7 @@ API=29                           # minSdk: AudioPlaybackCapture (system audio)
 OPENSSL_VER=3.0.15
 OPUS_VER=1.5.2
 SRTP_VER=2.6.0
+ORT_VER=1.20.0
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/android/deps/src"
@@ -94,7 +95,20 @@ for ABI in "${ABIS[@]}"; do
   [ -f "$PREFIX/lib/libusrsctp.a" ] || \
     cmake_dep "usrsctp-master" -Dsctp_build_programs=OFF -Dsctp_build_shared_lib=OFF
 
-  echo "  $ABI deps: $(cd "$PREFIX/lib" && echo *.a)"
+  echo "== onnxruntime $ORT_VER (in-process depth; NNAPI EP) =="
+  if [ ! -f "$PREFIX/lib/libonnxruntime.so" ]; then
+    [ -f "onnxruntime-android-$ORT_VER.aar" ] || curl -fsSL -o "onnxruntime-android-$ORT_VER.aar" \
+      "https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/$ORT_VER/onnxruntime-android-$ORT_VER.aar"
+    rm -rf aar-$ABI && mkdir aar-$ABI && ( cd aar-$ABI && unzip -q "../onnxruntime-android-$ORT_VER.aar" )
+    cp -a aar-$ABI/headers/* "$PREFIX/include/"
+    cp -a "aar-$ABI/jni/$ABI/libonnxruntime.so" "$PREFIX/lib/"
+    # also stage the runtime .so so Gradle packages it into the APK
+    mkdir -p "$ROOT/android/app/src/main/jniLibs/$ABI"
+    cp -a "aar-$ABI/jni/$ABI/libonnxruntime.so" "$ROOT/android/app/src/main/jniLibs/$ABI/"
+    rm -rf aar-$ABI
+  fi
+
+  echo "  $ABI deps: $(cd "$PREFIX/lib" && echo *.a) + libonnxruntime.so"
 done
 
 echo

@@ -13,9 +13,14 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.BitmapFactory
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -25,6 +30,7 @@ import android.os.Looper
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
+import androidx.core.content.ContextCompat
 
 /**
  * The foreground service: owns the native agent lifecycle, the MediaProjection,
@@ -36,6 +42,9 @@ class BsdrService : Service() {
 
     private var projection: MediaProjection? = null
     private var capture: ScreenCapture? = null
+    private var cameraCapture: CameraCapture? = null
+    private var curMode = "desktop"        // active source: desktop | webcam | webcam3d
+    private var curDev = ""                // active camera id (webcam modes)
     private var audio: AudioIO? = null
     private var bubble: BubbleOverlay? = null
     private var voiceMic: VoiceMic? = null
@@ -69,12 +78,120 @@ class BsdrService : Service() {
         Log.i(TAG, "casting ${w}x$h @ ${dpi}dpi")
 
         NativeBridge.pairingListener = { code -> updateNotification(getString(R.string.pairing_code, code)) }
+        // cloud session persists in the app's internal files dir ($HOME) -> survives app updates
+        NativeBridge.setConfigHome(filesDir.absolutePath)
+        // depth models cache under the app's files dir (adb-pushable, app-writable, survives updates)
+        NativeBridge.setModelDir((getExternalFilesDir(null) ?: filesDir).resolve("models").absolutePath)
         NativeBridge.start(w, h, FPS, BITRATE)
         capture = ScreenCapture(proj, w, h, dpi, FPS, BITRATE).also { it.start() }
         audio = AudioIO(proj).also { runCatching { it.start() }.onFailure { e -> Log.w(TAG, "audio off", e) } }
         wireControls(Screenshotter(proj, w, h, dpi))   // bubble + voice + vision screenshot
+        publishCameras()          // enumerate cameras for the web-UI source picker
+        main.post(sourcePoll)     // watch for a webcam/desktop source switch from the web UI
         return START_STICKY
     }
+
+    // ---- webcam source: enumerate cameras + switch capture on the web-UI selection --------------
+    /** Enumerate the device cameras and hand the list to native for the web-UI /api/webcams. */
+    private fun publishCameras() {
+        try {
+            val mgr = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val ids = ArrayList<String>(); val names = ArrayList<String>()
+            for (id in mgr.cameraIdList) {
+                val label = when (mgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING)) {
+                    CameraCharacteristics.LENS_FACING_FRONT -> "Front camera"
+                    CameraCharacteristics.LENS_FACING_BACK -> "Back camera"
+                    CameraCharacteristics.LENS_FACING_EXTERNAL -> "External camera"
+                    else -> "Camera"
+                }
+                ids.add(id); names.add("$label (id $id)")
+            }
+            NativeBridge.nativePublishCameras(ids.toTypedArray(), names.toTypedArray())
+            Log.i(TAG, "cameras: ${names.joinToString()}")
+        } catch (e: Exception) { Log.w(TAG, "enumerate cameras: ${e.message}") }
+    }
+
+    private val sourcePoll = object : Runnable {
+        override fun run() {
+            val s = runCatching { NativeBridge.nativePollSource() }.getOrDefault("")
+            if (s.isNotEmpty()) applySource(s)
+            val fs = runCatching { NativeBridge.nativePollFaceswap() }.getOrDefault("")
+            if (fs.isNotEmpty()) applyFaceswap(fs)
+            main.postDelayed(this, 500)
+        }
+    }
+
+    private var fsSrcLoaded = ""
+    /** Apply a "on|tier|sourcePath" faceswap config: open the engine, load the source image, and turn
+     *  the GL swap stage on/off on the active capture. */
+    private fun applyFaceswap(cfg: String) {
+        val p = cfg.split("|")
+        val on = p.getOrElse(0) { "0" } == "1"
+        val tier = p.getOrElse(1) { "0" }.toIntOrNull() ?: 0
+        val src = p.getOrElse(2) { "" }
+        if (!on) {
+            NativeBridge.nativeFaceswapConfig(false, "", 0)
+            capture?.setFaceswap(false); cameraCapture?.setFaceswap(false)
+            fsSrcLoaded = ""
+            return
+        }
+        // internal files dir: reliably app-readable (unlike adb-pushed files under Android/data, which
+        // are shell-owned on Android 11+). The app (or a future importer) places the .onnx here.
+        val dir = filesDir.resolve("faceswap").absolutePath
+        val loaded = runCatching { NativeBridge.nativeFaceswapConfig(true, dir, tier) }.getOrDefault(false)
+        if (loaded && src.isNotEmpty() && src != fsSrcLoaded) {
+            decodeImageToRgb(src)?.let { (rgb, w, h) ->
+                val ok = runCatching { NativeBridge.nativeFaceswapSource(rgb, w, h) }.getOrDefault(false)
+                Log.i(TAG, "faceswap source '$src' -> ${if (ok) "identity set" else "no face"}")
+                if (ok) fsSrcLoaded = src
+            } ?: Log.w(TAG, "faceswap: cannot decode source image $src")
+        }
+        capture?.setFaceswap(loaded); cameraCapture?.setFaceswap(loaded)
+    }
+
+    private fun decodeImageToRgb(path: String): Triple<ByteArray, Int, Int>? {
+        val bm = runCatching { BitmapFactory.decodeFile(path) }.getOrNull() ?: return null
+        val w = bm.width; val h = bm.height
+        if (w <= 0 || h <= 0) { bm.recycle(); return null }
+        val px = IntArray(w * h); bm.getPixels(px, 0, w, 0, 0, w, h)
+        val rgb = ByteArray(w * h * 3)
+        for (i in 0 until w * h) {
+            val c = px[i]
+            rgb[i*3]     = ((c shr 16) and 0xff).toByte()
+            rgb[i*3 + 1] = ((c shr 8) and 0xff).toByte()
+            rgb[i*3 + 2] = (c and 0xff).toByte()
+        }
+        bm.recycle()
+        return Triple(rgb, w, h)
+    }
+
+    /** Apply a "mode|dev|dev2" source choice: switch between screen and camera capture live. */
+    private fun applySource(s: String) {
+        val p = s.split("|")
+        val mode = p.getOrElse(0) { "" }
+        val dev = p.getOrElse(1) { "" }
+        if (mode.isEmpty() || mode == "file") return   // file streaming is a separate service action
+        when (mode) {
+            "webcam", "webcam3d" -> {
+                if (curMode == mode && curDev == dev && cameraCapture != null) return
+                capture?.pause()          // keep the ScreenCapture + its VirtualDisplay for resume
+                cameraCapture?.stop()
+                val camId = if (dev.isNotEmpty()) dev else firstCameraId() ?: return
+                cameraCapture = CameraCapture(this, camId, FPS, BITRATE).also { it.start() }
+                curMode = mode; curDev = dev
+            }
+            else -> {   // "desktop": resume the screen mirror (the VirtualDisplay can't be recreated)
+                if (curMode == "desktop" && cameraCapture == null) return
+                cameraCapture?.stop(); cameraCapture = null
+                capture?.start()          // resume the existing ScreenCapture (reuses its display)
+                curMode = "desktop"; curDev = ""
+            }
+        }
+    }
+
+    private fun firstCameraId(): String? = runCatching {
+        (getSystemService(Context.CAMERA_SERVICE) as CameraManager).cameraIdList.firstOrNull()
+    }.getOrNull()
 
     /** Stream a local video file instead of the live screen (no MediaProjection). */
     private fun startFileCast(intent: Intent): Int {
@@ -88,6 +205,7 @@ class BsdrService : Service() {
         }
         Log.i(TAG, "streaming file ${fs.srcWidth}x${fs.srcHeight}")
         NativeBridge.pairingListener = { code -> updateNotification(getString(R.string.pairing_code, code)) }
+        NativeBridge.setConfigHome(filesDir.absolutePath)
         NativeBridge.start(fs.srcWidth, fs.srcHeight, FPS, BITRATE)
         fs.start(); fileSource = fs
         wireControls(null)      // no projection -> no vision screenshot in file mode
@@ -133,9 +251,11 @@ class BsdrService : Service() {
     }
 
     private fun stopEverything() {
+        main.removeCallbacks(sourcePoll)
         voiceMic?.stop(); voiceMic = null
         fileSource?.stop(); fileSource = null
         capture?.stop(); capture = null
+        cameraCapture?.stop(); cameraCapture = null
         audio?.stop(); audio = null
         NativeBridge.stop()
         NativeBridge.pairingListener = null
@@ -159,9 +279,16 @@ class BsdrService : Service() {
         }
         val notif = buildNotification(getString(R.string.notif_text))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // file streaming isn't a screen capture -> declare dataSync, not mediaProjection
-            val type = if (fileMode) ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            // file streaming isn't a screen capture -> declare dataSync, not mediaProjection.
+            // Screen path: also declare `camera` (when granted) so we can switch to a webcam live
+            // without restarting the foreground service (Android 14+ requires the type up front).
+            var type = if (fileMode) ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
                        else ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            if (!fileMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            }
             startForeground(NID, notif, type)
         } else {
             startForeground(NID, notif)

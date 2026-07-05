@@ -19,6 +19,9 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
+#ifdef __ANDROID__
+#  include <android/log.h>   /* app stderr is discarded on Android -> mirror to logcat */
+#endif
 
 static bsdr_log_level g_level = BSDR_LOG_INFO;
 
@@ -54,4 +57,16 @@ void bsdr_log(bsdr_log_level level, const char *tag, const char *fmt, ...) {
     va_end(ap);
     fputc('\n', stderr);
     fflush(stderr);
+
+#ifdef __ANDROID__
+    int prio = level == BSDR_LOG_DEBUG ? ANDROID_LOG_DEBUG :
+               level == BSDR_LOG_WARN  ? ANDROID_LOG_WARN  :
+               level == BSDR_LOG_ERROR ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO;
+    char msg[1024];
+    va_list ap2;
+    va_start(ap2, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap2);
+    va_end(ap2);
+    __android_log_print(prio, tag && *tag ? tag : "bsdr", "%s", msg);
+#endif
 }
