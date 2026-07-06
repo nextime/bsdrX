@@ -125,10 +125,11 @@ A no-model, low-latency DSP voice changer applied to the headset-owner's voice b
 it reaches the virtual mic, computer-control, or the cloud room. A **master enable**
 toggle plus four knobs: **gender** (−100…100 pitch+formant shift), **robot**
 (ring-mod), **echo**, **whisper** (breathiness). Cross-platform (no FFT/ffmpeg). With
-**MITM or Relay** active, the optional **"substitute into the cloud"** option rewrites
-the headset→cloud packets in flight (Linux NFQUEUE, needs root) so the *room* hears
-the changed voice too. (A higher-quality RVC model tier is planned behind the same
-interface.)
+**MITM** active, the optional **"substitute into the cloud"** option rewrites the
+headset→cloud packets in flight — **Linux** via NFQUEUE (root), **Windows** via the
+bundled **WinDivert** (Administrator) — so the *room* hears the changed voice too.
+(macOS lacks a userland packet-divert primitive, so substitution is unavailable there;
+a higher-quality RVC model tier is planned behind the same interface.)
 
 ### Microphone hijacking & capture
 
@@ -249,7 +250,10 @@ encoder paths, and the build targets).
   voice in flight while we MITM it: **Linux** via NFQUEUE (root), **Windows** via bundled **WinDivert**
   (Administrator). macOS has no userland packet-divert primitive, so it's not supported there.
 - The virtual mic depends on a loopback driver you must install: **VB-CABLE** on
-  Windows, **BlackHole** on macOS (PulseAudio is native on Linux).
+  Windows, **BlackHole** on macOS (PulseAudio is native on Linux). The web panel's
+  **Dependencies** card lists every optional external driver/program a feature needs,
+  shows whether each is already present, and links to the official installer with
+  step-by-step instructions (bundling the ones whose licence allows it, e.g. WinDivert).
 - **Hardware encoding matches the GPU vendor**: Windows picks NVENC / AMF (AMD) /
   QSV (Intel) / MediaFoundation, macOS uses **VideoToolbox**, Linux uses NVENC/CUDA
   or VAAPI. macOS screen capture requires the OS **Screen Recording** permission — bsdrX
@@ -393,8 +397,10 @@ make windows WIN_DEPS=/path/to/win-deps    # full media (alias: windows-media)
 ```
 
 Capture via gdigrab, encode via NVENC/x264, virtual mic via **VB-CABLE**, owner-mic
-sniffer via **Npcap** — run the agent as **Administrator** for the sniffer.
-`make windows` == `make windows-media` (full media-capable build).
+sniffer via **Npcap**, and cloud voice **substitution** via bundled **WinDivert** —
+run the agent as **Administrator** for the sniffer/MITM. `make windows` ==
+`make windows-media` (full media-capable build; picks up WinDivert automatically when
+`WIN_DEPS` contains the SDK).
 
 ### Android
 

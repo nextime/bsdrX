@@ -84,6 +84,14 @@ Web surface (all in `webui.c`, served locally, same-origin):
    Also fixed build-blockers/warnings surfaced en route: winlist_win.c missing <stdio.h>,
    capture.c `have_raw` unused-label (non-PipeWire), micsniff.c rp_filter unused-vars (macOS).
    Docker needs `sudo` here (not in docker group); images already built.
-4. **TODO** C dependency manager (endpoints + UI + instructions pages). Design in section C above.
+4. **DONE + built (Linux/Win/macOS clean)** C dependency manager: new `src/deps.c` + `include/bsdr/deps.h`
+   (`bsdr_deps_list`/`bsdr_dep_install`/`bsdr_dep_page`); per-platform tables + conservative presence
+   detection (Win: LoadLibrary wpcap/WinDivert, waveOut enum for VB-CABLE; Linux: BSDR_HAVE_PCAP; macOS:
+   BlackHole=instructions). webui.c endpoints `GET /api/deps`, `POST /api/deps/install`, `GET /deps/<id>`
+   (styled instructions page) + a "Dependencies" UI card (hidden when empty → Android/Linux-native show
+   none). Wired into CORE_SRC (Makefile) + Android CMakeLists. WinDivert reports bundled; Npcap/VB-CABLE/
+   ViGEmBus/BlackHole = instructions+official download link (licences forbid silent install or need user
+   consent). `automatable` flag reserved for future fetch-and-launch installers. Runtime smoke test blocked:
+   the agent gets signal-killed when detached in this sandbox (env artifact; web server binds fine).
 5. **TODO** B macOS experimental piggyback (needs micsniff↔micsub plumbing; no divert socket).
 6. **TODO** full `./distribute.sh` bundle run; live Quest tests (Win voice-sub, macOS screen/webcam).

@@ -188,7 +188,7 @@ CORE_SRC := src/log.c src/net.c src/json.c src/input_decode.c \
             src/dtls.c src/cloud.c src/cloud_stream.c src/app.c src/webui.c \
             src/overlay.c src/httpc.c src/tls.c src/stt.c src/llm.c \
             src/compcontrol.c src/voice.c src/screenshot.c src/threed.c \
-            src/depth_onnx.c src/model_store.c src/webcam.c src/voicefx.c src/faceswap.c src/micsub.c \
+            src/depth_onnx.c src/model_store.c src/webcam.c src/voicefx.c src/faceswap.c src/micsub.c src/deps.c \
             $(INJECT_SRC) $(WINLIST_SRC) $(SCTP_SRC) $(MEDIA_SRC)
 # miniz (vendored, third_party) backs model_store.c's zip import; built in every config.
 # Map both .c and .m (macOS AVFoundation shims) sources to objects.

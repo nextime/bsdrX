@@ -23,6 +23,7 @@
 #include "bsdr/winlist.h"
 #include "bsdr/model_store.h"
 #include "bsdr/webcam.h"
+#include "bsdr/deps.h"
 #include "bsdr/tls.h"
 
 #include <stdio.h>
@@ -373,6 +374,13 @@ static const char PAGE[] =
 "<div class=row><button id=ccbtn class=p onclick=toggleCompctl()>Enable computer control</button></div></div>"
 "</div>"
 
+/* Optional 3rd-party dependencies: shown only when this platform has any (empty on Linux-native/Android).
+ * Each row: present ✓ / a How-to-install button linking to /deps/<id> (auto-install where automatable). */
+"<div class=card id=depcard style=display:none><h2>Dependencies</h2>"
+"<div class=hint>Optional external drivers/programs some features need. bsdrX bundles what its licence "
+"allows; the rest link to the official installer with step-by-step instructions.</div>"
+"<div id=deplist></div></div>"
+
 /* server-side file-browser modal (fills the source path) */
 "<div id=fb style=\"display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99\" onclick=\"if(event.target==this)fbClose()\">"
 "<div style=\"background:#1b1f2a;color:#e6e8ee;max-width:640px;margin:6vh auto;border-radius:10px;padding:14px;max-height:80vh;display:flex;flex-direction:column;border:1px solid #333\">"
@@ -413,6 +421,13 @@ static const char PAGE[] =
 "function pickSrc(m){camMode=m;srcRows(m);"
 "if(m==='webcam'||m==='webcam3d'){loadCams().then(pickCam);}else{api('/api/source',{mode:m,path:path.value});}}"
 "async function loadCams(){let r=await api('/api/webcams');cams=(r&&r.cams)||[];renderCams();}"
+"async function loadDeps(){let r=await api('/api/deps');let d=(r&&r.deps)||[];let card=document.getElementById('depcard');"
+"if(!d.length){card.style.display='none';return;}card.style.display='';let h='';"
+"d.forEach(function(x){let st=x.present?'<span class=\"badge free\">installed</span>':(x.bundled?'<span class=\"badge free\">bundled</span>':'<span class=\"badge custom\">not detected</span>');"
+"let btn=x.present?'':(x.automatable?'<button style=width:auto onclick=\"depInstall(\\''+x.id+'\\')\">Install</button>':'<button style=width:auto onclick=\"window.open(\\'/deps/'+x.id+'\\',\\'_blank\\')\">How to install</button>');"
+"h+='<div class=sub2><div class=t>'+x.name+' '+st+'</div><div class=hint>'+x.purpose+' &middot; <span style=opacity:.7>'+x.license+'</span></div>'+(btn?('<div class=row>'+btn+'</div>'):'')+'</div>';});"
+"document.getElementById('deplist').innerHTML=h;}"
+"async function depInstall(id){let r=await api('/api/deps/install',{id:id});if(r&&r.manual){window.open('/deps/'+id,'_blank');}else{await loadDeps();}}"
 "function camCtl(id,cur){if(cams.length){return '<select id='+id+' class=grow onchange=pickCam()>'+cams.map(function(c){return '<option value=\"'+c.id+'\"'+(c.id===cur?' selected':'')+'>'+c.name+'</option>'}).join('')+'</select>';}"
 "return '<input id='+id+' class=grow onchange=pickCam() value=\"'+(cur||'')+'\" placeholder=\"camera device or index\">';}"
 "function renderCams(){camsel.innerHTML=camCtl('cam',window._cam||'');camselR.innerHTML=camCtl('camR',window._camR||'');}"
@@ -540,7 +555,7 @@ static const char PAGE[] =
 "ccbadge.textContent=cc.active?'armed':(cc.want?'pending':'off');ccbadge.className='badge '+(cc.active?'free':'custom');"
 "if(document.activeElement!==ccvis)ccvis.checked=!!cc.vision;}"
 "let pb=document.getElementById('pause');pb.textContent=s.quest.paused?'Restart':'Stop';pb.className=s.quest.paused?'p':'danger';}"
-"setInterval(tick,1000);tick();loadWindows();"
+"setInterval(tick,1000);tick();loadWindows();loadDeps();"
 "</script></body></html>";
 
 static void respond(bsdr_socket_t c, int code, const char *ctype, const char *body, size_t blen) {
@@ -560,6 +575,47 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
     bsdr_app *a = w->app;
     if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
         respond(c, 200, "text/html", PAGE, sizeof(PAGE) - 1);
+    } else if (strcmp(method, "GET") == 0 && strncmp(path, "/deps/", 6) == 0) {
+        /* Per-dependency install instructions page (opened in a new tab from the Dependencies card). */
+        const char *frag = bsdr_dep_page(path + 6);
+        if (!frag) { respond(c, 404, "text/html", "<h1>Unknown dependency</h1>", 27); }
+        else {
+            static char pg[8192];
+            int n = snprintf(pg, sizeof pg,
+                "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+                "<title>bsdrX — install</title><style>body{font:15px/1.6 system-ui,sans-serif;max-width:44rem;"
+                "margin:2rem auto;padding:0 1rem;color:#222;background:#fafafa}h1{font-size:1.4rem}code{background:#eee;"
+                "padding:.1em .3em;border-radius:3px}a{color:#1769c0}ol,ul{padding-left:1.3rem}"
+                "@media(prefers-color-scheme:dark){body{background:#181a1b;color:#ddd}code{background:#333}a{color:#6ab0ff}}"
+                "</style>%s<p style=margin-top:2rem><a href=\"/\">&larr; back to bsdrX</a></p>", frag);
+            respond(c, 200, "text/html", pg, n > 0 ? (size_t)n : 0);
+        }
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/deps") == 0) {
+        /* List this platform's optional 3rd-party deps + whether each is present. */
+        bsdr_dep deps[16];
+        int nd = bsdr_deps_list(deps, 16);
+        char out[4096]; int ol = snprintf(out, sizeof out, "{\"deps\":[");
+        for (int i = 0; i < nd && ol < (int)sizeof(out) - 512; i++) {
+            char en[128], ep[256], el[128];
+            bsdr_json_escape(en, sizeof en, deps[i].name);
+            bsdr_json_escape(ep, sizeof ep, deps[i].purpose);
+            bsdr_json_escape(el, sizeof el, deps[i].license);
+            ol += snprintf(out + ol, sizeof(out) - ol,
+                "%s{\"id\":\"%s\",\"name\":\"%s\",\"purpose\":\"%s\",\"license\":\"%s\",\"present\":%s,\"bundled\":%s,\"automatable\":%s}",
+                i ? "," : "", deps[i].id, en, ep, el,
+                deps[i].present ? "true" : "false", deps[i].bundled ? "true" : "false",
+                deps[i].automatable ? "true" : "false");
+        }
+        ol += snprintf(out + ol, sizeof(out) - ol, "]}");
+        respond(c, 200, "application/json", out, ol);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/deps/install") == 0) {
+        char id[64] = ""; bsdr_json_get_str(body, "id", id, sizeof id);
+        char msg[256] = ""; int r = bsdr_dep_install(id, msg, sizeof msg);
+        char em[512]; bsdr_json_escape(em, sizeof em, msg);
+        char out[700]; int ol = snprintf(out, sizeof out,
+            "{\"ok\":%s,\"manual\":%s,\"msg\":\"%s\"}",
+            r == 1 ? "true" : "false", r == 0 ? "true" : "false", em);
+        respond(c, 200, "application/json", out, ol);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
         static char json[12288];
         size_t n = bsdr_app_status_json(a, json, sizeof(json));
