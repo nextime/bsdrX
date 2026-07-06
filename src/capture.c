@@ -22,6 +22,7 @@
 #include "bsdr/faceswap.h"
 #include "bsdr/platform.h"
 #include "bsdr/log.h"
+#include "bsdr/capture_pipewire.h"   /* Wayland desktop capture (portal + PipeWire); Linux only */
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -63,6 +64,12 @@ struct bsdr_capture {
     AVFilterGraph *fg;
     AVFilterContext *fg_src, *fg_sink;
     AVFrame *gpu;               /* CUDA NV12 frame out of the filter graph */
+    /* ---- Wayland source (xdg-desktop-portal + PipeWire): frames arrive already-decoded (packed
+     * 32-bit RGB), so we skip av_read_frame/decode and drop them straight into c->raw. fmt/dec are
+     * lightweight dummies that only carry size + pix_fmt + time_base for the scale/encode setup. ---- */
+    struct bsdr_pw_capture *pw;
+    uint8_t *pw_buf;            /* packed BGR0/RGB0 frame (stride = pw_stride) filled each read */
+    int pw_stride;
     /* ---- file-source playback (cfg.input_file) ---- */
     /* realtime face swap (borrowed engine, CPU path): NV12 <-> RGB24 scratch + scalers */
     struct bsdr_faceswap *faceswap;
@@ -189,34 +196,42 @@ static int open_encoder(bsdr_capture *c, const bsdr_capture_config *cfg,
         enc->profile = AV_PROFILE_H264_HIGH;
         /* in-band SPS/PPS (no GLOBAL_HEADER) so late joiners can decode */
         if (strstr(try_names[i], "nvenc")) {
-            /* Quality-tuned low-latency NVENC. The old preset=p4 + tune=ull (ultra-low latency)
-             * combo shrinks the VBV to ~1 frame and disables adaptive quant, so at low bitrates
-             * (e.g. 3 Mbps @ 1080p) complex desktop frames were heavily quantized and looked worse
-             * than the x264 fallback. We keep latency low (tune=ll, no B-frames, no lookahead) but
-             * restore the quality knobs: a slower preset, spatial AQ (the single biggest low-bitrate
-             * win, no latency cost), and a ~1s CBR VBV so AQ can redistribute bits. p6 stays well
-             * above real-time for 1080p30 on any NVENC GPU. */
+            /* Quality-tuned NVENC, matched to the x264 CPU fallback. History: preset=p4 + tune=ull
+             * collapsed the VBV and killed adaptive quant, so desktop frames looked worse than x264.
+             * The deeper reason the GPU path still trailed CPU at the SAME resolution+bitrate (e.g.
+             * 1080p/3Mbps): the x264 branch runs with NO VBV cap ("quality is the whole point", see
+             * that branch), so it overshoots the target on complex frames and stays sharp, while a
+             * hard-capped nvenc holds the target and smears. We mirror x264 here — VBR toward a quality
+             * target (cq) with GENEROUS HEADROOM (rc_max_rate = 2x the target) so nvenc spends the same
+             * actual bits on busy frames: sharper text, less mush, at the same nominal bitrate. The
+             * live path keeps latency low (tune=ll, no B-frames/lookahead); spatial AQ + 2-pass
+             * concentrate bits on high-contrast text; p7 stays above real-time for 1080p30 on any
+             * NVENC GPU. Busy-frame bandwidth rises to ~2x the target — exactly as the CPU path already
+             * does — so cap it with --max-bitrate on a constrained (e.g. internet-share) uplink. */
             av_opt_set(enc->priv_data, "preset", "p7", 0);    /* max-quality preset; still real-time */
             av_opt_set(enc->priv_data, "profile", "high", 0);
-            av_opt_set(enc->priv_data, "rc", "cbr", 0);
+            av_opt_set(enc->priv_data, "rc", "vbr", 0);       /* VBR (not CBR): don't pad static frames */
             av_opt_set_int(enc->priv_data, "spatial-aq", 1, 0);
             av_opt_set_int(enc->priv_data, "aq-strength", 8, 0);
             /* 2-pass rate control ("multipass"): the biggest quality-per-bit win at the Quest's low
-             * bitrates — allocates bits far better than 1-pass CBR, for a negligible latency cost. */
+             * bitrates — allocates bits far better than 1-pass, for a negligible latency cost. */
             av_opt_set(enc->priv_data, "multipass", "fullres", 0);
-            enc->rc_max_rate = cfg->bitrate;
             if (cfg->input_file) {
                 /* File playback has NO latency constraint -> go for maximum quality: HQ tune,
                  * look-ahead, temporal AQ and B-frames (all of which the low-latency desktop path
-                 * must avoid). A ~2s VBV lets complex scenes borrow bits. */
+                 * must avoid). Bounded VBV is fine with no realtime deadline. */
                 av_opt_set(enc->priv_data, "tune", "hq", 0);
+                av_opt_set_int(enc->priv_data, "cq", 19, 0);
                 av_opt_set_int(enc->priv_data, "rc-lookahead", 20, 0);
                 av_opt_set_int(enc->priv_data, "temporal-aq", 1, 0);
                 enc->max_b_frames = 3;
-                enc->rc_buffer_size = cfg->bitrate * 2;
+                enc->rc_max_rate = cfg->bitrate;
+                enc->rc_buffer_size = (int64_t)cfg->bitrate * 2;
             } else {
                 av_opt_set(enc->priv_data, "tune", "ll", 0);  /* low latency (no lookahead/B-frames) */
-                enc->rc_buffer_size = cfg->bitrate;           /* ~1s VBV */
+                av_opt_set_int(enc->priv_data, "cq", 20, 0);  /* quality target; maxrate bounds the spend */
+                enc->rc_max_rate = (int64_t)cfg->bitrate * 2; /* 2x headroom = x264's practical overshoot */
+                enc->rc_buffer_size = (int64_t)cfg->bitrate * 2;
             }
         } else if (strstr(try_names[i], "videotoolbox")) {
             /* Apple VideoToolbox HW H.264. It ignores the nvenc/x264 private options, so give it
@@ -285,17 +300,21 @@ static int open_encoder_cuda(bsdr_capture *c, const bsdr_capture_config *cfg,
     enc->gop_size = cfg->fps;
     enc->max_b_frames = 0;
     enc->profile = AV_PROFILE_H264_HIGH;
-    /* Same quality-tuned low-latency NVENC config as the NV12 path (see the note there): p6 + ll +
-     * spatial AQ + a ~1s CBR VBV, instead of p4 + ull which looked worse than x264 at low bitrate. */
+    /* Same quality-tuned low-latency NVENC config as the NV12 path (see the note there): p7 + ll +
+     * spatial AQ + VBR with a cq target + 2x rc_max_rate HEADROOM, so on complex desktop frames nvenc
+     * spends the same actual bits the uncapped x264 fallback does -> GPU quality matches CPU at the
+     * same resolution+bitrate. (Was CBR, then hard-capped VBR, both of which held the target and
+     * smeared while x264 overshot and stayed sharp.) --max-bitrate caps the target on a thin uplink. */
     av_opt_set(enc->priv_data, "preset", "p7", 0);   /* max-quality preset; still real-time */
     av_opt_set(enc->priv_data, "tune", "ll", 0);
     av_opt_set(enc->priv_data, "profile", "high", 0);
-    av_opt_set(enc->priv_data, "rc", "cbr", 0);
+    av_opt_set(enc->priv_data, "rc", "vbr", 0);
+    av_opt_set_int(enc->priv_data, "cq", 20, 0);
     av_opt_set_int(enc->priv_data, "spatial-aq", 1, 0);
     av_opt_set_int(enc->priv_data, "aq-strength", 8, 0);
     av_opt_set(enc->priv_data, "multipass", "fullres", 0);   /* 2-pass RC: big low-bitrate quality win */
-    enc->rc_max_rate = cfg->bitrate;
-    enc->rc_buffer_size = cfg->bitrate;
+    enc->rc_max_rate = (int64_t)cfg->bitrate * 2;    /* 2x headroom -> matches the uncapped x264 path */
+    enc->rc_buffer_size = (int64_t)cfg->bitrate * 2;
     if (avcodec_open2(enc, codec, NULL) != 0) { avcodec_free_context(&enc); return -1; }
     c->enc = enc; c->enc_name = "h264_nvenc(cuda)";
     return 0;
@@ -390,9 +409,13 @@ static int open_encoder_vaapi(bsdr_capture *c, const bsdr_capture_config *cfg,
     enc->gop_size = cfg->fps;
     enc->max_b_frames = 0;
     enc->profile = AV_PROFILE_H264_HIGH;
-    enc->rc_max_rate = cfg->bitrate;
-    enc->rc_buffer_size = cfg->bitrate;   /* ~1s VBV: lets CBR spend bits on complex frames (quality) */
-    av_opt_set(enc->priv_data, "rc_mode", "CBR", 0);
+    /* VBR with 2x headroom (was 1s CBR): CBR pads near-static desktop frames and a tight buffer caps
+     * the IDR, leaving keyframe text soft while the uncapped x264 path overshoots and stays sharp.
+     * VBR + rc_max_rate = 2x target lets VAAPI spend the same actual bits on complex frames (VBR also
+     * genuinely needs maxrate > bitrate). Mirrors the NVENC paths; --max-bitrate caps a thin uplink. */
+    enc->rc_max_rate = (int64_t)cfg->bitrate * 2;
+    enc->rc_buffer_size = (int64_t)cfg->bitrate * 2;
+    av_opt_set(enc->priv_data, "rc_mode", "VBR", 0);
     av_opt_set_int(enc->priv_data, "low_power", 1, 0);   /* VCN low-latency path; ignored if unsupported */
     if (avcodec_open2(enc, codec, NULL) != 0) {
         av_opt_set_int(enc->priv_data, "low_power", 0, 0);
@@ -480,6 +503,38 @@ static int open_webcam(AVFormatContext **fmt, const char *dev) {
     if (rc != 0) { BSDR_ERROR("bsdr.capture", "cannot open webcam '%s' (in use, or wrong device?)", dev); return -1; }
     return 0;
 }
+
+#ifdef BSDR_HAVE_PIPEWIRE
+/* Open the Wayland portal + PipeWire screencast and set up lightweight dummy fmt/dec (size, pixfmt,
+ * time_base) so the shared scale/encode setup and the read loop treat it like an x11grab source that
+ * already decoded to packed 32-bit RGB. Returns 0 on success. */
+static int cap_open_pipewire(bsdr_capture *c, bsdr_capture_config *cfg) {
+    int w = 0, h = 0; bsdr_pw_format pf = BSDR_PW_FMT_BGR0;
+    c->pw = bsdr_pw_capture_open(0 /*whole monitor*/, 1 /*cursor embedded*/, &w, &h, &pf);
+    if (!c->pw || w <= 0 || h <= 0) return -1;
+    enum AVPixelFormat avf =
+        pf == BSDR_PW_FMT_RGB0 ? AV_PIX_FMT_RGB0 :
+        pf == BSDR_PW_FMT_BGRA ? AV_PIX_FMT_BGRA :
+        pf == BSDR_PW_FMT_RGBA ? AV_PIX_FMT_RGBA : AV_PIX_FMT_BGR0;
+    c->fmt = avformat_alloc_context();
+    if (!c->fmt) return -1;
+    AVStream *st = avformat_new_stream(c->fmt, NULL);
+    if (!st) return -1;
+    st->time_base = (AVRational){ 1, cfg->fps };
+    c->vstream = 0;
+    c->dec = avcodec_alloc_context3(NULL);   /* not opened — only carries size/pixfmt for scale setup */
+    if (!c->dec) return -1;
+    c->dec->pix_fmt = avf;
+    c->dec->width = w; c->dec->height = h;
+    c->dec->time_base = (AVRational){ 1, cfg->fps };
+    c->pw_stride = w * 4;                     /* packed 32-bit RGB, no row padding */
+    c->pw_buf = malloc((size_t)c->pw_stride * h);
+    if (!c->pw_buf) return -1;
+    cfg->use_kmsgrab = 0;                     /* PipeWire delivers CPU frames (BGR0), like x11grab */
+    BSDR_INFO("bsdr.capture", "Wayland capture via xdg-desktop-portal + PipeWire (%dx%d)", w, h);
+    return 0;
+}
+#endif
 
 bsdr_capture *bsdr_capture_open(const bsdr_capture_config *cfg_in) {
     bsdr_capture_config cfg = *cfg_in;
@@ -589,6 +644,19 @@ bsdr_capture *bsdr_capture_open(const bsdr_capture_config *cfg_in) {
         av_dict_free(&opts); goto fail;
     }
 #else
+#ifdef BSDR_HAVE_PIPEWIRE
+    /* Backend autodetect: x11grab can't see a native Wayland desktop (it grabs the XWayland root,
+     * usually blank), so on a Wayland session use the xdg-desktop-portal + PipeWire path; on a real
+     * Xorg session use x11grab. --x11 / --wayland force it. kmsgrab (explicit) always wins. */
+    {
+        int wayland = getenv("WAYLAND_DISPLAY") != NULL;
+        int use_pw = cfg.force_pipewire ? 1 : (cfg.force_x11 || cfg.use_kmsgrab) ? 0 : wayland;
+        if (use_pw) {
+            if (cap_open_pipewire(c, &cfg) == 0) { av_dict_free(&opts); goto have_input_pw; }
+            BSDR_WARN("bsdr.capture", "portal/PipeWire capture unavailable; falling back to x11grab");
+        }
+    }
+#endif
     if (cfg.use_kmsgrab) cfg.use_vaapi = 1;   /* kmsgrab frames are DRM hw surfaces -> need the VAAPI path */
     char url[64];
     const AVInputFormat *ifmt;
@@ -653,6 +721,9 @@ have_input:;
         if (!c->raw2) goto fail;
     }
 
+#ifdef BSDR_HAVE_PIPEWIRE
+have_input_pw:;   /* PipeWire path joins here: fmt/dec already set by cap_open_pipewire (no avformat decode) */
+#endif
     /* Target dims: 0 means "derive from source". If only one is given, scale the
      * other to preserve the desktop's aspect ratio (so e.g. 720p on a 16:10 or
      * ultrawide desktop is not stretched). The Quest sizes its surface from the
@@ -867,6 +938,22 @@ int bsdr_capture_frame(bsdr_capture *c, const uint8_t **au, size_t *len,
         }
     }
 
+#ifdef BSDR_HAVE_PIPEWIRE
+    if (c->pw) {
+        /* Wayland: the portal/PipeWire stream already delivers packed 32-bit RGB — drop it into
+         * c->raw (an unowned wrapper over pw_buf) and skip av_read_frame/decode entirely. */
+        int got = bsdr_pw_capture_read(c->pw, c->pw_buf, c->pw_stride, c->dec->height);
+        if (got < 0) return -1;
+        if (got == 0) return 0;                 /* no new frame this tick — try again */
+        av_frame_unref(c->raw);
+        c->raw->format = c->dec->pix_fmt;
+        c->raw->width  = c->dec->width;
+        c->raw->height = c->dec->height;
+        c->raw->data[0]     = c->pw_buf;
+        c->raw->linesize[0] = c->pw_stride;
+        goto have_raw;
+    }
+#endif
 read_frame:
     /* grab one frame (screen or file), decode, scale, feed the encoder */
     if (av_read_frame(c->fmt, c->ipkt) < 0) {
@@ -881,6 +968,7 @@ read_frame:
     if (avcodec_receive_frame(c->dec, c->raw) != 0) return 0;
     if (c->is_file) cap_pace(c, c->raw->pts);
 
+have_raw:;
     /* Voice-command balloon: composite onto the SOURCE frame (before scale/convert/
      * upload) so it survives both the CPU and the GPU (VAAPI/CUDA) encode paths — no
      * CPU-encode fallback needed. Only a software packed-RGB32 frame can be drawn on;
@@ -972,6 +1060,15 @@ double bsdr_capture_position(bsdr_capture *c, int *seekable) {
 
 void bsdr_capture_close(bsdr_capture *c) {
     if (!c) return;
+#ifdef BSDR_HAVE_PIPEWIRE
+    if (c->pw) {                              /* stop the PipeWire thread before freeing its scratch */
+        bsdr_pw_capture_close(c->pw); c->pw = NULL;
+        if (c->raw) { c->raw->data[0] = NULL; c->raw->linesize[0] = 0; }   /* was an unowned pw_buf wrapper */
+        free(c->pw_buf); c->pw_buf = NULL;
+        /* the dummy fmt was avformat_alloc_context()'d (never opened) -> free, don't close_input */
+        if (c->fmt) { avformat_free_context(c->fmt); c->fmt = NULL; }
+    }
+#endif
     if (c->opkt) { av_packet_unref(c->opkt); av_packet_free(&c->opkt); }
     if (c->ipkt) { av_packet_unref(c->ipkt); av_packet_free(&c->ipkt); }
     if (c->raw) av_frame_free(&c->raw);

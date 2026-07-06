@@ -6,6 +6,8 @@
 #     --prefix=DIR           install prefix (default /usr/local)
 #     --host=TRIPLE          cross-compile (e.g. x86_64-w64-mingw32)
 #     --with-openssl=DIR     OpenSSL prefix (required for cross builds)
+#     --with-onnx=DIR        ONNX Runtime prefix for in-process 2D->3D depth + face
+#                            swap (auto-detected from ../onnx-deps or /opt/onnxruntime)
 #     --enable-sctp          build the usrsctp DataChannel (needs usrsctp)
 #     --static               link a static Linux binary (needs static .a deps;
 #                            pair with --disable-media for a clean portable build)
@@ -17,26 +19,36 @@ set -e
 prefix=/usr/local
 host=
 with_openssl=
+with_onnx=
 enable_sctp=yes        # media is on by default; deps auto-detected below
 enable_video=yes
 enable_audio=yes
 build_tests=yes
 static=no
 CC_OVERRIDE=
+# A feature is "required" unless the user explicitly --disable-s it. Required deps
+# that turn up missing are a hard configure error (with an install hint) rather than
+# a silent disable, because the Makefile's require-full-media makes them mandatory.
+req_sctp=yes
+req_video=yes
+req_audio=yes
+missing=          # accumulates apt-style package names for required deps not found
 
 for arg in "$@"; do
     case "$arg" in
         --prefix=*)       prefix=${arg#*=} ;;
         --host=*)         host=${arg#*=} ;;
         --with-openssl=*) with_openssl=${arg#*=} ;;
+        --with-onnx=*)    with_onnx=${arg#*=} ;;
         --enable-sctp)    enable_sctp=yes ;;
         --enable-video)   enable_video=yes ;;
         --enable-audio)   enable_audio=yes ;;
         --enable-media)   enable_sctp=yes; enable_video=yes; enable_audio=yes ;;
-        --disable-sctp)   enable_sctp=no ;;
-        --disable-video)  enable_video=no ;;
-        --disable-audio)  enable_audio=no ;;
-        --disable-media)  enable_sctp=no; enable_video=no; enable_audio=no ;;
+        --disable-sctp)   enable_sctp=no; req_sctp=no ;;
+        --disable-video)  enable_video=no; req_video=no ;;
+        --disable-audio)  enable_audio=no; req_audio=no ;;
+        --disable-media)  enable_sctp=no; enable_video=no; enable_audio=no
+                          req_sctp=no; req_video=no; req_audio=no ;;
         --static)         static=yes ;;
         --disable-static) static=no ;;
         --disable-tests)  build_tests=no ;;
@@ -74,18 +86,18 @@ LDFLAGS_EXTRA=
 case "$target" in
     windows)
         INJECT_SRC=src/inject_win.c
-        PLAT_LIBS="-lws2_32 -luser32 -lbcrypt -lcrypt32"
+        PLAT_LIBS="-lws2_32 -luser32 -lbcrypt -lcrypt32 -lm"
         LDFLAGS_EXTRA="-static -static-libgcc"
         EXEEXT=.exe ;;
     macos)
         INJECT_SRC=src/inject_macos.c
-        PLAT_LIBS="-framework CoreGraphics -framework CoreFoundation" ;;
+        PLAT_LIBS="-framework CoreGraphics -framework CoreFoundation -lm" ;;
     linux)
         INJECT_SRC=src/inject_linux.c
-        PLAT_LIBS="-lpthread" ;;
+        PLAT_LIBS="-lpthread -lm" ;;
     *)
         INJECT_SRC=src/inject_null.c
-        PLAT_LIBS="-lpthread" ;;
+        PLAT_LIBS="-lpthread -lm" ;;
 esac
 
 # --- static linking (Linux) ------------------------------------------------
@@ -118,32 +130,72 @@ else
     OSSL_LIBS="-lssl -lcrypto"
 fi
 
-# --- auto-detect media deps; disable what's missing (so the build never fails
-#     just because an optional lib isn't installed) ----------------------------
+# --- auto-detect media deps ------------------------------------------------
+# A missing dep for a REQUIRED feature (one the user didn't --disable) is recorded
+# in $missing and turned into a hard error at the end, with an install hint: the
+# Makefile's require-full-media makes these mandatory, so silently disabling them
+# here would only defer the failure to `make`. An explicitly --disabled feature
+# that is missing is simply left off (no error).
 have_pkg() { pkg-config --exists "$@" 2>/dev/null; }
+# note_missing FEATURE "apt packages": disable FEATURE; error later iff it's required.
+note_missing() {
+    _feat=$1; _pkgs=$2
+    eval "enable_$_feat=no"
+    if eval "[ \"\$req_$_feat\" = yes ]"; then
+        missing="$missing $_pkgs"
+        echo "configure: ERROR: $_feat deps missing -> need: $_pkgs" >&2
+    else
+        echo "configure: $_feat deps missing -> $_feat disabled (explicitly requested)"
+    fi
+}
 if [ "$enable_sctp" = yes ]; then
     if [ ! -f /usr/include/usrsctp.h ] && [ ! -f /usr/local/include/usrsctp.h ] \
        && ! have_pkg usrsctp; then
-        echo "configure: usrsctp not found -> SCTP disabled (--enable-sctp to force)"; enable_sctp=no
+        note_missing sctp "libusrsctp-dev"
     fi
 fi
 if [ "$enable_video" = yes ]; then
     miss=
-    have_pkg libsrtp2 || miss="libsrtp2"
+    have_pkg libsrtp2 || miss="libsrtp2-dev"
     if [ "$target" = linux ] || [ "$target" = macos ]; then
         # ffmpeg drives desktop capture/encode on both Linux (x11grab/nvenc) and macOS
         # (avfoundation/videotoolbox); the RTP sender (video.c) alone needs no ffmpeg.
-        have_pkg libavcodec libavformat libavdevice libswscale libswresample libavfilter || miss="$miss ffmpeg"
+        have_pkg libavcodec libavformat libavdevice libswscale libswresample libavfilter \
+          || miss="$miss libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libswscale-dev libswresample-dev libavfilter-dev"
     fi
-    if [ -n "$miss" ]; then echo "configure: video deps missing ($miss) -> video disabled"; enable_video=no; fi
+    # winlist.c (X11) links on the Linux video path; check its dev header too.
+    if [ "$target" = linux ] && ! have_pkg x11 && [ ! -f /usr/include/X11/Xlib.h ]; then
+        miss="$miss libx11-dev"
+    fi
+    [ -n "$miss" ] && note_missing video "$miss"
 fi
 if [ "$enable_audio" = yes ]; then
     # Linux audio = Opus + PulseAudio; macOS audio = Opus + CoreAudio (no PulseAudio).
     case "$target" in
-        linux) have_pkg opus libpulse-simple || { echo "configure: audio deps missing (opus/libpulse) -> audio disabled"; enable_audio=no; } ;;
-        macos) have_pkg opus                 || { echo "configure: audio deps missing (opus) -> audio disabled"; enable_audio=no; } ;;
+        linux) have_pkg opus libpulse-simple || note_missing audio "libopus-dev libpulse-dev" ;;
+        macos) have_pkg opus                 || note_missing audio "libopus-dev" ;;
         *)     echo "configure: audio not supported on target $target -> audio disabled"; enable_audio=no ;;
     esac
+fi
+
+# --- fail fast: required deps missing --------------------------------------
+# Aggregate every missing required package into one actionable message instead of
+# letting `make` die later at require-full-media (or at a link step).
+if [ -n "$missing" ]; then
+    uniq_missing=$(printf '%s\n' $missing | sort -u | tr '\n' ' ')
+    echo "" >&2
+    echo "configure: required libraries are missing. bsdrX is a full-media build" >&2
+    echo "           (desktop capture is mandatory), so these are not optional:" >&2
+    echo "" >&2
+    echo "    $uniq_missing" >&2
+    echo "" >&2
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "    Debian/Ubuntu:  sudo apt-get install $uniq_missing" >&2
+    fi
+    echo "" >&2
+    echo "           (or pass --disable-video/--disable-audio/--disable-sctp to build" >&2
+    echo "            without them — note the default 'make' target still requires media.)" >&2
+    exit 1
 fi
 
 # --- optional SCTP ---------------------------------------------------------
@@ -173,7 +225,7 @@ if [ "$enable_video" = yes ]; then
     if [ "$target" = linux ] || [ "$target" = macos ]; then
         # Desktop capture + local-file streaming + 2D->3D (all ffmpeg): Linux via
         # x11grab/kmsgrab + nvenc/vaapi/x264, macOS via avfoundation + h264_videotoolbox.
-        MEDIA_SRC="$MEDIA_SRC src/capture.c src/filesrc.c src/fileaudio.c"   # threed.c is in the Makefile's CORE_SRC
+        MEDIA_SRC="$MEDIA_SRC src/capture.c src/filesrc.c src/fileaudio.c src/capture_pipewire.c"   # threed.c is in the Makefile's CORE_SRC; capture_pipewire = Wayland (stub off Linux)
         MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_CAPTURE=1"
         MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags libavcodec libavformat libavdevice libavutil libswscale libswresample libavfilter 2>/dev/null)"
         MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS libavcodec libavformat libavdevice libavutil libswscale libswresample libavfilter 2>/dev/null)"
@@ -181,6 +233,20 @@ if [ "$enable_video" = yes ]; then
             # ffmpeg's avfoundation input device + h264_videotoolbox encoder link these frameworks.
             MEDIA_LIBS="$MEDIA_LIBS -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework AVFoundation -framework Foundation -framework CoreServices"
         fi
+    fi
+fi
+# --- Wayland desktop capture: xdg-desktop-portal (dbus) + PipeWire ----------
+# Optional, Linux only. x11grab can't see a native Wayland desktop, so on Wayland we capture via
+# the portal ScreenCast + a PipeWire stream. capture_pipewire.c stubs out (still compiled) when the
+# libs are absent, so the autodetect just falls back to x11grab/kmsgrab.
+if [ "$enable_video" = yes ] && [ "$target" = linux ]; then
+    if have_pkg libpipewire-0.3 dbus-1; then
+        MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_PIPEWIRE=1"
+        MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags libpipewire-0.3 dbus-1 2>/dev/null)"
+        MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS libpipewire-0.3 dbus-1 2>/dev/null)"
+        echo "configure: Wayland capture = xdg-desktop-portal + PipeWire"
+    else
+        echo "configure: Wayland capture OFF (install libpipewire-0.3-dev + libdbus-1-dev); x11grab/kmsgrab only"
     fi
 fi
 if [ "$enable_audio" = yes ] && [ "$target" = macos ]; then
@@ -222,6 +288,60 @@ else
     WINLIST_SRC="src/winlist_null.c"
 fi
 
+# --- in-process ONNX Runtime (2D->3D depth + face swap) --------------------
+# Mirrors the Makefile's HOST_ONNX and the linux-bundle's ONNX enablement so a native
+# ./configure build is FEATURE-IDENTICAL to the bundle (depth_onnx.c / faceswap.c compile
+# their real path, not the stub). Auto-detect from --with-onnx, a sibling ../onnx-deps
+# checkout, or /opt/onnxruntime; absent -> those units stub out (no error, it's optional).
+ONNX_DEF=
+ONNX_LIBS=
+onnx_prefix=
+if [ -n "$with_onnx" ]; then
+    onnx_prefix="$with_onnx"
+else
+    for d in ../onnx-deps/onnxruntime-linux-* /opt/onnxruntime; do
+        [ -f "$d/include/onnxruntime_c_api.h" ] && { onnx_prefix="$d"; break; }
+    done
+fi
+if [ -n "$onnx_prefix" ] && [ -f "$onnx_prefix/include/onnxruntime_c_api.h" ]; then
+    ONNX_DEF="-DBSDR_HAVE_ONNX=1 -I$onnx_prefix/include"
+    ONNX_LIBS="-L$onnx_prefix/lib -lonnxruntime -Wl,-rpath,$onnx_prefix/lib"
+    echo "configure: in-process depth + face swap = ONNX Runtime at $onnx_prefix"
+else
+    echo "configure: ONNX Runtime not found -> 2D->3D neural tiers + face swap stub out (pass --with-onnx=DIR to enable)"
+fi
+
+# Final flag strings (used both for the smoke test below and the emitted config.mk).
+CFLAGS_OUT="-std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -Ithird_party/miniz $OSSL_CFLAGS $SCTP_DEF $MEDIA_DEF $MEDIA_CFLAGS $ONNX_DEF $CFLAGS"
+LDFLAGS_OUT="$LDFLAGS_EXTRA $LDFLAGS"
+LDLIBS_OUT="$OSSL_LIBS $PLAT_LIBS $SCTP_LIBS $MEDIA_LIBS $ONNX_LIBS"
+
+# --- smoke test: prove the generated flags actually compile AND link -------
+# pkg-config --exists only checks metadata; it won't catch a bad include path
+# (the miniz bug) or a missing transitive link lib (the -lm/sinf bug). A trial
+# compile+link of a snippet that touches the vendored include (miniz.h) and the
+# math lib (sinf, pulled in by voicefx.c which is always built) verifies both.
+# Skipped for cross builds — the host CC can't run the target linker's libs.
+if [ -z "$host" ] && [ "$static" != yes ]; then
+    smoke=$(mktemp -d)
+    cat > "$smoke/t.c" <<'CEOF'
+#include <math.h>
+#include "miniz.h"        /* proves -Ithird_party/miniz resolves */
+/* sizeof a miniz type proves the header parsed (no link symbol needed — miniz.c
+ * is compiled into the app, not a lib); sinf proves libm is on the link line. */
+int main(void){ volatile float x = sinf(1.0f); (void)sizeof(mz_ulong); return (int)x*0; }
+CEOF
+    if ! err=$($CC $CFLAGS_OUT "$smoke/t.c" $LDFLAGS_OUT $LDLIBS_OUT -o "$smoke/t" 2>&1); then
+        echo "configure: ERROR: dependency smoke test failed to build with the detected flags." >&2
+        echo "$err" | sed 's/^/    /' >&2
+        echo "configure: the generated flags do not produce a working binary; not writing config.mk." >&2
+        rm -rf "$smoke"
+        exit 1
+    fi
+    rm -rf "$smoke"
+    echo "configure: smoke test passed (include paths + libm link OK)"
+fi
+
 # --- emit config.mk --------------------------------------------------------
 cat > config.mk <<EOF
 # Generated by ./configure -- do not edit (re-run configure instead).
@@ -241,9 +361,9 @@ WINLIST_SRC = $WINLIST_SRC
 SCTP_SRC    = $SCTP_SRC
 MEDIA_SRC   = $MEDIA_SRC
 
-CFLAGS  = -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude $OSSL_CFLAGS $SCTP_DEF $MEDIA_DEF $MEDIA_CFLAGS $CFLAGS
-LDFLAGS = $LDFLAGS_EXTRA $LDFLAGS
-LDLIBS  = $OSSL_LIBS $PLAT_LIBS $SCTP_LIBS $MEDIA_LIBS
+CFLAGS  = $CFLAGS_OUT
+LDFLAGS = $LDFLAGS_OUT
+LDLIBS  = $LDLIBS_OUT
 EOF
 
 echo "configure: target=$target  CC=$CC  static=$static  sctp=$enable_sctp  video=$enable_video  audio=$enable_audio"

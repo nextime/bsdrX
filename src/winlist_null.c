@@ -23,3 +23,8 @@ int bsdr_list_windows(const char *display, bsdr_window *out, int max) {
     (void)display; (void)out; (void)max;
     return 0;
 }
+
+int bsdr_list_monitors(const char *display, bsdr_window *out, int max) {
+    (void)display; (void)out; (void)max;
+    return 0;
+}

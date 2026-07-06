@@ -56,7 +56,10 @@ struct bsdr_faceswap {
 
 /* ---- ORT status helpers ---- */
 static int ob(const OrtApi *o, OrtStatus *s, const char *w) {
-    if (!s) return 0; BSDR_WARN("bsdr.faceswap", "%s: %s", w, o->GetErrorMessage(s)); o->ReleaseStatus(s); return 1;
+    if (!s) return 0;
+    BSDR_WARN("bsdr.faceswap", "%s: %s", w, o->GetErrorMessage(s));
+    o->ReleaseStatus(s);
+    return 1;
 }
 static void od(const OrtApi *o, OrtStatus *s) { if (s) o->ReleaseStatus(s); }
 
@@ -102,7 +105,8 @@ static void umeyama(const float src[5][2], const float dst[5][2], float M[6]) {
         cov[0]+=dx*sx; cov[1]+=dx*sy; cov[2]+=dy*sx; cov[3]+=dy*sy;
         var+=sx*sx+sy*sy;
     }
-    for (int i=0;i<4;i++) cov[i]/=5; var/=5;
+    for (int i=0;i<4;i++) cov[i]/=5;
+    var/=5;
     float U[4],S[2],V[4]; svd2(cov,U,S,V);
     float det = cov[0]*cov[3]-cov[1]*cov[2];
     float d1=1.f, d2 = det<0?-1.f:1.f;
@@ -190,9 +194,9 @@ static int detect(bsdr_faceswap *fs, const uint8_t *rgb, int w, int h, face_t *f
         for (int si=0; si<3 && nf<maxf; si++) {
             int stride=strides[si], gw=DET_SIZE/stride, gh=DET_SIZE/stride, na=2;
             float *score,*bbox,*kps;
-            o->GetTensorMutableData(outs[si],(void**)&score);
-            o->GetTensorMutableData(outs[3+si],(void**)&bbox);
-            o->GetTensorMutableData(outs[6+si],(void**)&kps);
+            od(o,o->GetTensorMutableData(outs[si],(void**)&score));
+            od(o,o->GetTensorMutableData(outs[3+si],(void**)&bbox));
+            od(o,o->GetTensorMutableData(outs[6+si],(void**)&kps));
             int idx=0;
             for (int gy=0;gy<gh;gy++) for (int gx=0;gx<gw;gx++) for (int a=0;a<na;a++,idx++){
                 if (score[idx] < DET_THRESH) continue;
@@ -208,8 +212,8 @@ static int detect(bsdr_faceswap *fs, const uint8_t *rgb, int w, int h, face_t *f
         }
     }
     if (getenv("BSDR_FS_DEBUG")) {
-        for (int i=0;i<9;i++){ if(!outs[i])continue; float *dp; o->GetTensorMutableData(outs[i],(void**)&dp);
-            OrtTensorTypeAndShapeInfo *ti=NULL; o->GetTensorTypeAndShape(outs[i],&ti); size_t cnt=0; o->GetTensorShapeElementCount(ti,&cnt); o->ReleaseTensorTypeAndShapeInfo(ti);
+        for (int i=0;i<9;i++){ if(!outs[i])continue; float *dp; od(o,o->GetTensorMutableData(outs[i],(void**)&dp));
+            OrtTensorTypeAndShapeInfo *ti=NULL; od(o,o->GetTensorTypeAndShape(outs[i],&ti)); size_t cnt=0; od(o,o->GetTensorShapeElementCount(ti,&cnt)); o->ReleaseTensorTypeAndShapeInfo(ti);
             float mx=-1e9; for(size_t z=0;z<cnt;z++) if(dp[z]>mx)mx=dp[z];
             BSDR_INFO("bsdr.faceswap","  out[%d] '%s' count=%zu max=%.3f",i,fs->det_out[i],cnt,mx); }
         float mx=0; for (int i=0;i<nf;i++) if (faces[i].score>mx) mx=faces[i].score;
@@ -247,12 +251,14 @@ static int embed(bsdr_faceswap *fs, const uint8_t *aligned112, float out512[512]
     int rc=-1;
     const char *innames[1]={fs->rec_in}, *outnames[1]={fs->rec_out};
     if (in && !ob(o,o->Run(fs->rec,NULL,innames,(const OrtValue*const*)&in,1,outnames,1,&ov),"rec Run")) {
-        float *emb; o->GetTensorMutableData(ov,(void**)&emb);
+        float *emb; od(o,o->GetTensorMutableData(ov,(void**)&emb));
         float n=0; for(int i=0;i<512;i++) n+=emb[i]*emb[i]; n=sqrtf(n)+1e-9f;
         for(int i=0;i<512;i++) out512[i]=emb[i]/n;
         rc=0;
     }
-    if (ov) o->ReleaseValue(ov); if (in) o->ReleaseValue(in); free(blob);
+    if (ov) o->ReleaseValue(ov);
+    if (in) o->ReleaseValue(in);
+    free(blob);
     return rc;
 }
 
@@ -362,14 +368,14 @@ bsdr_faceswap *bsdr_faceswap_open(const char *model_dir, int use_gpu) {
     if (!fs->det||!fs->rec||!fs->swp){ BSDR_WARN("bsdr.faceswap","missing model(s) in %s (need det_10g/w600k_r50/inswapper_128)",model_dir); goto fail; }
     if (ob(o,o->CreateCpuMemoryInfo(OrtArenaAllocator,OrtMemTypeDefault,&fs->mem),"mem")) goto fail;
     if (ob(o,o->GetAllocatorWithDefaultOptions(&al),"alloc")) goto fail;
-    o->SessionGetInputName(fs->det,0,al,&fs->det_in);
-    for (int i=0;i<9;i++) o->SessionGetOutputName(fs->det,i,al,&fs->det_out[i]);
-    o->SessionGetInputName(fs->rec,0,al,&fs->rec_in);
-    o->SessionGetOutputName(fs->rec,0,al,&fs->rec_out);
+    od(o,o->SessionGetInputName(fs->det,0,al,&fs->det_in));
+    for (int i=0;i<9;i++) od(o,o->SessionGetOutputName(fs->det,i,al,&fs->det_out[i]));
+    od(o,o->SessionGetInputName(fs->rec,0,al,&fs->rec_in));
+    od(o,o->SessionGetOutputName(fs->rec,0,al,&fs->rec_out));
     /* inswapper inputs: index 0 = "target" (image), 1 = "source" (latent) — resolve by name */
-    { char *a=NULL,*b=NULL; o->SessionGetInputName(fs->swp,0,al,&a); o->SessionGetInputName(fs->swp,1,al,&b);
+    { char *a=NULL,*b=NULL; od(o,o->SessionGetInputName(fs->swp,0,al,&a)); od(o,o->SessionGetInputName(fs->swp,1,al,&b));
       if (a && strcmp(a,"source")==0){ fs->swp_in_s=a; fs->swp_in_t=b; } else { fs->swp_in_t=a; fs->swp_in_s=b; } }
-    o->SessionGetOutputName(fs->swp,0,al,&fs->swp_out);
+    od(o,o->SessionGetOutputName(fs->swp,0,al,&fs->swp_out));
     { char emp[1024]; snprintf(emp,sizeof emp,"%s/inswapper_128.onnx",model_dir);
       fs->have_emap = (load_emap(emp,fs->emap)==0);
       if (!fs->have_emap) BSDR_WARN("bsdr.faceswap","could not extract emap from inswapper — swaps disabled"); }
@@ -419,10 +425,13 @@ int bsdr_faceswap_process_rgb(bsdr_faceswap *fs, uint8_t *rgb, int w, int h) {
         const char *innames[2]={fs->swp_in_t,fs->swp_in_s}; const OrtValue *invals[2]={tv,sv};
         const char *outnames[1]={fs->swp_out};
         if (tv&&sv&&!ob(o,o->Run(fs->swp,NULL,innames,invals,2,outnames,1,&ov),"swap Run")){
-            float *fake; o->GetTensorMutableData(ov,(void**)&fake);
+            float *fake; od(o,o->GetTensorMutableData(ov,(void**)&fake));
             paste_back(rgb,w,h,fake,M); swapped++;
         }
-        if (ov) o->ReleaseValue(ov); if(tv)o->ReleaseValue(tv); if(sv)o->ReleaseValue(sv); free(blob);
+        if (ov) o->ReleaseValue(ov);
+        if (tv) o->ReleaseValue(tv);
+        if (sv) o->ReleaseValue(sv);
+        free(blob);
     }
     return swapped;
 }

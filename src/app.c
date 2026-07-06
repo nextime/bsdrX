@@ -121,6 +121,7 @@ void bsdr_app_init(bsdr_app *a) {
     a->file_volume = 100;   /* media bar default */
     a->threed_deepness = 35; a->threed_convergence = 0;   /* comfortable defaults when 3D is enabled */
     a->threed_full = 0;      /* default: light half-SBS (full-res is ~4x the load; opt-in) */
+    a->voice_fx_on = true;   /* voice changer master enable (sliders still default to 0 = no effect) */
     snprintf(a->cloud_msg, sizeof(a->cloud_msg), "not logged in");
     a->cloud_auto_share = true;   /* follow the Quest's RDC screen (auto start/stop sharing) */
     /* Cloud VIDEO is ON: the relay video is plain H.264 (NOT encrypted, as first thought) but uses
@@ -130,14 +131,32 @@ void bsdr_app_init(bsdr_app *a) {
      * Confirmed working on a live Quest; ON by default like video — disable with --no-cloud-audio. */
     a->cloud_no_video = false;
     a->video_decoupled = false;    /* default: couple cloud to the single LAN encoder */
-    a->cpu_only = false;           /* default: try the CUDA GPU capture pipeline */
+#if defined(__linux__) && !defined(BSDR_PLATFORM_ANDROID)
+    a->cpu_only = true;            /* Linux (desktop) default: CPU-scale + libx264 encode — sharper
+                                    * low-bitrate text than NVENC (which lacks psy-RD). --gpu / the web
+                                    * toggle opts into the CUDA/NVENC pipeline for offload / high bitrate. */
+#else
+    a->cpu_only = false;           /* Windows/macOS/Android: hardware encoder by default */
+#endif
     a->use_vaapi = false;          /* default off: opt-in VAAPI iGPU encode */
     a->use_kmsgrab = false;        /* default off: opt-in DRM/KMS capture */
     a->cloud_no_audio = false;
     a->audio = true;
-    a->bitrate = 8000000;     /* 8 Mbps default */
+    a->bitrate = 8000000;     /* 8 Mbps default (effective) */
+    a->quest_bitrate = 8000000;
+    a->bitrate_override = 0;   /* 0 = follow the headset; web UI can force a value */
     a->res_w = 0;             /* width auto-derived from the desktop aspect ratio */
     a->res_h = 720;           /* 720p default; the headset overrides via PUT /device */
+}
+
+/* Effective encode bitrate = the web override if set, else what the headset asked for, then bounded
+ * by --max-bitrate. Callers hold a->lock. Everything downstream (streamer, cloud, status) reads the
+ * single resolved a->bitrate, so the override is honored everywhere without threading it through. */
+static void recompute_bitrate_locked(bsdr_app *a) {
+    int eff = a->bitrate_override > 0 ? a->bitrate_override : a->quest_bitrate;
+    if (eff <= 0) eff = 8000000;
+    if (a->max_bitrate > 0 && eff > a->max_bitrate) eff = a->max_bitrate;
+    a->bitrate = eff;
 }
 
 void bsdr_app_set_quality(bsdr_app *a, int w, int h, int bitrate) {
@@ -145,12 +164,10 @@ void bsdr_app_set_quality(bsdr_app *a, int w, int h, int bitrate) {
     if (w >= 0) a->res_w = w;
     if (h >= 0) a->res_h = h;
     /* The headset's bitrate is a fixed cycle (1/3/5/8/.../100 Mbps) and it forces 3 Mbps when
-     * internet sharing turns on. --max-bitrate lets the operator cap it below whatever the Quest
-     * sends (e.g. hold 1 Mbps for a constrained uplink). */
-    if (bitrate > 0) {
-        if (a->max_bitrate > 0 && bitrate > a->max_bitrate) bitrate = a->max_bitrate;
-        a->bitrate = bitrate;
-    }
+     * internet sharing turns on. We remember it raw as quest_bitrate; the effective encode bitrate
+     * (recomputed below) is the web override if one is set, else this, then capped by --max-bitrate. */
+    if (bitrate > 0) a->quest_bitrate = bitrate;
+    recompute_bitrate_locked(a);
     bsdr_mutex_unlock(a->lock);
     char wbuf[16];
     if (a->res_w > 0) snprintf(wbuf, sizeof(wbuf), "%d", a->res_w);
@@ -165,6 +182,47 @@ void bsdr_app_get_quality(bsdr_app *a, int *w, int *h, int *bitrate) {
     if (h) *h = a->res_h;
     if (bitrate) *bitrate = a->bitrate;
     bsdr_mutex_unlock(a->lock);
+}
+
+static void settings_save(bsdr_app *a);   /* defined with the config-file helpers below */
+
+void bsdr_app_set_bitrate_override(bsdr_app *a, int bitrate) {
+    bsdr_mutex_lock(a->lock);
+    a->bitrate_override = bitrate > 0 ? bitrate : 0;
+    recompute_bitrate_locked(a);
+    int eff = a->bitrate;
+    bsdr_mutex_unlock(a->lock);
+    if (a->bitrate_override > 0)
+        BSDR_INFO("bsdr.app", "bitrate override: %d bps (headset config ignored)", eff);
+    else
+        BSDR_INFO("bsdr.app", "bitrate override cleared -> following the headset (%d bps)", eff);
+    settings_save(a);   /* remember across restarts */
+}
+
+int bsdr_app_get_bitrate_override(bsdr_app *a) {
+    bsdr_mutex_lock(a->lock);
+    int v = a->bitrate_override;
+    bsdr_mutex_unlock(a->lock);
+    return v;
+}
+
+/* Encoder choice: gpu=true -> CUDA/NVENC pipeline; gpu=false -> CPU-scale + libx264 (sharper text).
+ * Bumps encoder_gen so a running live session reopens the capture IN PLACE — NOT source_gen, which
+ * tore the whole session down (dropping the Quest input channel and stalling video for seconds). */
+void bsdr_app_set_gpu_encode(bsdr_app *a, bool gpu) {
+    bsdr_mutex_lock(a->lock);
+    a->cpu_only = !gpu;
+    a->encoder_gen++;   /* live session reopens the capture (in place) with the new encoder */
+    bsdr_mutex_unlock(a->lock);
+    BSDR_INFO("bsdr.app", "encoder set to %s", gpu ? "GPU (NVENC)" : "CPU (libx264)");
+    settings_save(a);
+}
+
+bool bsdr_app_get_gpu_encode(bsdr_app *a) {
+    bsdr_mutex_lock(a->lock);
+    bool gpu = !a->cpu_only;
+    bsdr_mutex_unlock(a->lock);
+    return gpu;
 }
 void bsdr_app_set_region(bsdr_app *a, int x, int y, int w, int h) {
     bsdr_mutex_lock(a->lock);
@@ -342,6 +400,25 @@ void bsdr_app_set_owner_mic_local(bsdr_app *a, bool on) {
     bsdr_mutex_unlock(a->lock);
 }
 
+/* Copy the current Bigscreen access token (for a room-join REST call). Empty if not logged in. */
+void bsdr_app_get_access_token(bsdr_app *a, char *out, size_t cap) {
+    bsdr_mutex_lock(a->lock);
+    snprintf(out, cap, "%s", a->access_token);
+    bsdr_mutex_unlock(a->lock);
+}
+
+void bsdr_app_set_room_mic(bsdr_app *a, bool on) {
+    bsdr_mutex_lock(a->lock);
+    a->room_mic_want = on;   /* the cloud room-mic thread (cloud_stream.c) polls this to (un)expose the device */
+    bsdr_mutex_unlock(a->lock);
+}
+bool bsdr_app_get_room_mic(bsdr_app *a) {
+    bsdr_mutex_lock(a->lock);
+    bool v = a->room_mic_want;
+    bsdr_mutex_unlock(a->lock);
+    return v;
+}
+
 void bsdr_app_set_relay_port(bsdr_app *a, int port) {
     bsdr_mutex_lock(a->lock);
     a->sniff_remote_port = (port > 0 && port < 65536) ? port : 0;
@@ -356,8 +433,9 @@ int bsdr_app_get_relay_port(bsdr_app *a) {
 
 static int clamp100(int v, int lo) { if (v < lo) return lo; if (v > 100) return 100; return v; }
 
-void bsdr_app_set_voicefx(bsdr_app *a, int gender, int robot, int echo, int whisper, bool substitute) {
+void bsdr_app_set_voicefx(bsdr_app *a, bool on, int gender, int robot, int echo, int whisper, bool substitute) {
     bsdr_mutex_lock(a->lock);
+    a->voice_fx_on = on;
     a->voice_gender = clamp100(gender, -100);
     a->voice_robot = clamp100(robot, 0);
     a->voice_echo = clamp100(echo, 0);
@@ -366,13 +444,16 @@ void bsdr_app_set_voicefx(bsdr_app *a, int gender, int robot, int echo, int whis
     bsdr_mutex_unlock(a->lock);
 }
 
+/* Effective effect values: the master toggle gates every effect (and substitution) at once so the
+ * slider positions survive a disable/enable. When off, all four report 0 (no change). */
 void bsdr_app_get_voicefx(bsdr_app *a, int *gender, int *robot, int *echo, int *whisper, bool *substitute) {
     bsdr_mutex_lock(a->lock);
-    if (gender) *gender = a->voice_gender;
-    if (robot) *robot = a->voice_robot;
-    if (echo) *echo = a->voice_echo;
-    if (whisper) *whisper = a->voice_whisper;
-    if (substitute) *substitute = a->voice_substitute;
+    bool on = a->voice_fx_on;
+    if (gender) *gender = on ? a->voice_gender : 0;
+    if (robot) *robot = on ? a->voice_robot : 0;
+    if (echo) *echo = on ? a->voice_echo : 0;
+    if (whisper) *whisper = on ? a->voice_whisper : 0;
+    if (substitute) *substitute = on && a->voice_substitute;
     bsdr_mutex_unlock(a->lock);
 }
 
@@ -407,19 +488,62 @@ void bsdr_app_set_room_pcm_sink(bsdr_app *a, void (*cb)(void *, const int16_t *,
 /* ---- session persistence (so a restart is already logged in) -------------- */
 /* Path: $XDG_CONFIG_HOME/bsdr_agent/session  (or ~/.config/bsdr_agent/session), mode 0600.
  * Stores only tokens + display info — never the password. */
-static bool session_path(char *out, size_t cap) {
+static bool config_dir(char *dir, size_t cap) {
     const char *xdg = getenv("XDG_CONFIG_HOME");
     const char *home = getenv("HOME");
 #if defined(_WIN32)
     if (!home || !home[0]) home = getenv("APPDATA");   /* Windows: no HOME by default */
 #endif
-    char dir[512];
-    if (xdg && xdg[0]) snprintf(dir, sizeof(dir), "%s/bsdr_agent", xdg);
-    else if (home && home[0]) snprintf(dir, sizeof(dir), "%s/.config/bsdr_agent", home);
+    if (xdg && xdg[0]) snprintf(dir, cap, "%s/bsdr_agent", xdg);
+    else if (home && home[0]) snprintf(dir, cap, "%s/.config/bsdr_agent", home);
     else return false;
     bsdr_mkdir(dir);   /* best-effort; ignore EEXIST */
+    return true;
+}
+static bool session_path(char *out, size_t cap) {
+    char dir[512];
+    if (!config_dir(dir, sizeof(dir))) return false;
     snprintf(out, cap, "%s/session", dir);
     return true;
+}
+/* User preferences that persist across restarts (encoder choice, bitrate override). Distinct from
+ * the cloud `session` file. Simple key=value lines so it's easy to extend. */
+static bool settings_path(char *out, size_t cap) {
+    char dir[512];
+    if (!config_dir(dir, sizeof(dir))) return false;
+    snprintf(out, cap, "%s/settings", dir);
+    return true;
+}
+static void settings_save(bsdr_app *a) {
+    char path[600];
+    if (!settings_path(path, sizeof(path))) return;
+    bsdr_mutex_lock(a->lock);
+    int cpu = a->cpu_only ? 1 : 0, bro = a->bitrate_override;
+    bsdr_mutex_unlock(a->lock);
+    FILE *f = fopen(path, "w");
+    if (!f) { BSDR_WARN("bsdr.app", "could not save settings to %s", path); return; }
+    fprintf(f, "cpu_only=%d\nbitrate_override=%d\n", cpu, bro);
+    fclose(f);
+    BSDR_DEBUG("bsdr.app", "settings saved to %s", path);
+}
+/* Load persisted prefs at startup — call AFTER bsdr_app_init (platform defaults) and BEFORE applying
+ * CLI flags, so an explicit --cpu/--gpu on the command line still wins over the saved value. */
+void bsdr_app_load_settings(bsdr_app *a) {
+    char path[600];
+    if (!settings_path(path, sizeof(path))) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[128]; int v;
+    bsdr_mutex_lock(a->lock);
+    while (fgets(line, sizeof(line), f)) {
+        if      (sscanf(line, "cpu_only=%d", &v) == 1)         a->cpu_only = v ? true : false;
+        else if (sscanf(line, "bitrate_override=%d", &v) == 1) a->bitrate_override = v > 0 ? v : 0;
+    }
+    recompute_bitrate_locked(a);
+    bsdr_mutex_unlock(a->lock);
+    fclose(f);
+    BSDR_INFO("bsdr.app", "loaded settings from %s (encoder=%s, bitrate override=%d)",
+              path, a->cpu_only ? "cpu/x264" : "gpu/nvenc", a->bitrate_override);
 }
 
 /* lines: access_token / refresh_token / email / name (token strings have no newlines). */
@@ -758,14 +882,30 @@ bool bsdr_app_take_disconnect(bsdr_app *a) {
     return req;
 }
 
-void bsdr_app_set_sniff(bsdr_app *a, bool want, bool mitm, const char *password) {
+void bsdr_app_set_sniff(bsdr_app *a, bool want, const char *password) {
     bsdr_mutex_lock(a->lock);
     a->sniff_want = want;
-    a->sniff_mitm = mitm;
-    a->sniff_dirty = true;
+    a->sniff_dirty = true;   /* capture method comes from sniff_method (set separately) */
     if (password) snprintf(a->sniff_password, sizeof a->sniff_password, "%s", password);
     else a->sniff_password[0] = 0;
     bsdr_mutex_unlock(a->lock);
+}
+/* Capture method: 0 = passive sniff, 1 = MITM (ARP), 2 = router relay. Marks the sniffer dirty so a
+ * running sniffer reconfigures on the next reconcile. `sniff_mitm` is the derived flag the reconcile
+ * and the sniffer restart-on-mode-change logic read. */
+void bsdr_app_set_sniff_method(bsdr_app *a, int method) {
+    bsdr_mutex_lock(a->lock);
+    if (method < 0 || method > 2) method = 0;
+    a->sniff_method = method;
+    a->sniff_mitm = (method == 1);
+    a->sniff_dirty = true;
+    bsdr_mutex_unlock(a->lock);
+}
+int bsdr_app_get_sniff_method(bsdr_app *a) {
+    bsdr_mutex_lock(a->lock);
+    int m = a->sniff_method;
+    bsdr_mutex_unlock(a->lock);
+    return m;
 }
 bool bsdr_app_take_sniff(bsdr_app *a, bool *want, bool *mitm, char *pw, size_t pwlen) {
     bsdr_mutex_lock(a->lock);
@@ -808,13 +948,13 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         "\"internetSharing\":%s},"
         "\"quest\":{\"paired\":%s,\"name\":\"%s\",\"ip\":\"%s\",\"streaming\":%s,\"paused\":%s},"
         "\"source\":{\"mode\":\"%s\",\"path\":\"%s\",\"path2\":\"%s\",\"audio\":%s},"
-        "\"blank\":%s,\"cloudMic\":%s,\"ownerMicLocal\":%s,\"tlsInsecure\":%s,"
+        "\"blank\":%s,\"cloudMic\":%s,\"ownerMicLocal\":%s,\"roomMic\":%s,\"tlsInsecure\":%s,"
         "\"threed\":{\"mode\":%d,\"deepness\":%d,\"convergence\":%d,\"swap\":%s,\"full\":%s,\"tier\":%d,\"ai\":\"%s\"},"
-        "\"quality\":{\"w\":%d,\"h\":%d,\"bitrate\":%d},"
+        "\"quality\":{\"w\":%d,\"h\":%d,\"bitrate\":%d,\"brOverride\":%d,\"gpuEncode\":%s},"
         "\"voice\":{\"stt\":\"%s\",\"sttModel\":\"%s\",\"sttToken\":%s,"
         "\"llm\":\"%s\",\"llmModel\":\"%s\",\"llmToken\":%s},"
-        "\"sniff\":{\"want\":%s,\"mitm\":%s,\"active\":%s,\"msg\":\"%s\","
-        "\"gender\":%d,\"robot\":%d,\"echo\":%d,\"whisper\":%d,\"substitute\":%s,\"relayPort\":%d},"
+        "\"sniff\":{\"want\":%s,\"mitm\":%s,\"method\":%d,\"active\":%s,\"msg\":\"%s\","
+        "\"fxOn\":%s,\"gender\":%d,\"robot\":%d,\"echo\":%d,\"whisper\":%d,\"substitute\":%s,\"relayPort\":%d},"
         "\"compctl\":{\"want\":%s,\"vision\":%s,\"active\":%s,\"msg\":\"%s\"},"
         "\"android\":%s,\"selected\":\"%s\",\"quests\":[",
         a->cloud_logged_in ? "true" : "false", esc_email, esc_name, esc_msg,
@@ -823,14 +963,16 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         a->streaming ? "true" : "false", a->paused ? "true" : "false",
         a->source, a->source_path, a->source_path2, a->audio ? "true" : "false",
         a->blank_want ? "true" : "false", a->cloud_mic_fallback ? "true" : "false",
-        a->owner_mic_local ? "true" : "false", bsdr_tls_is_insecure() ? "true" : "false",
+        a->owner_mic_local ? "true" : "false", a->room_mic_want ? "true" : "false",
+        bsdr_tls_is_insecure() ? "true" : "false",
         a->threed_mode, a->threed_deepness, a->threed_convergence,
         a->threed_swap ? "true" : "false", a->threed_full ? "true" : "false", a->threed_tier, esc_ai,
-        a->res_w, a->res_h, a->bitrate,
+        a->res_w, a->res_h, a->bitrate, a->bitrate_override, a->cpu_only ? "false" : "true",
         a->stt_endpoint, a->stt_model, a->stt_token[0] ? "true" : "false",
         a->llm_endpoint, a->llm_model, a->llm_token[0] ? "true" : "false",
-        a->sniff_want ? "true" : "false", a->sniff_mitm ? "true" : "false",
+        a->sniff_want ? "true" : "false", a->sniff_mitm ? "true" : "false", a->sniff_method,
         a->sniff_active ? "true" : "false", esc_sniff,
+        a->voice_fx_on ? "true" : "false",
         a->voice_gender, a->voice_robot, a->voice_echo, a->voice_whisper,
         a->voice_substitute ? "true" : "false", a->sniff_remote_port,
         a->compctl_want ? "true" : "false", a->compctl_vision ? "true" : "false",
@@ -871,8 +1013,23 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         bsdr_json_escape(esrc, sizeof esrc, a->faceswap_source);
         bsdr_json_escape(efst, sizeof efst, a->faceswap_status);
         n += snprintf(out + n, cap - n,
-                      ",\"faceswap\":{\"on\":%s,\"tier\":%d,\"source\":\"%s\",\"status\":\"%s\"}",
+                      ",\"faceswap\":{\"on\":%s,\"tier\":%d,\"source\":\"%s\",\"status\":\"%s\"",
                       a->faceswap_on ? "true" : "false", a->faceswap_tier, esrc, efst);
+        /* face-swap model manager: dir, per-file present state, and any in-flight download */
+        char fsdir[900]; bsdr_faceswap_model_dir(fsdir, sizeof fsdir);
+        char efsd[930]; bsdr_json_escape(efsd, sizeof efsd, fsdir);
+        bsdr_model_dl fdl; bsdr_faceswap_download_state(&fdl);
+        char efderr[160]; bsdr_json_escape(efderr, sizeof efderr, fdl.err);
+        n += snprintf(out + n, cap - n, ",\"models\":{\"dir\":\"%s\",\"ready\":%s,\"files\":[",
+                      efsd, bsdr_faceswap_models_ready() ? "true" : "false");
+        for (int i = 0; i < BSDR_FACESWAP_NFILES; i++)
+            n += snprintf(out + n, cap - n, "%s{\"name\":\"%s\",\"present\":%s}", i ? "," : "",
+                          bsdr_faceswap_files[i],
+                          bsdr_faceswap_file_present(bsdr_faceswap_files[i]) ? "true" : "false");
+        n += snprintf(out + n, cap - n,
+                      "],\"dl\":{\"active\":%s,\"pct\":%d,\"done\":%ld,\"total\":%ld,\"ok\":%s,\"name\":\"%s\",\"err\":\"%s\"}}}",
+                      fdl.active ? "true" : "false", fdl.pct, fdl.done, fdl.total,
+                      fdl.ok ? "true" : "false", fdl.name, efderr);
     }
     n += snprintf(out + n, cap - n, "}");
     bsdr_mutex_unlock(a->lock);

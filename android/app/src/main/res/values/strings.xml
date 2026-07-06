@@ -5,6 +5,11 @@
     <string name="cast_stop">Stop casting</string>
     <string name="minimize">Minimize to balloon</string>
     <string name="stream_file">Stream a video file</string>
+    <!-- short labels for the 3 equal-width top buttons (the status line keeps the long text) -->
+    <string name="btn_cast_start">Cast</string>
+    <string name="btn_cast_stop">Stop</string>
+    <string name="btn_file">File</string>
+    <string name="btn_minimize">Balloon</string>
     <string name="grant_overlay">Allow the floating control balloon</string>
     <string name="grant_accessibility">Enable input control (Accessibility)</string>
     <string name="pairing_code">Pairing code: %1$s</string>

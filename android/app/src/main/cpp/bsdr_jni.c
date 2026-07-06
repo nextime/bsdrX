@@ -38,6 +38,7 @@ static JavaVM       *g_vm;
 static jobject       g_bridge;           /* global ref to the NativeBridge singleton */
 static jmethodID     g_mid_pairing;      /* onPairingCode(String) */
 static jmethodID     g_mid_mic;          /* onMicPcm(short[], int, int) */
+static jmethodID     g_mid_room;         /* onRoomPcm(short[], int, int) */
 static jmethodID     g_mid_input;        /* onInputEvent(int, int, int) */
 static jmethodID     g_mid_vstate;       /* onVoiceState(int) */
 static jmethodID     g_mid_vfeedback;    /* onVoiceFeedback(String) */
@@ -89,6 +90,17 @@ void bsdr_android_emit_mic(const int16_t *pcm, int frames, int channels) {
     if (!arr) return;
     (*e)->SetShortArrayRegion(e, arr, 0, n, pcm);
     (*e)->CallVoidMethod(e, g_bridge, g_mid_mic, arr, frames, channels);
+    (*e)->DeleteLocalRef(e, arr);
+}
+
+void bsdr_android_emit_room(const int16_t *pcm, int frames, int channels) {
+    JNIEnv *e = get_env();
+    if (!e || !g_bridge || !g_mid_room) return;
+    jsize n = (jsize)frames * channels;
+    jshortArray arr = (*e)->NewShortArray(e, n);
+    if (!arr) return;
+    (*e)->SetShortArrayRegion(e, arr, 0, n, pcm);
+    (*e)->CallVoidMethod(e, g_bridge, g_mid_room, arr, frames, channels);
     (*e)->DeleteLocalRef(e, arr);
 }
 
@@ -176,6 +188,7 @@ JNIEXPORT void JNICALL NB(nativeStart)(JNIEnv *env, jobject thiz,
         jclass cls = (*env)->GetObjectClass(env, thiz);
         g_mid_pairing   = (*env)->GetMethodID(env, cls, "onPairingCode", "(Ljava/lang/String;)V");
         g_mid_mic       = (*env)->GetMethodID(env, cls, "onMicPcm", "([SII)V");
+        g_mid_room      = (*env)->GetMethodID(env, cls, "onRoomPcm", "([SII)V");
         g_mid_input     = (*env)->GetMethodID(env, cls, "onInputEvent", "(III)V");
         g_mid_vstate    = (*env)->GetMethodID(env, cls, "onVoiceState", "(I)V");
         g_mid_vfeedback = (*env)->GetMethodID(env, cls, "onVoiceFeedback", "(Ljava/lang/String;)V");

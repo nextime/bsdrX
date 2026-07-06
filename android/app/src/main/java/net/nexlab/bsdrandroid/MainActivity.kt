@@ -47,6 +47,9 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var wantUi = false
     /** We only send the user to Accessibility settings once per run (it's optional for streaming). */
     private var accessibilityAsked = false
+    /** Permissions panel collapse state. null = follow default (auto-collapse once all required are
+     *  granted); true/false once the user taps the header to override. */
+    private var permsExpandedOverride: Boolean? = null
 
     private val fileLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -222,15 +225,33 @@ class MainActivity : AppCompatActivity() {
         list += Perm("Display over other apps", "the floating control balloon",
             Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this),
             { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) })
+        // Accessibility is optional — it doesn't count toward "all required granted" for auto-collapse.
+        val optionalGranted = isAccessibilityEnabled()
         list += Perm("Accessibility service", "remote mouse/keyboard from the headset (optional)",
-            isAccessibilityEnabled(),
+            optionalGranted,
             { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) })
 
+        val allRequiredGranted = list.dropLast(1).all { it.granted }   // every row except the optional Accessibility one
+        // Default: expanded while something still needs granting, auto-collapsed once all required are done.
+        // The user can override either way by tapping the header.
+        val expanded = permsExpandedOverride ?: !allRequiredGranted
+
         val hdr = TextView(this).apply {
-            text = "Permissions — tap a red item to enable it:"
+            text = if (expanded)
+                (if (allRequiredGranted) "▾ Permissions — all set (tap to hide)"
+                 else "▾ Permissions — tap a red item to enable it:")
+            else
+                "▸ Permissions — all set (tap to show)"
             setPadding(0, 4, 0, 6); textSize = 13f; setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(if (allRequiredGranted) 0xFF2E7D32.toInt() else 0xFF000000.toInt())
+            setOnClickListener {
+                permsExpandedOverride = !expanded
+                renderPermissions()
+            }
         }
         box.addView(hdr)
+        if (!expanded) return   // collapsed: header only, the rest is hidden until tapped
+
         for (p in list) {
             val row = TextView(this).apply {
                 text = "${if (p.granted) "✓" else "✗"}  ${p.name} — ${p.why}"
@@ -260,7 +281,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun onCasting() {
         status.text = getString(R.string.cast_stop)
-        btnCast.text = getString(R.string.cast_stop)
+        btnCast.text = getString(R.string.btn_cast_stop)
         btnMin.isEnabled = true
         wantUi = true
         loadUi()        // retried by the WebViewClient until the native server binds 8088
@@ -269,7 +290,7 @@ class MainActivity : AppCompatActivity() {
     private fun onStopped() {
         wantUi = false
         status.text = getString(R.string.cast_start)
-        btnCast.text = getString(R.string.cast_start)
+        btnCast.text = getString(R.string.btn_cast_start)
         btnMin.isEnabled = false
         web.loadData(
             "<html><body style='font-family:sans-serif;padding:24px'>" +

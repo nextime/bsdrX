@@ -40,9 +40,19 @@ make clean >/dev/null 2>&1 || true
 # ---- 1. build bsdrX (full media) against the private minimal-ffmpeg prefix ----
 # Explicit vars (not ./configure autodetect) so we pin OUR deps and set an rpath
 # that finds the bundled libs at $ORIGIN/../lib.
-BASE_CFLAGS="-std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude"
-MEDIA_SRC="src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/fileaudio.c src/audio.c src/micsniff.c src/micsniff_capture.c"
+BASE_CFLAGS="-std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -Ithird_party/miniz"
+MEDIA_SRC="src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/fileaudio.c src/capture_pipewire.c src/audio.c src/micsniff.c src/micsniff_capture.c"
 MEDIA_DEF="-DBSDR_ENABLE_SCTP=1 -DBSDR_ENABLE_VIDEO=1 -DBSDR_HAVE_CAPTURE=1 -DBSDR_ENABLE_AUDIO=1 -DBSDR_HAVE_AUDIO=1 -DBSDR_HAVE_PCAP=1"
+# Wayland desktop capture (xdg-desktop-portal + PipeWire). System libs in the build image; linuxdeploy
+# bundles them like the others. Absent -> capture_pipewire.c compiles as a stub (x11grab/kmsgrab only).
+if pkg-config --exists libpipewire-0.3 dbus-1 2>/dev/null; then
+  MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_PIPEWIRE=1"
+  PW_CFLAGS="$(pkg-config --cflags libpipewire-0.3 dbus-1)"
+  PW_LIBS="$(pkg-config --libs libpipewire-0.3 dbus-1)"
+else
+  PW_CFLAGS=""; PW_LIBS=""
+  echo ">> WARN: libpipewire-0.3/dbus-1 not in the build image — Wayland capture will be stubbed"
+fi
 
 # Guard: the list above is a hand-pinned copy of the Makefile's canonical media
 # list (MEDIA_SRC_ALL). If a new media unit is added there but not here, the
@@ -59,7 +69,7 @@ if [ "$want" != "$have" ]; then
   diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") >&2 || true
   exit 1
 fi
-MEDIA_LIBS="-lusrsctp -lsrtp2 -lavdevice -lavfilter -lavformat -lavcodec -lavutil -lswscale -lswresample -lopus -lpulse-simple -lpulse -lpcap -lX11 -lssl -lcrypto -lpthread"
+MEDIA_LIBS="-lusrsctp -lsrtp2 -lavdevice -lavfilter -lavformat -lavcodec -lavutil -lswscale -lswresample -lopus -lpulse-simple -lpulse -lpcap -lX11 $PW_LIBS -lssl -lcrypto -lpthread -lm"
 # in-process depth via ONNX Runtime (shipped in the bundle's lib dir; $ORIGIN/../lib rpath finds it)
 if [ -f "$BSDRX_DEPS/include/onnxruntime_c_api.h" ]; then
   MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_ONNX=1"; MEDIA_LIBS="$MEDIA_LIBS -lonnxruntime"
@@ -68,7 +78,7 @@ fi
 make all BUILD=build-bundle EXEEXT= BUILD_TESTS=no \
   INJECT_SRC=src/inject_linux.c WINLIST_SRC=src/winlist.c \
   MEDIA_SRC="$MEDIA_SRC" SCTP_SRC=src/sctp.c \
-  CFLAGS="$BASE_CFLAGS $MEDIA_DEF -I$BSDRX_DEPS/include" \
+  CFLAGS="$BASE_CFLAGS $MEDIA_DEF $PW_CFLAGS -I$BSDRX_DEPS/include" \
   LDFLAGS="-L$BSDRX_DEPS/lib -Wl,-rpath,\$\$ORIGIN/../lib -Wl,--disable-new-dtags" \
   LDLIBS="$MEDIA_LIBS"
 
@@ -84,24 +94,62 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" \
 cp "$BIN" "$APPDIR/usr/bin/bsdr_agent"
 cp assets/bsdrx-256.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/bsdrX.png"
 
-cat > "$APPDIR/usr/share/applications/bsdrX.desktop" <<EOF
+# Reverse-DNS basenames throughout (desktop id, metainfo filename, AppStream <id> and
+# the launchable that ties them together). This is the modern freedesktop/AppStream
+# convention and it's what keeps appimagetool's bundled appstreamcli happy: a bare
+# "bsdrX" id trips cid-desktopapp-is-not-rdns, while a reverse-DNS id in a "bsdrX"-named
+# file trips metainfo-filename-cid-mismatch — only when all three agree do both clear.
+APPID="net.nexlab.bsdrX"
+cat > "$APPDIR/usr/share/applications/$APPID.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=bsdrX
 Comment=Bigscreen Remote Desktop agent (cast this desktop into a VR headset)
 Exec=bsdr_agent
 Icon=bsdrX
-Categories=Network;RemoteAccess;AudioVideo;
+Categories=Network;RemoteAccess;
 Terminal=true
+EOF
+
+# AppStream metainfo — appimagetool looks for usr/share/metainfo/<desktop-id>.appdata.xml
+# and warns if it's absent or fails validation. RELDATE stays build-stable via VERSION.
+RELDATE="$(date -u +%Y-%m-%d 2>/dev/null || echo 2024-01-01)"
+mkdir -p "$APPDIR/usr/share/metainfo"
+cat > "$APPDIR/usr/share/metainfo/$APPID.appdata.xml" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>net.nexlab.bsdrX</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>bsdrX</name>
+  <summary>Cast a Linux desktop into a Bigscreen VR headset</summary>
+  <description>
+    <p>
+      bsdrX is a Bigscreen Remote Desktop agent for Linux. It casts a desktop into a
+      Bigscreen VR headset over the LAN with H.264 video and two-way Opus audio, injects
+      headset input via uinput, and provides an in-VR control bar and a voice assistant.
+    </p>
+  </description>
+  <launchable type="desktop-id">net.nexlab.bsdrX.desktop</launchable>
+  <url type="homepage">https://git.nexlab.net/nextime/bsdrX</url>
+  <developer_name>Stefy Lanza (nexlab)</developer_name>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="${VERSION#v}" date="${RELDATE}"/>
+  </releases>
+</component>
 EOF
 
 # linuxdeploy follows ldd (honoring LD_LIBRARY_PATH) and copies non-system libs,
 # skipping glibc / GPU-driver libs via its built-in exclude list. FUSE-less mode.
 export APPIMAGE_EXTRACT_AND_RUN=1
+export LINUXDEPLOY_OUTPUT_VERSION="$VERSION"   # non-deprecated replacement for $VERSION
 LD=/opt/tools/linuxdeploy-x86_64.AppImage
-"$LD" --appdir "$APPDIR" \
+# Run with VERSION unset so the appimage plugin uses LINUXDEPLOY_OUTPUT_VERSION and
+# doesn't print the "$VERSION is deprecated" warning.
+env -u VERSION "$LD" --appdir "$APPDIR" \
   --executable "$APPDIR/usr/bin/bsdr_agent" \
-  --desktop-file "$APPDIR/usr/share/applications/bsdrX.desktop" \
+  --desktop-file "$APPDIR/usr/share/applications/$APPID.desktop" \
   --icon-file "$APPDIR/usr/share/icons/hicolor/256x256/apps/bsdrX.png" \
   --output appimage
 mv -f bsdrX*.AppImage "$OUT/bsdrX-${ARCH}.AppImage" 2>/dev/null || \
@@ -124,6 +172,9 @@ ln -sf /opt/bsdrX/bin/bsdr_agent "$PKG/usr/bin/bsdr_agent"
 
 cp assets/../docs/../README.md "$PKG/usr/share/doc/bsdr-agent/README.md" 2>/dev/null || cp README.md "$PKG/usr/share/doc/bsdr-agent/"
 cp LICENSE.md "$PKG/usr/share/doc/bsdr-agent/"
+# ship the AppStream metainfo in the .deb too (same file the AppImage embeds)
+mkdir -p "$PKG/usr/share/metainfo"
+cp "$APPDIR/usr/share/metainfo/$APPID.appdata.xml" "$PKG/usr/share/metainfo/$APPID.appdata.xml"
 cat > "$PKG/lib/udev/rules.d/99-uinput.rules" <<'EOF'
 KERNEL=="uinput", GROUP="uinput", MODE="0660"
 EOF

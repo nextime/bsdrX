@@ -94,7 +94,7 @@
 #define OWNER_SINK   "bsdr_ownersink"      /* PulseAudio null-sink we create */
 #endif
 #define OWNER_SOURCE "bsdr_quest_owner_mic"
-#define OWNER_DESC   "BSDR-Quest-OwnerMic"
+#define OWNER_DESC   "BSDR_QuestMic"   /* the single Quest mic device apps see (was -OwnerMic) */
 
 struct bsdr_micsniff {
     char        quest_ip[64];

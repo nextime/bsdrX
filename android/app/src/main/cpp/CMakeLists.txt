@@ -49,6 +49,12 @@ set(CORE_SRC
 
 add_library(bsdr_agent SHARED ${CORE_SRC})
 
+# Vendored miniz: define _LARGEFILE64_SOURCE so it takes the fopen64/ftello64
+# large-file I/O path (miniz.h documents this) instead of the fallback branch
+# that emits a "may not support large files" #pragma message. Scoped to miniz.c.
+set_source_files_properties(${REPO}/third_party/miniz/miniz.c PROPERTIES
+  COMPILE_DEFINITIONS "_LARGEFILE64_SOURCE=1")
+
 target_include_directories(bsdr_agent PRIVATE
   ${REPO}/include ${CORE} ${DEPS}/include ${REPO}/third_party/miniz)
 

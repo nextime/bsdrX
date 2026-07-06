@@ -223,3 +223,134 @@ void bsdr_model_download_state(bsdr_model_dl *out) {
     *out = g_dl;
     bsdr_mutex_unlock(g_dl_lock);
 }
+
+/* ---- face-swap models (buffalo_l det/rec + inswapper) ---------------------------------------- */
+const char *const bsdr_faceswap_files[BSDR_FACESWAP_NFILES] = {
+    "det_10g.onnx", "w600k_r50.onnx", "inswapper_128.onnx"
+};
+/* det_10g + w600k_r50 ship inside the official insightface buffalo_l release zip; inswapper is a
+ * standalone file on a HuggingFace mirror. Both non-commercial — mechanism only, no sha pin. */
+#define FS_BUFFALO_URL   "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
+#define FS_INSWAPPER_URL "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx"
+
+int bsdr_faceswap_model_dir(char *out, size_t cap) {
+    char base[768]; bsdr_model_dir(base, sizeof base);
+    snprintf(out, cap, "%s%cfaceswap", base, PATHSEP);
+    MKDIR(out);
+    return 0;
+}
+int bsdr_faceswap_file_present(const char *filename) {
+    char dir[900], path[1200]; bsdr_faceswap_model_dir(dir, sizeof dir);
+    snprintf(path, sizeof path, "%s%c%s", dir, PATHSEP, filename);
+    return file_exists(path);
+}
+int bsdr_faceswap_models_ready(void) {
+    for (int i = 0; i < BSDR_FACESWAP_NFILES; i++)
+        if (!bsdr_faceswap_file_present(bsdr_faceswap_files[i])) return 0;
+    return 1;
+}
+
+static bsdr_mutex   *g_fs_lock;
+static bsdr_model_dl g_fs_dl;
+static void fs_lock_init(void) { if (!g_fs_lock) g_fs_lock = bsdr_mutex_new(); }
+static void fs_progress(size_t done, size_t total) {
+    if (!g_fs_lock) return;
+    bsdr_mutex_lock(g_fs_lock);
+    g_fs_dl.done = (long)done; g_fs_dl.total = (long)total;
+    g_fs_dl.pct = total ? (int)((done * 100) / total) : -1;
+    bsdr_mutex_unlock(g_fs_lock);
+}
+static void fs_set_name(const char *nm) {
+    bsdr_mutex_lock(g_fs_lock); snprintf(g_fs_dl.name, sizeof g_fs_dl.name, "%s", nm); bsdr_mutex_unlock(g_fs_lock);
+}
+/* Extract det_10g.onnx + w600k_r50.onnx out of a buffalo_l zip into the face-swap dir. */
+static int fs_extract_buffalo(const char *zip_path, const char *dir) {
+    mz_zip_archive z; memset(&z, 0, sizeof z);
+    if (!mz_zip_reader_init_file(&z, zip_path, 0)) return -1;
+    int got = 0;
+    for (int i = 0; i < 2; i++) {   /* det_10g + w600k_r50 (buffalo_l stores them at the zip root) */
+        const char *want = bsdr_faceswap_files[i];
+        int idx = mz_zip_reader_locate_file(&z, want, NULL, 0);
+        if (idx < 0) { char alt[64]; snprintf(alt, sizeof alt, "buffalo_l/%s", want);
+                       idx = mz_zip_reader_locate_file(&z, alt, NULL, 0); }
+        if (idx < 0) continue;
+        char dest[1200]; snprintf(dest, sizeof dest, "%s%c%s", dir, PATHSEP, want);
+        if (mz_zip_reader_extract_to_file(&z, idx, dest, 0)) got++;
+    }
+    mz_zip_reader_end(&z);
+    return got == 2 ? 0 : -1;
+}
+static void fs_worker(void *arg) {
+    (void)arg;
+    char dir[900]; bsdr_faceswap_model_dir(dir, sizeof dir);
+    int ok = 1; char err[96] = "";
+    /* 1) buffalo_l (det_10g + w600k_r50) if either is missing */
+    if (!bsdr_faceswap_file_present("det_10g.onnx") || !bsdr_faceswap_file_present("w600k_r50.onnx")) {
+        fs_set_name("buffalo_l (det + rec)");
+        char zip[1200]; snprintf(zip, sizeof zip, "%s%cbuffalo_l.zip.part", dir, PATHSEP);
+        if (bsdr_http_download(FS_BUFFALO_URL, zip, fs_progress) != 0) { ok = 0; snprintf(err, sizeof err, "buffalo_l download failed"); }
+        else if (fs_extract_buffalo(zip, dir) != 0) { ok = 0; snprintf(err, sizeof err, "buffalo_l extract failed"); }
+        remove(zip);
+    }
+    /* 2) inswapper_128.onnx if missing */
+    if (ok && !bsdr_faceswap_file_present("inswapper_128.onnx")) {
+        fs_set_name("inswapper_128");
+        char dest[1200], tmp[1264];
+        snprintf(dest, sizeof dest, "%s%cinswapper_128.onnx", dir, PATHSEP);
+        snprintf(tmp,  sizeof tmp,  "%s.part", dest);
+        if (bsdr_http_download(FS_INSWAPPER_URL, tmp, fs_progress) == 0 && file_exists(tmp)) {
+            remove(dest); if (rename(tmp, dest) != 0) { ok = 0; snprintf(err, sizeof err, "inswapper save failed"); }
+        } else { ok = 0; remove(tmp); snprintf(err, sizeof err, "inswapper download failed"); }
+    }
+    bsdr_mutex_lock(g_fs_lock);
+    g_fs_dl.active = 0; g_fs_dl.ok = ok;
+    if (ok) { g_fs_dl.pct = 100; g_fs_dl.err[0] = 0; } else snprintf(g_fs_dl.err, sizeof g_fs_dl.err, "%s", err);
+    bsdr_mutex_unlock(g_fs_lock);
+    if (ok) BSDR_INFO("bsdr.model", "face-swap models ready");
+    else    BSDR_WARN("bsdr.model", "face-swap model download failed (%s)", err);
+}
+int bsdr_faceswap_download_start(void) {
+    fs_lock_init();
+    if (!g_fs_lock) return -1;
+    bsdr_mutex_lock(g_fs_lock);
+    if (g_fs_dl.active)          { bsdr_mutex_unlock(g_fs_lock); return 0; }
+    if (bsdr_faceswap_models_ready()) { bsdr_mutex_unlock(g_fs_lock); return 0; }
+    memset(&g_fs_dl, 0, sizeof g_fs_dl);
+    g_fs_dl.active = 1; g_fs_dl.pct = -1;
+    bsdr_mutex_unlock(g_fs_lock);
+    if (!bsdr_thread_start_detached(fs_worker, NULL)) {
+        bsdr_mutex_lock(g_fs_lock); g_fs_dl.active = 0;
+        snprintf(g_fs_dl.err, sizeof g_fs_dl.err, "cannot start download thread"); bsdr_mutex_unlock(g_fs_lock);
+        return -1;
+    }
+    return 0;
+}
+void bsdr_faceswap_download_state(bsdr_model_dl *out) {
+    if (!out) return;
+    fs_lock_init();
+    if (!g_fs_lock) { memset(out, 0, sizeof *out); return; }
+    bsdr_mutex_lock(g_fs_lock);
+    *out = g_fs_dl;
+    bsdr_mutex_unlock(g_fs_lock);
+}
+int bsdr_faceswap_import_zip(const char *zip_path) {
+    mz_zip_archive z; memset(&z, 0, sizeof z);
+    if (!mz_zip_reader_init_file(&z, zip_path, 0)) {
+        BSDR_ERROR("bsdr.model", "cannot open faceswap zip %s", zip_path); return -1;
+    }
+    char dir[900]; bsdr_faceswap_model_dir(dir, sizeof dir);
+    int imported = 0;
+    for (int i = 0; i < BSDR_FACESWAP_NFILES; i++) {
+        const char *want = bsdr_faceswap_files[i];
+        int idx = mz_zip_reader_locate_file(&z, want, NULL, 0);
+        if (idx < 0) { char alt[64]; snprintf(alt, sizeof alt, "buffalo_l/%s", want);
+                       idx = mz_zip_reader_locate_file(&z, alt, NULL, 0); }
+        if (idx < 0) continue;
+        char dest[1200]; snprintf(dest, sizeof dest, "%s%c%s", dir, PATHSEP, want);
+        if (mz_zip_reader_extract_to_file(&z, idx, dest, 0)) { imported++;
+            BSDR_INFO("bsdr.model", "imported %s -> %s", want, dest); }
+    }
+    mz_zip_reader_end(&z);
+    if (!imported) BSDR_WARN("bsdr.model", "no faceswap models found in %s", zip_path);
+    return imported ? imported : -1;
+}

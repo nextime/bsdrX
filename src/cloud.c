@@ -310,15 +310,65 @@ bool bsdr_cloud_get_rooms(const char *access_token, bsdr_cloud_screen *out) {
         out->video_port = (int)v;
         if (bsdr_json_get_double(body, "audioPort", &v)) out->audio_port = (int)v;
         if (bsdr_json_get_double(body, "dataPort",  &v)) out->data_port  = (int)v;
+        if (bsdr_json_get_double(body, "micPort",   &v)) out->mic_port   = (int)v;   /* room voice (mono) */
+        bsdr_json_get_str(body, "roomId", out->room_id, sizeof(out->room_id));       /* for the room-join mic peer */
         bsdr_json_get_str(body, "userSessionId", out->session_id, sizeof(out->session_id));
         out->found = true;
-        BSDR_INFO("bsdr.cloud", "rooms: relay %s video=%d audio=%d data=%d session=%s",
-                  out->media_ip, out->video_port, out->audio_port, out->data_port, out->session_id);
+        BSDR_INFO("bsdr.cloud", "rooms: relay %s video=%d audio=%d mic=%d data=%d session=%s",
+                  out->media_ip, out->video_port, out->audio_port, out->mic_port,
+                  out->data_port, out->session_id);
         return true;
     }
     BSDR_INFO("bsdr.cloud", "rooms: no shareable screen yet (add one on the Quest)");
     BSDR_DEBUG("bsdr.cloud", "GET /rooms body (%d B): %.1500s", (int)strlen(body), body);
     return true;   /* connected OK, just no screen provisioned yet */
+}
+
+bool bsdr_cloud_join_room(const char *access_token, const char *room_id, bsdr_cloud_screen *out) {
+    memset(out, 0, sizeof(*out));
+    if (!room_id || !room_id[0]) return false;
+    /* the roomId carries a "room:" prefix; the REST path + body use the BARE id (a prefixed path 500s,
+     * matching the official client's String.Concat of the bare id). */
+    const char *bare = strncmp(room_id, "room:", 5) == 0 ? room_id + 5 : room_id;
+    char jbody[256];
+    int bl = snprintf(jbody, sizeof jbody,
+                      "{\"roomId\":\"%s\",\"version\":\"0.950.2\"}", bare);
+    char req[4096];
+    snprintf(req, sizeof(req),
+        "POST /room/%s/join HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Authorization: Bearer %s\r\n"
+        "x-access-token: %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Accept: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n\r\n%s",
+        bare, BSDR_CLOUD_API2_HOST, bsdr_cloud_api_key(), access_token, bl, jbody);
+    static char resp[65536];
+    int n = https_request(BSDR_CLOUD_API2_HOST, req, resp, sizeof(resp));
+    if (n < 0) { BSDR_WARN("bsdr.cloud", "POST /room/%s/join: connection failed", bare); return false; }
+    int code = status_code(resp);
+    out->http_status = code;
+    const char *body = strstr(resp, "\r\n\r\n");
+    if (code / 100 != 2 || !body) { BSDR_WARN("bsdr.cloud", "room-join -> HTTP %d", code); return false; }
+    body += 4;
+    BSDR_INFO("bsdr.cloud", "room-join body (%d B): %.4000s", (int)strlen(body), body);
+    /* Same flat-key mediaPeer shape as /rooms, but this peer DOES expose micPort (the room voice). */
+    double v;
+    if (bsdr_json_get_str(body, "ipAddress", out->media_ip, sizeof(out->media_ip)) &&
+        bsdr_json_get_double(body, "micPort", &v)) {
+        out->mic_port = (int)v;
+        if (bsdr_json_get_double(body, "audioPort", &v)) out->audio_port = (int)v;
+        if (bsdr_json_get_double(body, "videoPort", &v)) out->video_port = (int)v;
+        if (bsdr_json_get_double(body, "dataPort",  &v)) out->data_port  = (int)v;
+        bsdr_json_get_str(body, "userSessionId", out->session_id, sizeof(out->session_id));
+        out->found = true;
+        BSDR_INFO("bsdr.cloud", "room-join: mic peer %s mic=%d (audio=%d)",
+                  out->media_ip, out->mic_port, out->audio_port);
+        return true;
+    }
+    BSDR_WARN("bsdr.cloud", "room-join: no micPort in the response");
+    return false;
 }
 
 /* ---- WS presence ---- */

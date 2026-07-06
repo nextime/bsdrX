@@ -55,6 +55,8 @@ typedef struct bsdr_app {
     bool cpu_only;                /* --cpu: force CPU scale/convert (default: try CUDA GPU pipeline) */
     bool use_vaapi;               /* --vaapi: encode on the iGPU via VAAPI */
     bool use_kmsgrab;             /* --kmsgrab: DRM/KMS capture (zero-copy with --vaapi) */
+    bool force_x11;               /* --x11: force x11grab; never the Wayland portal */
+    bool force_pipewire;          /* --wayland/--pipewire: force the portal + PipeWire capture */
     bool cloud_no_audio;          /* relay audio: plain Opus RTP (pt 100, djb2 SSRC, ts+=480, no
                                    * trailer); default ON (false) -> --no-cloud-audio disables */
     /* discovered Quests + selection */
@@ -75,6 +77,8 @@ typedef struct bsdr_app {
     char source_path[512];        /* file path/URL, or (webcam) the primary/left camera device */
     char source_path2[512];       /* webcam3d: the right-eye camera device */
     volatile unsigned source_gen; /* bump when the source changes so the live session reopens capture */
+    volatile unsigned encoder_gen;/* bump on a CPU<->GPU encoder toggle so the session reopens capture
+                                   * IN PLACE (no full restart, which would drop the input channel) */
     /* In-VR media-bar playback controls for file streaming — shared by the LAN video+audio threads,
      * the input thread, and the cloud audio sender. Edge-triggered seek via a generation counter. */
     volatile int file_paused;     /* play/pause */
@@ -105,7 +109,9 @@ typedef struct bsdr_app {
     int cap_x, cap_y, cap_w, cap_h;
     /* video quality (applied on next session / source change) */
     int res_w, res_h;             /* 0 = source resolution */
-    int bitrate;                  /* bps */
+    int bitrate;                  /* bps — the EFFECTIVE encode bitrate (what the streamer reads) */
+    int quest_bitrate;            /* bps — last value the headset asked for (PUT /device) */
+    int bitrate_override;         /* web UI override: 0 = follow the headset, >0 = force this bitrate */
     int max_bitrate;              /* --max-bitrate: hard cap (bps); 0 = no cap (follow the Quest) */
     /* voice assistant config (STT + LLM endpoints) */
     char stt_endpoint[256], stt_token[256], stt_model[64];
@@ -126,14 +132,17 @@ typedef struct bsdr_app {
 
     /* owner-mic sniffer (desired state driven by CLI + web UI; reconciled in the main loop) */
     bool sniff_want;              /* should the owner-mic sniffer be running */
-    bool sniff_mitm;              /* use ARP MITM (vs passive capture) */
+    int  sniff_method;            /* 0 = passive sniff, 1 = MITM (ARP), 2 = router relay */
+    bool sniff_mitm;              /* derived: method == 1 (kept for the reconcile path) */
     bool sniff_dirty;             /* one-shot: desired state changed, main loop should reconcile */
     char sniff_password[128];     /* transient sudo password from the web UI (cleared after use) */
     bool sniff_active;            /* status: sniffer currently running */
     char sniff_msg[128];          /* status/error line for the web UI */
-    int  sniff_remote_port;       /* router-companion relay port (Android's only owner-mic path) */
-    /* realtime voice change on the owner mic: gender -100..100 (0 = off); and, in MITM/relay mode,
-     * substitute = stop the Quest->cloud voice and inject the changed audio in its place. */
+    int  sniff_remote_port;       /* router-companion relay port (used when method == relay) */
+    bool room_mic_want;           /* expose the cloud room's voice mix as a virtual mic "BSDR_RoomMic" */
+    /* realtime voice change on the Quest mic: master on/off, gender -100..100 (0 = off); and, in
+     * MITM/relay mode, substitute = stop the Quest->cloud voice and inject the changed audio. */
+    bool voice_fx_on;             /* master enable for the voice changer (sliders ignored when off) */
     int  voice_gender;
     int  voice_robot;
     int  voice_echo;
@@ -181,8 +190,16 @@ void bsdr_app_set_cloud_mic_fallback(bsdr_app *a, bool on);
 void bsdr_app_set_owner_mic_local(bsdr_app *a, bool on);
 void bsdr_app_set_relay_port(bsdr_app *a, int port);
 int  bsdr_app_get_relay_port(bsdr_app *a);
-/* owner-mic voice change: gender (-100..100), robot/echo/whisper (0..100) + substitute-to-cloud */
-void bsdr_app_set_voicefx(bsdr_app *a, int gender, int robot, int echo, int whisper, bool substitute);
+/* expose the cloud room's voice mix as a virtual mic "BSDR_RoomMic" (needs an active cloud session) */
+void bsdr_app_set_room_mic(bsdr_app *a, bool on);
+bool bsdr_app_get_room_mic(bsdr_app *a);
+/* current Bigscreen access token (for the room-join REST call); empty when not logged in */
+void bsdr_app_get_access_token(bsdr_app *a, char *out, size_t cap);
+/* capture method for the Quest mic: 0 = passive sniff, 1 = MITM (ARP), 2 = router relay */
+void bsdr_app_set_sniff_method(bsdr_app *a, int method);
+int  bsdr_app_get_sniff_method(bsdr_app *a);
+/* Quest-mic voice change: master on, gender (-100..100), robot/echo/whisper (0..100) + substitute */
+void bsdr_app_set_voicefx(bsdr_app *a, bool on, int gender, int robot, int echo, int whisper, bool substitute);
 void bsdr_app_get_voicefx(bsdr_app *a, int *gender, int *robot, int *echo, int *whisper, bool *substitute);
 /* face swap: enable + tier + source-image path (bumps faceswap_gen for a live capture reopen) */
 void bsdr_app_set_faceswap(bsdr_app *a, bool on, int tier, const char *source);
@@ -228,7 +245,7 @@ bool bsdr_app_take_disconnect(bsdr_app *a);
 
 /* owner-mic sniffer: web UI sets the desired state (+ transient sudo password); the main loop
  * consumes the dirty flag and reconciles by starting/stopping the sniffer. */
-void bsdr_app_set_sniff(bsdr_app *a, bool want, bool mitm, const char *password);
+void bsdr_app_set_sniff(bsdr_app *a, bool want, const char *password);
 /* If the desired state changed since the last call, copy it out (and the password, then wipe it
  * from the app) and return true. `pw` must be >= 128 bytes. */
 bool bsdr_app_take_sniff(bsdr_app *a, bool *want, bool *mitm, char *pw, size_t pwlen);
@@ -236,6 +253,16 @@ void bsdr_app_set_sniff_status(bsdr_app *a, bool active, const char *msg);
 void bsdr_app_get_source(bsdr_app *a, char *mode, size_t ml, char *path, size_t pl);
 void bsdr_app_set_quality(bsdr_app *a, int w, int h, int bitrate);
 void bsdr_app_get_quality(bsdr_app *a, int *w, int *h, int *bitrate);
+/* Web-UI bitrate override: bps to force, or 0 to follow whatever the headset asks for. Recomputes
+ * the effective bitrate immediately; the live streamer reopens the encoder on the next tick. */
+void bsdr_app_set_bitrate_override(bsdr_app *a, int bitrate);
+int  bsdr_app_get_bitrate_override(bsdr_app *a);
+/* Encoder choice (gpu=true -> NVENC/CUDA; false -> libx264). Live-switchable; persisted. */
+void bsdr_app_set_gpu_encode(bsdr_app *a, bool gpu);
+bool bsdr_app_get_gpu_encode(bsdr_app *a);
+/* Load persisted user prefs (encoder, bitrate override) at startup — call after bsdr_app_init and
+ * before applying CLI flags so an explicit flag still wins. */
+void bsdr_app_load_settings(bsdr_app *a);
 void bsdr_app_set_region(bsdr_app *a, int x, int y, int w, int h);
 void bsdr_app_get_region(bsdr_app *a, int *x, int *y, int *w, int *h);
 /* voice config: each field may be "" to leave unchanged on set. get copies all. */

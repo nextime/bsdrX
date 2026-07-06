@@ -49,6 +49,10 @@ typedef struct {
     bool found;
     char media_ip[64];                 /* mediaServer.ipAddress */
     int  video_port, audio_port, data_port;   /* mediaPeer.{video,audio,data}Port */
+    int  mic_port;                     /* mediaPeer.micPort — the room's MONO voice mix (others) */
+    char mic_media_ip[64];             /* media server for the mic peer (from the room-join); may
+                                        * differ from media_ip. Empty => reuse media_ip. */
+    char room_id[128];                 /* social roomId ("room:..."), for the room-join mic peer */
     char session_id[200];              /* mediaPeer.userSessionId */
     int  http_status;                  /* GET /rooms HTTP status (401/403 => token expired) */
 } bsdr_cloud_screen;
@@ -67,6 +71,14 @@ bool bsdr_cloud_renew(const char *refresh_token, bsdr_cloud_result *out);
 /* GET {cloudApiServerUrl}/rooms -> the first screen that has a mediaPeer.
  * Returns true and fills `out` (out->found) on a 2xx with a usable screen. */
 bool bsdr_cloud_get_rooms(const char *access_token, bsdr_cloud_screen *out);
+
+/* POST {cloudApiServerUrl}/room/{bareRoomId}/join -> the caller's OWN media peer in that social
+ * room, whose mediaPeer carries the room-voice `micPort` (the mix of the OTHER participants). The
+ * remote-desktop screen peer from /rooms does NOT expose micPort, so this extra call is how bsdrX
+ * consumes the room mic (BSDR_RoomMic + the computer-control cloud fallback). `room_id` may carry the
+ * "room:" prefix (stripped for the path/body). Fills out->media_ip + out->mic_port. Returns true on a
+ * 2xx with a usable mic peer. NB: this registers as a room participant — call only when needed. */
+bool bsdr_cloud_join_room(const char *access_token, const char *room_id, bsdr_cloud_screen *out);
 
 /* WS presence connection (so this host shows online and a Quest can add a screen).
  * Opens wss://main-shark-cloud/<base64(JSON{accessToken,systemInfo})> and keeps it

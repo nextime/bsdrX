@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       autoconf automake libtool cmake dpkg-dev fakeroot zip flex bison \
       libx11-dev libxext-dev libxfixes-dev libxcb1-dev libxcb-shm0-dev \
       libxcb-shape0-dev libxcb-xfixes0-dev libpulse-dev libdrm-dev \
+      libpipewire-0.3-dev libdbus-1-dev \
       python3 file patchelf \
     && rm -rf /var/lib/apt/lists/*
 
@@ -102,3 +103,10 @@ RUN set -eux; mkdir -p /opt/tools; cd /opt/tools; \
       https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage; \
     chmod +x /opt/tools/*.AppImage
 ENV PATH=/opt/tools:$PATH
+
+# ---- packaging helpers appimagetool looks for (kept in a LATE layer so adding them
+#      doesn't invalidate the expensive dep-build layers above): appstreamcli validates
+#      the shipped AppStream metainfo, gpg is the (optional) AppImage signer. Their
+#      absence is what triggered the "appstreamcli/gpg is missing" warnings. ----
+RUN apt-get update && apt-get install -y --no-install-recommends appstream gnupg \
+    && rm -rf /var/lib/apt/lists/*

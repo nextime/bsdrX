@@ -45,11 +45,13 @@ class BubbleOverlay(private val ctx: Context, private val onStop: () -> Unit) {
      *  form field in its WebView can take input focus and raise the soft keyboard — a NOT_FOCUSABLE
      *  overlay can never show the IME. The collapsed icon stays non-focusable so it doesn't grab the
      *  Back button / steal focus from the app underneath while it's just idling. */
-    private fun params(w: Int, h: Int, focusable: Boolean = false): WindowManager.LayoutParams {
+    private fun params(w: Int, h: Int, focusable: Boolean = false,
+                       alpha: Float = 1f): WindowManager.LayoutParams {
         var flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
         if (!focusable) flags = flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
         return WindowManager.LayoutParams(w, h, overlayType, flags, PixelFormat.TRANSLUCENT).apply {
             gravity = Gravity.TOP or Gravity.START; x = 24; y = 160
+            this.alpha = alpha                   // whole-window translucency (semi-transparent balloon)
             if (focusable) softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         }
     }
@@ -63,7 +65,8 @@ class BubbleOverlay(private val ctx: Context, private val onStop: () -> Unit) {
     private fun showCollapsed() {
         removeAll()
         val view = LayoutInflater.from(ctx).inflate(R.layout.bubble_collapsed, null)
-        val lp = params(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT)
+        val lp = params(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                        alpha = 0.85f)   // semi-transparent bubble
         val icon = view.findViewById<View>(R.id.bubbleIcon)
         // tap: drive the voice cycle when armed, else open the control panel.
         icon.setOnTouchListener(dragToggle(lp) {
@@ -78,7 +81,8 @@ class BubbleOverlay(private val ctx: Context, private val onStop: () -> Unit) {
     private fun showExpanded() {
         removeAll()
         val view = LayoutInflater.from(ctx).inflate(R.layout.bubble_expanded, null)
-        val lp = params(dp(320), dp(440), focusable = true)   // focusable -> form fields raise the IME
+        // focusable -> form fields raise the IME; opaque panel; resizable via the corner grip
+        val lp = params(dp(320), dp(440), focusable = true)
         view.findViewById<WebView>(R.id.bubbleWeb).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
@@ -95,9 +99,31 @@ class BubbleOverlay(private val ctx: Context, private val onStop: () -> Unit) {
         view.findViewById<Button>(R.id.bubbleCollapse).setOnClickListener { showCollapsed() }
         // the header doubles as a drag handle
         view.findViewById<View>(R.id.bubbleHeader).setOnTouchListener(dragToggle(lp, null))
+        // the corner grip resizes the window
+        view.findViewById<View>(R.id.bubbleResize).setOnTouchListener(resizeDrag(lp))
         wm.addView(view, lp)
         expanded = view
     }
+
+    /** Drag the bottom-right grip to resize the expanded window (clamped to a usable minimum). */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun resizeDrag(lp: WindowManager.LayoutParams) =
+        object : View.OnTouchListener {
+            private var iw = 0; private var ih = 0
+            private var tx = 0f; private var ty = 0f
+            private val minW = dp(220); private val minH = dp(220)
+            override fun onTouch(v: View, e: MotionEvent): Boolean {
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> { iw = lp.width; ih = lp.height; tx = e.rawX; ty = e.rawY }
+                    MotionEvent.ACTION_MOVE -> {
+                        lp.width  = Math.max(minW, iw + (e.rawX - tx).toInt())
+                        lp.height = Math.max(minH, ih + (e.rawY - ty).toInt())
+                        runCatching { wm.updateViewLayout(expanded, lp) }
+                    }
+                }
+                return true
+            }
+        }
 
     /** A touch listener that drags the window and, on a tap (no drag), runs onTap. */
     private fun dragToggle(lp: WindowManager.LayoutParams, onTap: (() -> Unit)?) =

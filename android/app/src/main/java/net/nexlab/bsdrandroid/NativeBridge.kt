@@ -73,6 +73,7 @@ object NativeBridge {
     // ---- native -> Kotlin listeners -----------------------------------------
     @Volatile var pairingListener: ((String) -> Unit)? = null
     @Volatile var micListener: ((ShortArray, Int, Int) -> Unit)? = null
+    @Volatile var roomListener: ((ShortArray, Int, Int) -> Unit)? = null
     @Volatile var inputListener: ((Int, Int, Int) -> Unit)? = null
     @Volatile var voiceStateListener: ((Int) -> Unit)? = null
     @Volatile var voiceFeedbackListener: ((String) -> Unit)? = null
@@ -110,6 +111,8 @@ object NativeBridge {
     @Keep fun onPairingCode(code: String) { pairingListener?.invoke(code) }
     @Keep fun onMicPcm(pcm: ShortArray, frames: Int, channels: Int) =
         micListener?.invoke(pcm, frames, channels) ?: Unit
+    @Keep fun onRoomPcm(pcm: ShortArray, frames: Int, channels: Int) =
+        roomListener?.invoke(pcm, frames, channels) ?: Unit
     @Keep fun onInputEvent(kind: Int, a: Int, b: Int) { inputListener?.invoke(kind, a, b) }
     @Keep fun onVoiceState(state: Int) { voiceStateListener?.invoke(state) }
     @Keep fun onVoiceFeedback(msg: String) { voiceFeedbackListener?.invoke(msg) }

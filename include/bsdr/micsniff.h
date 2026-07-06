@@ -26,9 +26,7 @@
  *
  * So to expose the owner's voice as a local microphone we intercept that
  * Quest->cloud RTP off the LAN, decode the Opus, and feed it into a dedicated
- * virtual mic "BSDR-Quest-OwnerMic" — carrying ONLY the headset owner's voice,
- * distinct from the room-wide "BSDR-Quest-Mic" the cloud relay path already
- * plays back.
+ * virtual mic "BSDR_QuestMic" — carrying the headset owner's voice.
  *
  * Capture needs the agent to actually see the Quest->cloud packets. On a flat
  * hub/SPAN/gateway setup, plain promiscuous capture suffices. On a switched LAN
@@ -77,7 +75,7 @@ typedef struct {
 
 int bsdr_micsniff_helper_main(int argc, char **argv);
 
-/* Start the sniffer (spawns its own thread). Creates the "BSDR-Quest-OwnerMic"
+/* Start the sniffer (spawns its own thread). Creates the "BSDR_QuestMic"
  * virtual device and streams the decoded owner voice into it. Returns NULL if
  * unavailable (non-Linux build, missing CAP_NET_RAW, bad interface, no quest_ip). */
 bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg);

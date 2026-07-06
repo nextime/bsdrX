@@ -23,22 +23,34 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="@string/cast_start" />
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:textSize="13sp"
+            android:paddingHorizontal="4dp"
+            android:text="@string/btn_cast_start" />
 
         <Button
             android:id="@+id/btnFile"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="@string/stream_file" />
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:textSize="13sp"
+            android:paddingHorizontal="4dp"
+            android:text="@string/btn_file" />
 
         <Button
             android:id="@+id/btnMinimize"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:textSize="13sp"
+            android:paddingHorizontal="4dp"
             android:enabled="false"
-            android:text="@string/minimize" />
+            android:text="@string/btn_minimize" />
     </LinearLayout>
 
     <!-- permission status panel, filled by MainActivity.renderPermissions() -->

@@ -50,13 +50,16 @@ typedef struct {
     bool cloud_sticky_ports;      /* --cloud-sticky-ports: ephemeral 1st, then reuse same ports per relay IP across toggles */
     bool no_cloud_video;          /* --no-cloud-video: disable relay video (default: ON, trailer frags) */
     bool video_decoupled;         /* --video-decoupled: relay self-captures (default: couple to LAN encode) */
-    bool cpu_only;                /* --cpu: force CPU scale/convert (default: try CUDA GPU pipeline) */
+    bool cpu_only;                /* --cpu: force CPU scale + libx264 (Linux default; sharper low-bitrate text) */
+    bool gpu_encode;              /* --gpu: opt into the CUDA/NVENC pipeline (default on Windows/macOS) */
     bool lan_1x;                  /* --lan-1x: send LAN video once, not 2x (halves uplink on weak WiFi) */
     bool use_vaapi;               /* --vaapi: encode on the iGPU via VAAPI (frees the dGPU) */
     bool use_kmsgrab;             /* --kmsgrab: DRM/KMS capture (zero-copy with --vaapi; needs CAP_SYS_ADMIN) */
+    bool force_x11;               /* --x11: force x11grab (never the Wayland portal) */
+    bool force_pipewire;          /* --wayland/--pipewire: force the portal + PipeWire capture */
     bool use_sendmmsg;            /* --sendmmsg: batch LAN video fragments into one syscall */
     bool no_cloud_audio;          /* --no-cloud-audio: disable relay audio (default: ON, Opus + 8B trailer) */
-    bool sniff_mic;               /* --sniff-mic: sniff the Quest's room mic -> BSDR-Quest-OwnerMic */
+    bool sniff_mic;               /* --sniff-mic: sniff the Quest's room mic -> BSDR_QuestMic */
     bool sniff_mitm;              /* --sniff-mitm: ARP-spoof so a switched LAN routes it through us */
     const char *sniff_iface;      /* --sniff-iface: capture interface (NULL = default route) */
     const char *sniff_gw;         /* --sniff-gw: gateway IP for MITM (NULL = default route) */

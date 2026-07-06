@@ -134,7 +134,9 @@ static const char PAGE[] =
 "Disable TLS certificate verification (insecure — only for a broken/MITM'd CA store)</label></div>"
 "<div id=cloudshare class=row style='margin-top:12px;display:none'>"
 "<span id=sharelbl class=grow>Internet sharing: off</span>"
-"<button id=sharebtn class=p onclick=toggleShare()>Share to Internet</button></div></div>"
+"<button id=sharebtn class=p onclick=toggleShare()>Share to Internet</button></div>"
+"<div class=row id=blankrow><label style=width:auto><input id=blank type=checkbox style=width:auto onchange=blankToggle()> "
+"Blank my physical screen while the headset is connected (privacy)</label></div></div>"
 
 "<div class=card><h2>Headset (Quest)</h2>"
 "<div id=quest class=status>...</div>"
@@ -142,25 +144,29 @@ static const char PAGE[] =
 "<div class=hint>Pairing is automatic — the headset finds this PC on the LAN. "
 "No pairing code to type.</div></div>"
 
-"<div class=card><h2>Headset owner mic</h2>"
+"<div class=card><h2>Headset mic</h2>"
 "<div id=sniff class=status>...</div>"
-"<div class=hint>The Quest never sends its mic to this PC — the owner's voice only goes to the "
+"<div class=hint>The Quest never sends its mic to this PC — the headset owner's voice only goes to the "
 "Bigscreen room (cloud). This intercepts that stream off the LAN and exposes it as a virtual "
-"microphone <b>BSDR-Quest-OwnerMic</b> (owner only). Passive capture needs this PC to see the "
-"headset's traffic (be the gateway or a mirror port); <b>MITM</b> ARP-reroutes it through this PC "
-"on a switched LAN. Needs the root password (used once for a helper, never stored).</div>"
-"<div class=row><label style=width:auto><input id=snmitm type=checkbox style=width:auto> Use MITM (ARP)</label></div>"
-"<div class=row><label style=width:auto;color:var(--muted)>Router relay port</label>"
+"microphone <b>BSDR_QuestMic</b>. <b>Sniff</b> (passive) needs this PC to see the headset's traffic "
+"(be the gateway or a mirror port); <b>MITM</b> ARP-reroutes it through this PC on a switched LAN; "
+"<b>Relay</b> takes the mic from a router companion. Sniff/MITM need the root password (used once "
+"for a helper, never stored).</div>"
+"<div class=row><label style=width:auto;color:var(--muted)>Method</label>"
+"<select id=snmethod onchange=snMethodChange() style=width:auto>"
+"<option value=0>Sniff (passive)</option><option value=1>MITM (ARP)</option><option value=2>Relay (router)</option></select></div>"
+"<div class=row id=relayrow style=display:none><label style=width:auto;color:var(--muted)>Router relay port</label>"
 "<input id=relayport type=number min=0 max=65535 placeholder='e.g. 45099 (bsdr_micrelay)' onchange=relayPortSet() style=width:12em>"
 "<span class=hint style=margin-left:8px>the router companion forwards the mic here — <b>required on Android</b> (no local sniff)</span></div>"
 "<div class=row><input id=snpw type=password class=grow placeholder='root (sudo) password — only if not already root'>"
-"<button id=snbtn class=p onclick=toggleSniff()>Start owner mic</button></div>"
+"<button id=snbtn class=p onclick=toggleSniff()>Start mic</button></div>"
 "<div class=hint><b>On Wi-Fi</b>, MITM can't work (the AP isolates stations). Run the "
 "<b>router companion</b> <b>bsdr_micrelay</b> on your router — it captures the headset's uplink "
-"there and forwards it here (start bsdrX with <code>--sniff-remote PORT</code>). Prebuilt binaries "
-"for common routers are in <b>bsdrX_relay.zip</b>; see bsdr_micrelay(1).</div>"
-/* realtime voice changer on the owner mic */
-"<div class=sub2><div class=t>Voice changer <span class=badge>realtime</span></div>"
+"there and forwards it here (<b>Relay</b> method, or start bsdrX with <code>--sniff-remote PORT</code>). "
+"Prebuilt binaries for common routers are in <b>bsdrX_relay.zip</b>; see bsdr_micrelay(1).</div>"
+/* realtime voice changer on the Quest mic */
+"<div class=sub2><div class=t>Voice changer <span class=badge>realtime</span>"
+"<label style='margin-left:auto;width:auto;font-weight:400'><input id=vfxon type=checkbox style=width:auto onchange=voicefx()> enable</label></div>"
 "<div class=row><label style=width:120px;color:var(--muted)>Gender</label>"
 "<input id=vgender type=range min=-100 max=100 value=0 oninput='vgv.textContent=vgender.value' onchange=voicefx() class=grow>"
 "<span id=vgv style=width:2.5em;text-align:right>0</span></div>"
@@ -173,14 +179,27 @@ static const char PAGE[] =
 "<div class=row><label style=width:120px;color:var(--muted)>Whisper</label>"
 "<input id=vwhisper type=range min=0 max=100 value=0 oninput='vwv.textContent=vwhisper.value' onchange=voicefx() class=grow>"
 "<span id=vwv style=width:2.5em;text-align:right>0</span></div>"
-"<div class=hint>Live, no model, all platforms. <b>Gender</b> shifts pitch+formants (&#8722; deeper / + higher); "
+"<div class=hint>Live, no model, all platforms. <b>Enable</b> turns the changer on (the sliders keep "
+"their positions when off). <b>Gender</b> shifts pitch+formants (&#8722; deeper / + higher); "
 "<b>Robot</b> = ring-mod timbre; <b>Echo</b> = trailing echo; <b>Whisper</b> = breathy. Applies to the "
-"owner mic everywhere (virtual mic, computer-control, cloud).</div>"
+"Quest mic everywhere (virtual mic, computer-control, cloud).</div>"
 "<div class=row><label style=width:auto><input id=vsub type=checkbox style=width:auto onchange=voicefx()> "
 "Substitute into the cloud (MITM/relay): stop the headset&#8217;s original voice and inject the changed audio</label></div>"
-"<div class=hint>Requires <b>MITM</b> active (we rewrite the headset&#8594;cloud packets in flight via "
-"NFQUEUE) and the agent running with <b>root / CAP_NET_ADMIN</b> on Linux. Otherwise the change is "
-"still heard on the local virtual mic and the cloud-room fallback.</div></div></div>"
+"<div class=hint>Requires <b>MITM</b> or <b>Relay</b> active (we rewrite the headset&#8594;cloud packets in "
+"flight via NFQUEUE) and the agent running with <b>root / CAP_NET_ADMIN</b> on Linux. Otherwise the change "
+"is still heard on the local virtual mic and the cloud-room fallback.</div></div>"
+/* Room mic: the OTHER participants' voices, consumed from the cloud room's SFU (micPort). Distinct
+ * from BSDR_QuestMic (the headset owner's own voice, sniffed off the LAN). Needs an active cloud
+ * session (Internet sharing on). */
+"<div class=sub2><div class=t>Room mic <span class=badge>cloud</span>"
+"<label style='margin-left:auto;width:auto;font-weight:400'><input id=roommic type=checkbox style=width:auto onchange=roomMicToggle()> enable</label></div>"
+"<div id=roommicstat class=status style=margin-bottom:6px>...</div>"
+"<div class=hint>Pulls the <b>other people's voices</b> from your Bigscreen room out of the cloud "
+"(the room's mediasoup mic mix) and exposes them as a virtual microphone <b>BSDR_RoomMic</b> — record "
+"the room into OBS, a call, etc. This is the room voice, separate from <b>BSDR_QuestMic</b> (your own "
+"voice off the LAN). It also powers <b>computer control</b> when sniff/MITM/relay aren&#8217;t available. "
+"Requires <b>Internet sharing</b> on (that&#8217;s the cloud connection that carries the room). Linux "
+"exposes a dedicated device; on Windows/macOS it routes into VB-CABLE/BlackHole.</div></div></div>"
 
 "<div class=card><h2>Source</h2>"
 "<div class=row>"
@@ -188,9 +207,11 @@ static const char PAGE[] =
 "<label><input type=radio name=src value=file onclick=src('file') style=width:auto> Video file</label> "
 "<label><input type=radio name=src value=webcam onclick=src('webcam') style=width:auto> Webcam</label> "
 "<label><input type=radio name=src value=webcam3d onclick=src('webcam3d') style=width:auto> Stereo 3D (2 cams)</label></div>"
-"<div class=row id=winrow><label style=width:auto;color:var(--muted)>Window</label>"
+"<div class=row id=winrow><label style=width:auto;color:var(--muted)>Capture</label>"
 "<select id=win class=grow onchange=selWin()></select>"
-"<button onclick=loadWindows() style=width:auto>&#8635;</button></div>"
+"<button onclick=loadWindows() title='Rescan windows/screens' style=width:auto>&#8635;</button></div>"
+"<div class=hint id=winhint>Choose <b>Whole desktop</b>, a single <b>Screen:</b> (one monitor), or a "
+"single <b>window</b>. On Wayland the portal shows its own picker instead.</div>"
 /* Webcam picker: filled from /api/webcams. First select = camera (single) or LEFT eye (stereo);
  * second select = RIGHT eye, shown only in stereo mode. On platforms that can't enumerate (macOS),
  * these fall back to a manual device/index field (renderCams). */
@@ -207,8 +228,15 @@ static const char PAGE[] =
 "<div class=hint>A video file, an <b>http/https/rtsp URL</b>, or a <b>.txt playlist</b> (one file "
 "or URL per line, streamed in a loop). An in-VR media bar gives play/pause, seek, volume and exit; "
 "the source's own audio streams too.</div>"
-"<div class=row id=blankrow><label style=width:auto><input id=blank type=checkbox style=width:auto onchange=blankToggle()> "
-"Blank my physical screen while the headset is connected (privacy)</label></div></div>"
+"<div class=row><label style=width:auto;color:var(--muted)>Video bitrate</label>"
+"<input id=brate type=number min=0 step=1 style=width:90px placeholder=0 onchange=bitrateSet()>"
+"<span class=hint style=margin-left:6px>Mbps — <b>0 = follow the headset</b>; any value overrides the "
+"headset's bitrate (applied live). <span id=breff></span></span></div>"
+"<div class=row><label style=width:auto;color:var(--muted)>Encoder</label>"
+"<select id=enc style=width:auto onchange=encoderSet()><option value=0>CPU — x264 (sharper text)</option>"
+"<option value=1>GPU — NVENC (offload / high bitrate)</option></select>"
+"<span class=hint style=margin-left:6px>x264 keeps low-bitrate text crisp; NVENC frees the CPU but "
+"needs more bitrate for the same sharpness. Saved across restarts.</span></div></div>"
 
 "<div class=card><h2>2D&#8594;3D</h2>"
 "<div class=hint>Convert the stream to side-by-side 3D in real time. <b>Fast</b> is a light "
@@ -224,16 +252,26 @@ static const char PAGE[] =
 "<option value=1>Built-in \342\200\242 CPU \342\200\224 Depth-Anything V2 Small (~99 MB)</option>"
 "<option value=2>Built-in \342\200\242 small GPU \342\200\224 MiDaS DPT-Hybrid (~490 MB)</option>"
 "<option value=3>Built-in \342\200\242 gaming desktop \342\200\224 MiDaS DPT-Large (~1.3 GB)</option>"
-"<option value=-1 disabled>(auto)</option></select>"
-"<button onclick=dlmodel() style=width:auto title='Download the selected built-in model now'>Download</button></div>"
-"<div class=hint>Built-in tiers run the depth model inside bsdrX (no Python). GPU tiers use the "
+"<option value=-1 disabled>(auto)</option></select></div>"
+/* External-helper command: shown only when the AI-model select is on "External helper". */
+"<div id=tdext style=display:none>"
+"<div class=row><input id=tdai class=grow placeholder='e.g. python3 scripts/bsdr-depth-helper.py --model midas_v21_small.onnx' onchange=threed()></div>"
+"<div class=hint><b>AI mode needs this command set</b> — a ready-to-use helper ships in "
+"<code>scripts/bsdr-depth-helper.py</code> (real depth with a MiDaS-small ONNX model, or a built-in "
+"heuristic if you omit <code>--model</code>). It reads a small grayscale frame on stdin and writes "
+"back a depth map (header <code>BSDD</code>+w+h, then w&#215;h bytes each way), at a reduced rate. "
+"With no command, or if it stalls, 3D falls back to Fast. See <b>bsdr_agent</b>(1).</div></div>"
+/* Built-in model manager: shown only when a built-in tier is selected. */
+"<div id=tdbuiltin style=display:none>"
+"<div class=row><button onclick=dlmodel() style=width:auto title='Download the selected built-in model now'>Download</button>"
+"<span class=hint style=margin-left:8px>Built-in tiers run the depth model inside bsdrX. GPU tiers use the "
 "platform accelerator (DirectML / CoreML / NNAPI / CUDA) and fall back to CPU. Pick a tier and "
-"<b>Download</b> it (or import a zip below); until it lands, 3D uses the fast heuristic.</div>"
+"<b>Download</b> it (or import a zip below); until it lands, 3D uses the fast heuristic.</span></div>"
 /* Live model manager: per-tier cached/absent state, in-flight download progress, cache location.
  * Filled by the status poll (renderModels) from status.models. */
 "<div id=tdmodels class=hint style=margin-top:6px>models\342\200\246</div>"
 "<div class=row><input id=tdzip class=grow placeholder='path to a model .zip on this machine'>"
-"<button onclick=impmodel() style=width:auto>Import model zip</button></div>"
+"<button onclick=impmodel() style=width:auto>Import model zip</button></div></div>"
 "<div class=row><label style=width:120px;color:var(--muted)>Deepness</label>"
 "<input id=tddeep type=range min=0 max=100 oninput='tddv.textContent=tddeep.value' onchange=threed() class=grow>"
 "<span id=tddv style=width:2.5em;text-align:right>35</span></div>"
@@ -241,13 +279,7 @@ static const char PAGE[] =
 "<input id=tdconv type=range min=-50 max=50 oninput='tdcv.textContent=tdconv.value' onchange=threed() class=grow>"
 "<span id=tdcv style=width:2.5em;text-align:right>0</span></div>"
 "<div class=row><label style=width:auto><input id=tdfull type=checkbox style=width:auto onchange=threed()> Full resolution per eye (renders 3D at 2&#215; resolution, same screen shape; sharper, ~4&#215; encode cost)</label></div>"
-"<div class=row><label style=width:auto><input id=tdswap type=checkbox style=width:auto onchange=threed()> Swap eyes (L/R)</label></div>"
-"<div class=row><input id=tdai class=grow placeholder='e.g. python3 scripts/bsdr-depth-helper.py --model midas_v21_small.onnx' onchange=threed()></div>"
-"<div class=hint><b>AI mode needs this command set</b> — a ready-to-use helper ships in "
-"<code>scripts/bsdr-depth-helper.py</code> (real depth with a MiDaS-small ONNX model, or a built-in "
-"heuristic if you omit <code>--model</code>). It reads a small grayscale frame on stdin and writes "
-"back a depth map (header <code>BSDD</code>+w+h, then w&#215;h bytes each way), at a reduced rate. "
-"With no command, or if it stalls, 3D falls back to Fast. See <b>bsdr_agent</b>(1).</div></div>"
+"<div class=row><label style=width:auto><input id=tdswap type=checkbox style=width:auto onchange=threed()> Swap eyes (L/R)</label></div></div>"
 
 "<div class=card><h2>Face swap <span class=badge>GPU</span></h2>"
 "<div class=row><label style=width:auto><input id=fson type=checkbox style=width:auto onchange=faceswap()> "
@@ -260,10 +292,16 @@ static const char PAGE[] =
 "<option value=1>CPU</option><option value=2 selected>GPU (CUDA/DirectML/CoreML/NNAPI)</option>"
 "<option value=3>GPU (high)</option></select></div>"
 "<div id=fsstat class=hint>face swap: off</div>"
-"<div class=hint>Needs the insightface models in the <b>faceswap</b> model dir "
-"(<code>det_10g.onnx</code>, <code>w600k_r50.onnx</code>, <code>inswapper_128.onnx</code>) — they're "
-"non-commercial so bsdrX never ships them; drop them in yourself. Runs on the CPU encode path; use a "
-"GPU tier for realtime. Applies to whatever you're streaming (desktop / webcam / file).</div></div>"
+"<div class=hint>Needs the insightface models (<code>det_10g.onnx</code>, <code>w600k_r50.onnx</code>, "
+"<code>inswapper_128.onnx</code>) in the <b>faceswap</b> model dir. They're non-commercial so bsdrX "
+"never bundles them — <b>Download models</b> fetches them from upstream, or drop them in / import a "
+"zip yourself. Runs on the CPU encode path; use a GPU tier for realtime. Applies to whatever you're "
+"streaming (desktop / webcam / file).</div>"
+/* Model manager, mirrors 2D->3D: per-file present state + a one-click download. From status.faceswap.models. */
+"<div class=row><button onclick=fsdl() style=width:auto title='Download the insightface models now'>Download models</button>"
+"<span id=fsmodels class=hint style=margin-left:8px>models\342\200\246</span></div>"
+"<div class=row><input id=fszip class=grow placeholder='path to a models .zip (buffalo_l.zip) on this machine'>"
+"<button onclick=fsimp() style=width:auto>Import model zip</button></div></div>"
 
 "<div class=card><h2>Voice assistant</h2>"
 "<div class=hint>Configure speech-to-text and (for spoken desktop commands) an LLM here. "
@@ -292,14 +330,14 @@ static const char PAGE[] =
 "<div id=ccstatus class=status style=margin-bottom:8px>...</div>"
 "<div class=hint>Turns the in-VR voice-command <b>balloon</b> on. Drag it anywhere over the "
 "desktop; a click starts a listen-until-silence capture, then the LLM drives the desktop "
-"(type text, key combos, click, scroll, launch apps). Requires the <b>owner mic</b> (sniffer or "
-"MITM) running — the only source of your voice — and an LLM endpoint set above.</div>"
+"(type text, key combos, click, scroll, launch apps). Requires the <b>Quest mic</b> (sniff / MITM / "
+"relay) running — the only source of your voice — and an LLM endpoint set above.</div>"
 "<div class=row><label style=width:auto><input id=ccvis type=checkbox style=width:auto onchange=setVision()> "
 "Vision (let the model take a desktop screenshot when a request needs it)</label></div>"
 "<div class=row><label style=width:auto><input id=ownmiclocal type=checkbox style=width:auto onchange=ownMicLocalToggle()> "
-"Use <b>this computer's microphone</b> as the owner mic (no headset sniff/MITM/relay needed).</label></div>"
+"Use <b>this computer's microphone</b> as the Quest mic (no headset sniff/MITM/relay needed).</label></div>"
 "<div class=row><label style=width:auto><input id=cloudmic type=checkbox style=width:auto onchange=cloudmicToggle()> "
-"Owner mic via cloud room when the LAN sniffer/companion isn't available (WiFi). Isolates the owner "
+"Quest mic via cloud room when the LAN sniffer/companion isn't available (WiFi). Isolates the owner "
 "(loudest speaker) only while a command is spoken.</label></div>"
 "<div class=row><button id=ccbtn class=p onclick=toggleCompctl()>Enable computer control</button></div></div>"
 "</div>"
@@ -339,7 +377,7 @@ static const char PAGE[] =
 "function sel(ip){api('/api/select',{ip:ip})}"
 "let cams=[],camMode='desktop';"
 "function srcRows(m){let cam=(m==='webcam'||m==='webcam3d');"
-"winrow.style.display=(m==='desktop')?'flex':'none';filerow.style.display=(m==='file')?'flex':'none';"
+"winrow.style.display=(m==='desktop')?'flex':'none';winhint.style.display=(m==='desktop')?'block':'none';filerow.style.display=(m==='file')?'flex':'none';"
 "camrow.style.display=cam?'flex':'none';camrowR.style.display=(m==='webcam3d')?'flex':'none';camhint.style.display=cam?'block':'none';}"
 "function src(m){camMode=m;srcRows(m);"
 "if(m==='webcam'||m==='webcam3d'){loadCams().then(pickCam);}else{api('/api/source',{mode:m,path:path.value});}}"
@@ -350,6 +388,8 @@ static const char PAGE[] =
 "function pickCam(){let a=document.getElementById('cam'),b=document.getElementById('camR');let d=a?a.value:'',d2=b?b.value:'';window._cam=d;window._camR=d2;api('/api/source',{mode:camMode,path:d,dev2:d2});}"
 "function srcpath(){api('/api/source',{mode:'file',path:path.value})}"
 "function blankToggle(){api('/api/blank',{on:blank.checked?1:0})}"
+"function bitrateSet(){api('/api/bitrate',{mbps:+brate.value||0})}"
+"function encoderSet(){api('/api/encoder',{gpu:+enc.value})}"
 "function fbClose(){document.getElementById('fb').style.display='none'}"
 "function showDonate(){document.getElementById('dn').style.display='block'}"
 "function dnClose(){document.getElementById('dn').style.display='none'}"
@@ -373,18 +413,29 @@ static const char PAGE[] =
 "function togglePause(){api('/api/pause',{toggle:true})}"
 "function disconnect(){api('/api/disconnect',{})}"
 "function toggleShare(){api('/api/share',{toggle:true})}"
-"function toggleSniff(){let on=snbtn.dataset.on==='1';api('/api/sniff',{want:on?0:1,mitm:snmitm.checked?1:0,password:snpw.value}).then(()=>{snpw.value=''})}"
-"function voicefx(){api('/api/voicefx',{gender:+vgender.value,robot:+vrobot.value,echo:+vecho.value,whisper:+vwhisper.value,substitute:vsub.checked?1:0})}"
+"function toggleSniff(){let on=snbtn.dataset.on==='1';api('/api/sniff',{want:on?0:1,password:snpw.value}).then(()=>{snpw.value=''})}"
+"function snMethodChange(){relayrow.style.display=(+snmethod.value===2)?'flex':'none';api('/api/sniffmethod',{method:+snmethod.value})}"
+"function voicefx(){api('/api/voicefx',{on:vfxon.checked?1:0,gender:+vgender.value,robot:+vrobot.value,echo:+vecho.value,whisper:+vwhisper.value,substitute:vsub.checked?1:0})}"
 "function relayPortSet(){api('/api/relayport',{port:+relayport.value})}"
 "function faceswap(){api('/api/faceswap',{on:fson.checked?1:0,tier:+fstier.value,source:fssrc.value})}"
 "function voicecfg(){api('/api/voice',{stt:se.value,sttModel:sm.value,sttToken:st.value,llm:le.value,llmModel:lm.value,llmToken:lt.value})}"
 "function toggleCompctl(){let on=ccbtn.dataset.on==='1';api('/api/compctl',{enable:on?0:1,vision:ccvis.checked?1:0})}"
 "function setVision(){let on=ccbtn.dataset.on==='1';api('/api/compctl',{enable:on?1:0,vision:ccvis.checked?1:0})}"
 "function cloudmicToggle(){api('/api/cloudmic',{on:cloudmic.checked?1:0})}"
+"function roomMicToggle(){api('/api/roommic',{on:roommic.checked?1:0})}"
 "function ownMicLocalToggle(){api('/api/ownmiclocal',{on:ownmiclocal.checked?1:0})}"
-"function threed(){let m=0;for(const r of document.getElementsByName('td'))if(r.checked)m=+r.value;api('/api/threed',{mode:m,deepness:+tddeep.value,convergence:+tdconv.value,swap:tdswap.checked?1:0,full:tdfull.checked?1:0,tier:+tdtier.value,ai:tdai.value})}"
+"function tdTierUI(){let ext=(+tdtier.value===0);tdext.style.display=ext?'block':'none';tdbuiltin.style.display=ext?'none':'block';}"
+"function threed(){tdTierUI();let m=0;for(const r of document.getElementsByName('td'))if(r.checked)m=+r.value;api('/api/threed',{mode:m,deepness:+tddeep.value,convergence:+tdconv.value,swap:tdswap.checked?1:0,full:tdfull.checked?1:0,tier:+tdtier.value,ai:tdai.value})}"
 "function impmodel(){if(!tdzip.value)return;api('/api/model-import',{path:tdzip.value}).then(r=>alert(r&&r.imported>=0?('imported '+r.imported+' model(s)'):'import failed'))}"
 "function dlmodel(){let t=+tdtier.value;if(t<1){alert('Pick a built-in tier (CPU / GPU / desktop) to download.');return;}api('/api/model-download',{tier:t}).then(r=>{if(!r||r.ok!==true)alert('cannot start download'+(r&&r.err?': '+r.err:''))})}"
+"function fsdl(){api('/api/faceswap-download',{}).then(r=>{if(!r||r.ok!==true)alert('cannot start download')})}"
+"function fsimp(){if(!fszip.value)return;api('/api/faceswap-import',{path:fszip.value}).then(r=>alert(r&&r.imported>=0?('imported '+r.imported+' model(s)'):'import failed'))}"
+"function renderFsModels(m){if(!m){fsmodels.textContent='';return;}"
+"let d=m.dl,rows=(m.files||[]).map(function(f){return f.name+': '+(f.present?'\\u2713':'\\u2717');}).join('  ');"
+"if(d&&d.active)rows+='  \\u2193 '+(d.name||'')+' '+(d.pct>=0?d.pct+'%':((d.done/1048576).toFixed(0)+' MB'));"
+"else if(d&&d.err)rows+='  <span style=color:#f85149>'+d.err+'</span>';"
+"else if(m.ready)rows='<span style=color:#3fb950>\\u2713 all models present</span>';"
+"fsmodels.innerHTML=rows+'  <span style=color:var(--muted)>('+(m.dir||'?')+')</span>';}"
 "function renderModels(m){if(!m){tdmodels.textContent='';return;}"
 "let d=m.dl,rows=(m.tiers||[]).map(function(x){"
 "let st;if(x.present)st='<span style=color:#3fb950>\\u2713 cached</span>';"
@@ -402,8 +453,11 @@ static const char PAGE[] =
 "cloudshare.style.display=s.cloud.loggedIn?'flex':'none';"
 "if(s.cloud.loggedIn){let sh=s.cloud.internetSharing;sharelbl.textContent='Internet sharing: '+(sh?'ON':'off');sharebtn.textContent=sh?'Stop sharing':'Share to Internet';sharebtn.className=sh?'danger':'p';}"
 "quest.innerHTML=dot(s.quest.paired)+'<span>'+(s.quest.paired?('Connected: '+s.quest.name+' ('+s.quest.ip+')'):'No headset connected')+'</span>'+(s.quest.streaming?'<span class=pill>streaming</span>':'')+(s.quest.paired?'<button class=danger style=margin-left:auto onclick=disconnect()>Disconnect</button>':'');"
-"if(s.sniff){let sn=s.sniff;sniff.innerHTML=dot(sn.active)+'<span>'+(sn.active?('On — '+(sn.msg||'active')):('Off'+(sn.msg?(' — '+sn.msg):'')))+'</span>';snbtn.dataset.on=sn.want?'1':'0';snbtn.textContent=sn.want?'Stop owner mic':'Start owner mic';snbtn.className=sn.want?'danger':'p';if(document.activeElement!==snmitm)snmitm.checked=sn.mitm;"
+"if(s.sniff){let sn=s.sniff;sniff.innerHTML=dot(sn.active)+'<span>'+(sn.active?('On — '+(sn.msg||'active')):('Off'+(sn.msg?(' — '+sn.msg):'')))+'</span>';snbtn.dataset.on=sn.want?'1':'0';snbtn.textContent=sn.want?'Stop mic':'Start mic';snbtn.className=sn.want?'danger':'p';"
+"if(document.activeElement!==snmethod&&sn.method!==undefined)snmethod.value=sn.method;"
+"relayrow.style.display=(sn.method===2)?'flex':'none';"
 "if(document.activeElement!==relayport&&sn.relayPort!==undefined)relayport.value=sn.relayPort||'';"
+"if(document.activeElement!==vfxon&&sn.fxOn!==undefined)vfxon.checked=sn.fxOn;"
 "if(document.activeElement!==vgender&&sn.gender!==undefined){vgender.value=sn.gender;vgv.textContent=sn.gender;}"
 "if(document.activeElement!==vrobot&&sn.robot!==undefined){vrobot.value=sn.robot;vrv.textContent=sn.robot;}"
 "if(document.activeElement!==vecho&&sn.echo!==undefined){vecho.value=sn.echo;vev.textContent=sn.echo;}"
@@ -417,21 +471,26 @@ static const char PAGE[] =
 "{let m=s.source.mode;camMode=m;srcRows(m);"
 "if((m==='webcam'||m==='webcam3d')&&!camsel.firstChild){window._cam=s.source.path;window._camR=s.source.path2;loadCams();}}"
 "if(document.activeElement!==blank)blank.checked=!!s.blank;"
+"if(s.quality){if(document.activeElement!==brate)brate.value=s.quality.brOverride?(s.quality.brOverride/1e6):'';"
+"breff.textContent='(now '+((s.quality.bitrate||0)/1e6).toFixed(1)+' Mbps'+(s.quality.brOverride?', overriding':', from headset')+')';"
+"if(document.activeElement!==enc)enc.value=s.quality.gpuEncode?'1':'0';}"
 "blankrow.style.display=s.android?'none':'';"   /* screen-blank is desktop-only */
 "if(document.activeElement!==cloudmic)cloudmic.checked=!!s.cloudMic;"
 "if(document.activeElement!==ownmiclocal)ownmiclocal.checked=!!s.ownerMicLocal;"
+"if(document.activeElement!==roommic)roommic.checked=!!s.roomMic;"
+"{let sh=s.cloud&&s.cloud.internetSharing;roommicstat.innerHTML=dot(!!s.roomMic&&sh)+'<span>'+(!s.roomMic?'Off':(sh?'On — consuming the room voice (BSDR_RoomMic)':'Waiting — turn on Internet sharing to reach the room'))+'</span>';}"
 "if(s.threed){let t=s.threed;for(const r of document.getElementsByName('td'))r.checked=(+r.value===t.mode);"
 "if(document.activeElement!==tddeep){tddeep.value=t.deepness;tddv.textContent=t.deepness;}"
 "if(document.activeElement!==tdconv){tdconv.value=t.convergence;tdcv.textContent=t.convergence;}"
 "if(document.activeElement!==tdswap)tdswap.checked=!!t.swap;"
 "if(document.activeElement!==tdfull)tdfull.checked=t.full!==false;"
 "if(document.activeElement!==tdtier&&t.tier!==undefined)tdtier.value=t.tier;"
-"if(document.activeElement!==tdai)tdai.value=t.ai||'';}"
+"if(document.activeElement!==tdai)tdai.value=t.ai||'';tdTierUI();}"
 "renderModels(s.models);"
 "if(s.faceswap){let fx=s.faceswap;if(document.activeElement!==fson)fson.checked=fx.on;"
 "if(document.activeElement!==fssrc)fssrc.value=fx.source||'';"
 "if(document.activeElement!==fstier&&fx.tier)fstier.value=fx.tier;"
-"fsstat.textContent='face swap: '+(fx.status||(fx.on?'on':'off'));}"
+"fsstat.textContent='face swap: '+(fx.status||(fx.on?'on':'off'));renderFsModels(fx.models);}"
 "if(document.activeElement!==se)se.value=s.voice.stt||'';"
 "if(document.activeElement!==sm)sm.value=s.voice.sttModel||'';"
 "if(document.activeElement!==le)le.value=s.voice.llm||'';"
@@ -442,7 +501,7 @@ static const char PAGE[] =
 "if(s.compctl){let cc=s.compctl,ready=lf&&(s.android||(s.sniff&&s.sniff.active));"
 "ccbtn.dataset.on=cc.want?'1':'0';ccbtn.textContent=cc.want?'Disable computer control':'Enable computer control';ccbtn.className=cc.want?'danger':'p';"
 "ccbtn.disabled=!ready&&!cc.want;"
-"ccstatus.innerHTML=dot(cc.active)+'<span>'+(cc.active?('Armed — '+(cc.msg||'balloon active')):(cc.want?('Pending — '+(cc.msg||'waiting')):(ready?'Off — ready to enable':(s.android?'Off — set an LLM first':'Off — turn on the owner mic and set an LLM first'))))+'</span>';"
+"ccstatus.innerHTML=dot(cc.active)+'<span>'+(cc.active?('Armed — '+(cc.msg||'balloon active')):(cc.want?('Pending — '+(cc.msg||'waiting')):(ready?'Off — ready to enable':(s.android?'Off — set an LLM first':'Off — turn on the Quest mic and set an LLM first'))))+'</span>';"
 "ccbadge.textContent=cc.active?'armed':(cc.want?'pending':'off');ccbadge.className='badge '+(cc.active?'free':'custom');"
 "if(document.activeElement!==ccvis)ccvis.checked=!!cc.vision;}"
 "let pb=document.getElementById('pause');pb.textContent=s.quest.paused?'Restart':'Stop';pb.className=s.quest.paused?'p':'danger';}"
@@ -466,7 +525,7 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
     if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
         respond(c, 200, "text/html", PAGE, sizeof(PAGE) - 1);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
-        static char json[8192];
+        static char json[12288];
         size_t n = bsdr_app_status_json(a, json, sizeof(json));
         respond(c, 200, "application/json", json, n);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/login") == 0) {
@@ -490,6 +549,10 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         double on = 0; bsdr_json_get_double(body, "on", &on);
         bsdr_app_set_cloud_mic_fallback(a, on != 0);   /* owner-mic WiFi fallback via cloud room */
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/roommic") == 0) {
+        double on = 0; bsdr_json_get_double(body, "on", &on);
+        bsdr_app_set_room_mic(a, on != 0);   /* expose the cloud room's voice mix as BSDR_RoomMic */
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/ownmiclocal") == 0) {
         double on = 0; bsdr_json_get_double(body, "on", &on);
         bsdr_app_set_owner_mic_local(a, on != 0);      /* use this computer's mic as the owner mic */
@@ -509,6 +572,19 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         bsdr_app_get_threed(a, NULL, &cur_deep, NULL, NULL, NULL, &cur_tier, NULL, 0);
         bsdr_app_set_threed(a, (int)mode, deep >= 0 ? (int)deep : cur_deep, (int)conv, swap != 0,
                             full != 0, tier >= 0 ? (int)tier : cur_tier, have_ai ? ai : NULL);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/bitrate") == 0) {
+        /* Video bitrate override. mbps>0 forces that bitrate (the headset's bitrate config is
+         * ignored); 0 follows the headset. Applied live — the streamer reopens the encoder next tick. */
+        double mbps = 0; bsdr_json_get_double(body, "mbps", &mbps);
+        int bps = mbps > 0 ? (int)(mbps * 1000000.0 + 0.5) : 0;
+        bsdr_app_set_bitrate_override(a, bps);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/encoder") == 0) {
+        /* Encoder choice: gpu=1 -> CUDA/NVENC, gpu=0 -> CPU libx264 (sharper low-bitrate text).
+         * Live-switchable (restarts a running session) and persisted across restarts. */
+        double gpu = 0; bsdr_json_get_double(body, "gpu", &gpu);
+        bsdr_app_set_gpu_encode(a, gpu != 0);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/model-import") == 0) {
         /* Import depth models from a zip that already exists on this machine (path given by the
@@ -563,25 +639,30 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         bsdr_app_set_internet_sharing(a, !bsdr_app_get_internet_sharing(a));
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/sniff") == 0) {
-        double want = 0, mitm = 0; char pw[128] = "";
+        double want = 0; char pw[128] = "";
         bsdr_json_get_double(body, "want", &want);
-        bsdr_json_get_double(body, "mitm", &mitm);
         bsdr_json_get_str(body, "password", pw, sizeof(pw));   /* transient; feeds `sudo -S` */
-        bsdr_app_set_sniff(a, want != 0, mitm != 0, pw[0] ? pw : NULL);
+        bsdr_app_set_sniff(a, want != 0, pw[0] ? pw : NULL);   /* capture method set via /api/sniffmethod */
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/sniffmethod") == 0) {
+        /* capture method: 0 = passive sniff, 1 = MITM (ARP), 2 = router relay */
+        double m = 0; bsdr_json_get_double(body, "method", &m);
+        bsdr_app_set_sniff_method(a, (int)m);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/relayport") == 0) {
         double port = 0; bsdr_json_get_double(body, "port", &port);
         bsdr_app_set_relay_port(a, (int)port);   /* router-companion relay port (Android's owner-mic path) */
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/voicefx") == 0) {
-        /* realtime owner-mic voice change: gender knob (-100..100) + substitute-to-cloud toggle */
-        double gender = 0, robot = 0, echo = 0, whisper = 0, substitute = 0;
+        /* realtime Quest-mic voice change: master on + gender (-100..100) + effects + substitute */
+        double on = 1, gender = 0, robot = 0, echo = 0, whisper = 0, substitute = 0;
+        bsdr_json_get_double(body, "on", &on);
         bsdr_json_get_double(body, "gender", &gender);
         bsdr_json_get_double(body, "robot", &robot);
         bsdr_json_get_double(body, "echo", &echo);
         bsdr_json_get_double(body, "whisper", &whisper);
         bsdr_json_get_double(body, "substitute", &substitute);
-        bsdr_app_set_voicefx(a, (int)gender, (int)robot, (int)echo, (int)whisper, substitute != 0);
+        bsdr_app_set_voicefx(a, on != 0, (int)gender, (int)robot, (int)echo, (int)whisper, substitute != 0);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/faceswap") == 0) {
         /* realtime face swap: enable + tier + source-image path (server-side) */
@@ -591,19 +672,32 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         bsdr_json_get_str(body, "source", src, sizeof(src));
         bsdr_app_set_faceswap(a, on != 0, (int)tier, src);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/faceswap-download") == 0) {
+        /* background-download the insightface models (buffalo_l + inswapper) into the faceswap dir.
+         * Progress is reported through status.faceswap.models.dl, polled by the UI. */
+        int rc = bsdr_faceswap_download_start();
+        respond(c, 200, "application/json", rc == 0 ? "{\"ok\":true}" : "{\"ok\":false}",
+                rc == 0 ? 11 : 12);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/faceswap-import") == 0) {
+        char zip[1024] = ""; bsdr_json_get_str(body, "path", zip, sizeof(zip));
+        int n = zip[0] ? bsdr_faceswap_import_zip(zip) : -1;
+        char out[48]; int ol = snprintf(out, sizeof(out), "{\"imported\":%d}", n);
+        respond(c, 200, "application/json", out, ol);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/windows") == 0) {
-        bsdr_window wins[64];
+        bsdr_window wins[64], mons[16];
 #ifdef BSDR_HAVE_CAPTURE
-        int n = bsdr_list_windows(getenv("DISPLAY"), wins, 64);
+        int n  = bsdr_list_windows(getenv("DISPLAY"), wins, 64);
+        int nm = bsdr_list_monitors(getenv("DISPLAY"), mons, 16);   /* single-screen "virtual desktops" */
 #else
-        int n = 0; (void)wins;
+        int n = 0, nm = 0; (void)wins; (void)mons;
 #endif
         /* Per entry: escaped title (each byte may double to 2, esc[] holds <=511) + the fixed
          * template + four ints (<=11 each). ~700 B/entry is a safe ceiling; size the buffer from
          * the real max instead of a fixed 320-per-entry that the old code also used (wrongly) as
          * each snprintf's size limit, which let a long window title overrun the heap. */
         if (n < 0) n = 0; else if (n > 64) n = 64;
-        size_t cap = 128 + (size_t)n * 700;
+        if (nm < 0) nm = 0; else if (nm > 16) nm = 16;
+        size_t cap = 128 + (size_t)(n + nm) * 700;
         char *j = malloc(cap);
         if (!j) { respond(c, 500, "application/json", "{\"error\":\"oom\"}", 15); return; }
         size_t o = 0;
@@ -614,18 +708,26 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
             if (w_ < 0) break; \
             o += ((size_t)w_ < cap - o) ? (size_t)w_ : (cap - o - 1); \
         } while (0)
+        #define WUI_ESC(SRC, DST) do { size_t e_ = 0; \
+            for (const char *s_ = (SRC); *s_ && e_ < sizeof(DST) - 2; s_++) { \
+                if (*s_ == '"' || *s_ == '\\') (DST)[e_++] = '\\'; \
+                if ((unsigned char)*s_ >= 0x20) (DST)[e_++] = *s_; } \
+            (DST)[e_] = 0; } while (0)
         WUI_APPEND("[{\"title\":\"Whole desktop\",\"x\":0,\"y\":0,\"w\":0,\"h\":0}");
+        /* one entry per monitor (a single screen = one "virtual desktop") */
+        for (int i = 0; i < nm; i++) {
+            char esc[512]; WUI_ESC(mons[i].title, esc);
+            WUI_APPEND(",{\"title\":\"Screen: %s\",\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}",
+                       esc, mons[i].x, mons[i].y, mons[i].w, mons[i].h);
+        }
+        /* then one entry per single window */
         for (int i = 0; i < n; i++) {
-            char esc[512]; size_t e = 0;
-            for (const char *s = wins[i].title; *s && e < sizeof(esc) - 2; s++) {
-                if (*s == '"' || *s == '\\') esc[e++] = '\\';
-                if ((unsigned char)*s >= 0x20) esc[e++] = *s;
-            }
-            esc[e] = 0;
+            char esc[512]; WUI_ESC(wins[i].title, esc);
             WUI_APPEND(",{\"title\":\"%s\",\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}",
                        esc, wins[i].x, wins[i].y, wins[i].w, wins[i].h);
         }
         WUI_APPEND("]");
+        #undef WUI_ESC
         #undef WUI_APPEND
         respond(c, 200, "application/json", j, o);
         free(j);

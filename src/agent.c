@@ -588,6 +588,8 @@ static void lan_live_main(agent_t *a) {
     cfg.cpu_only = user_cpu;
     cfg.use_vaapi = a->app && a->app->use_vaapi;
     cfg.use_kmsgrab = a->app && a->app->use_kmsgrab;
+    cfg.force_x11 = a->app && a->app->force_x11;              /* Wayland backend autodetect override */
+    cfg.force_pipewire = a->app && a->app->force_pipewire;
     /* 2D->3D SBS runs on the CPU NV12 frame, so it needs the CPU-scale path (no VAAPI/CUDA scale
      * and no zero-copy kmsgrab). Force CPU *scale* whenever 3D is enabled — but keep NVENC for the
      * ENCODE (it accepts a software NV12 frame and, unlike x264, the Quest decodes its stream without
@@ -683,6 +685,8 @@ static void lan_live_main(agent_t *a) {
     bsdr_thread *ithr = bsdr_thread_start(lan_input_main, &ictx);
     unsigned my_seek_gen = a->app->file_seek_gen;
     unsigned my_threed_gen = a->app->threed_gen;
+    unsigned my_enc_gen = a->app ? a->app->encoder_gen : 0;
+    int cur_cpu = user_cpu;   /* live encoder choice (web-UI CPU<->GPU toggle); user_cpu = the initial */
     if (cap) bsdr_capture_set_faceswap(cap, fs_engine);
     while (!a->stop) {
         if (cap) bsdr_capture_set_faceswap(cap, fs_engine);   /* re-attach across any reopen below */
@@ -692,11 +696,11 @@ static void lan_live_main(agent_t *a) {
             my_fs_gen = a->app->faceswap_gen;
             fs_engine = faceswap_reconcile(a, fs_engine);
             int fs_on = fs_engine != NULL, td = threed_on(a);
-            cfg.cpu_only = fs_on || td || user_cpu;
+            cfg.cpu_only = fs_on || td || cur_cpu;
             if (fs_on || td) { cfg.use_vaapi = 0; cfg.use_kmsgrab = 0; }
             else { cfg.use_vaapi = a->app->use_vaapi; cfg.use_kmsgrab = a->app->use_kmsgrab; }
             if (filemode) cfg.encoder = a->file_gpu ? NULL : "libx264";
-            else if (user_cpu) cfg.encoder = "libx264"; else cfg.encoder = NULL;
+            else if (cur_cpu) cfg.encoder = "libx264"; else cfg.encoder = NULL;
             threed_cfg(a, &cfg); if (!filemode) webcam_cfg(a, &cfg);
             bsdr_capture_close(cap); cap = bsdr_capture_open(&cfg);
             if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: reopen for faceswap change failed"); break; }
@@ -718,12 +722,12 @@ static void lan_live_main(agent_t *a) {
         if (a->app && a->app->threed_gen != my_threed_gen) {
             my_threed_gen = a->app->threed_gen;
             int on = threed_on(a);
-            cfg.cpu_only = on || user_cpu;
+            cfg.cpu_only = on || cur_cpu;
             if (on) { cfg.use_vaapi = 0; cfg.use_kmsgrab = 0; }
             else { cfg.use_vaapi = a->app->use_vaapi; cfg.use_kmsgrab = a->app->use_kmsgrab; }
             /* 3D keeps NVENC (Quest decodes it cleanly); only --cpu or file-default forces x264. */
             if (filemode) cfg.encoder = a->file_gpu ? NULL : "libx264";
-            else if (user_cpu) cfg.encoder = "libx264"; else cfg.encoder = NULL;
+            else if (cur_cpu) cfg.encoder = "libx264"; else cfg.encoder = NULL;
             threed_cfg(a, &cfg);
             if (!filemode) webcam_cfg(a, &cfg);   /* keep the webcam source across the 3D reopen */
             bsdr_capture_close(cap);
@@ -737,6 +741,28 @@ static void lan_live_main(agent_t *a) {
             tw = (uint16_t)((w+15)&~15); th = (uint16_t)((h+15)&~15);
             BSDR_INFO("bsdr.agent", "LAN 3D reconfig: mode=%s %dx%d (fresh keyframe)",
                       on ? "on" : "off", w, h);
+        }
+        /* Encoder CPU<->GPU toggled from the web UI: reopen the capture IN PLACE (like the 3D /
+         * bitrate reconfig) so the switch is seamless. Doing this here — instead of via a source_gen
+         * session restart — keeps the Quest input channel up and emits a fresh keyframe immediately,
+         * so the headset resyncs at once instead of freezing for seconds with no input. */
+        if (a->app && !filemode && a->app->encoder_gen != my_enc_gen) {
+            my_enc_gen = a->app->encoder_gen;
+            cur_cpu = a->app->cpu_only;
+            int td = threed_on(a), fs_on = (fs_engine != NULL);
+            cfg.cpu_only = cur_cpu || td || fs_on;
+            if (td || fs_on) { cfg.use_vaapi = 0; cfg.use_kmsgrab = 0; }
+            else { cfg.use_vaapi = a->app->use_vaapi; cfg.use_kmsgrab = a->app->use_kmsgrab; }
+            cfg.encoder = cur_cpu ? "libx264" : NULL;   /* NULL -> auto (nvenc, then x264 fallback) */
+            threed_cfg(a, &cfg); webcam_cfg(a, &cfg);
+            bsdr_capture_close(cap); cap = bsdr_capture_open(&cfg);
+            if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: reopen for encoder change failed"); break; }
+            if (a->overlay) bsdr_capture_set_overlay(cap, a->overlay);
+            bsdr_capture_set_faceswap(cap, fs_engine);
+            bsdr_capture_info(cap, &w, &h, &enc);
+            tw = (uint16_t)((w+15)&~15); th = (uint16_t)((h+15)&~15);
+            BSDR_INFO("bsdr.agent", "LAN encoder -> %s (in-place reopen, fresh keyframe)",
+                      cur_cpu ? "CPU/libx264" : "GPU/NVENC");
         }
         /* live re-config (desktop capture only): web UI window switch, or headset
          * bitrate/resolution (PUT /device). A file source has fixed dimensions. */
@@ -998,6 +1024,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
 
     bsdr_app app;
     bsdr_app_init(&app);
+    bsdr_app_load_settings(&app);   /* persisted encoder/bitrate prefs; CLI flags below still override */
     app.audio = a.audio;
     app.max_bitrate = opt->max_bitrate;   /* cap the Quest's bitrate (e.g. hold 1 Mbps when sharing) */
     if (opt->cloud_data)
@@ -1009,13 +1036,18 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     app.cloud_sticky_ports = opt->cloud_sticky_ports;
     if (opt->no_cloud_video) app.cloud_no_video = true;  /* default: video ON (trailer frags) */
     if (opt->video_decoupled) app.video_decoupled = true; /* default: coupled to the LAN encode */
-    if (opt->cpu_only) app.cpu_only = true;               /* default: try CUDA GPU pipeline */
+    /* Encoder: saved settings (loaded below) set the baseline; an explicit CLI flag still wins.
+     * --cpu forces libx264 (CPU scale), --gpu forces the CUDA/NVENC pipeline. */
+    if (opt->cpu_only)   app.cpu_only = true;
+    if (opt->gpu_encode) app.cpu_only = false;
     if (opt->threed_mode) bsdr_app_set_threed(&app, opt->threed_mode,
             opt->threed_deepness > 0 ? opt->threed_deepness : app.threed_deepness,
             opt->threed_convergence, opt->threed_swap,
             opt->threed_full, opt->threed_tier, opt->threed_ai_cmd);  /* --threed (half-SBS unless --threed-full) */
     if (opt->use_vaapi) app.use_vaapi = true;             /* --vaapi: encode on the iGPU */
     if (opt->use_kmsgrab) app.use_kmsgrab = true;         /* --kmsgrab: DRM/KMS capture */
+    if (opt->force_x11) app.force_x11 = true;             /* --x11: force x11grab */
+    if (opt->force_pipewire) app.force_pipewire = true;   /* --wayland/--pipewire: force the portal */
 #ifdef BSDR_HAVE_CAPTURE
     g_lan_video_reps = opt->lan_1x ? 1 : 2;               /* --lan-1x: halve the LAN uplink */
     g_lan_sendmmsg = opt->use_sendmmsg ? 1 : 0;           /* --sendmmsg: batch LAN fragment sends */
@@ -1107,17 +1139,24 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     /* Owner-mic sniffer: the Quest never sends its mic to us over the remote-desktop
      * protocol (proven from real captures) — the owner's voice only goes to the room's
      * mediasoup cloud, as plain Opus RTP. Intercept it off the LAN and feed a dedicated
-     * BSDR-Quest-OwnerMic. Needs the Quest IP: use --quest_ip, else the paired headset. */
+     * BSDR_QuestMic. Needs the Quest IP: use --quest_ip, else the paired headset. */
     bsdr_micsniff *sniffer = NULL;
     bool  want_sniff = false, want_mitm = false, have_pw = false;
+    int   cur_method = -1;                     /* method the running sniffer was started with */
     char  sniff_pw[128] = {0};
 #if !defined(BSDR_PLATFORM_ANDROID)
     bsdr_thread *mic_thr = NULL;               /* local-mic owner source */
     struct local_mic_ctx mic_ctx = { NULL, 0 };
     bsdr_micsub *micsub = NULL;                /* owner-mic cloud substitution (MITM/NFQUEUE) */
 #endif
-    /* CLI flags seed the desired state; the web UI can flip it live (with a sudo password). */
-    if (opt->sniff_mic) { want_sniff = true; want_mitm = opt->sniff_mitm; }
+    /* CLI flags seed the desired state; the web UI can flip it live (with a sudo password). The
+     * capture method (passive/MITM/relay) lives in the app so the web UI select drives it too. */
+    if (opt->sniff_mic) {
+        want_sniff = true;
+        int m = opt->sniff_remote_port > 0 ? 2 : (opt->sniff_mitm ? 1 : 0);
+        bsdr_app_set_sniff_method(&app, m);
+        want_mitm = (m == 1);
+    }
 
     /* Computer control: the voice pipeline is created lazily on first arm and kept for
      * the process lifetime (only balloon + PCM tap toggle), so session threads never see
@@ -1231,17 +1270,19 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
             }
         }
 
-        /* --- owner-mic sniffer reconcile (CLI + web UI drive `want_sniff`/`want_mitm`) --- */
+        /* --- Quest-mic sniffer reconcile (CLI + web UI drive want_sniff + the capture method) --- */
         {
-            bool w, m; char pw[128];
-            if (bsdr_app_take_sniff(&app, &w, &m, pw, sizeof pw)) {   /* web UI changed it */
-                want_sniff = w; want_mitm = m;
+            bool w; char pw[128];
+            if (bsdr_app_take_sniff(&app, &w, NULL, pw, sizeof pw)) {   /* web UI changed it */
+                want_sniff = w;
                 snprintf(sniff_pw, sizeof sniff_pw, "%s", pw);
                 have_pw = pw[0] != 0;
             }
-            bool mitm_changed = sniffer && (want_mitm != (bsdr_micsniff_is_mitm(sniffer)));
-            if (sniffer && (!want_sniff || mitm_changed)) {
-                bsdr_micsniff_stop(sniffer); sniffer = NULL;
+            int method = bsdr_app_get_sniff_method(&app);   /* 0 passive / 1 MITM / 2 relay */
+            want_mitm = (method == 1);
+            bool method_changed = sniffer && (method != cur_method);
+            if (sniffer && (!want_sniff || method_changed)) {
+                bsdr_micsniff_stop(sniffer); sniffer = NULL; cur_method = -1;
                 bsdr_app_set_sniff_status(&app, false, want_sniff ? "reconfiguring…" : "off");
             }
             if (want_sniff && !sniffer) {
@@ -1251,21 +1292,25 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                                if (a.remote_ip[0]) snprintf(sip, sizeof sip, "%s", a.remote_ip);
                                bsdr_mutex_unlock(a.lock); }
                 if (sip[0]) {
-                    int relay = bsdr_app_get_relay_port(&app);   /* web-UI relay port (Android's only path) */
-                    if (relay <= 0) relay = opt->sniff_remote_port;
+                    /* relay port only applies in relay mode; fall back to the CLI --sniff-remote port */
+                    int relay = 0;
+                    if (method == 2) { relay = bsdr_app_get_relay_port(&app);
+                                       if (relay <= 0) relay = opt->sniff_remote_port; }
                     bsdr_micsniff_cfg sc = { .quest_ip = sip, .iface = opt->sniff_iface,
                                              .gateway_ip = opt->sniff_gw, .mitm = want_mitm,
                                              .password = have_pw ? sniff_pw : NULL,
                                              .remote_port = relay };
                     sniffer = bsdr_micsniff_start(&sc);
                     memset(sniff_pw, 0, sizeof sniff_pw); have_pw = false;   /* one-shot */
-                    if (sniffer) bsdr_app_set_sniff_status(&app, true,
-                                     want_mitm ? "active (MITM)" : "active (passive)");
+                    if (sniffer) { cur_method = method;
+                                   bsdr_app_set_sniff_status(&app, true,
+                                       method == 2 ? "active (relay)" :
+                                       method == 1 ? "active (MITM)" : "active (passive)"); }
                     else { want_sniff = false;   /* don't hammer sudo every 200ms on failure */
                            bsdr_app_set_sniff_status(&app, false, "failed — check password / permissions"); }
                 }
             }
-            /* realtime voice change on the owner mic (gender + effects from the web UI) */
+            /* realtime voice change on the Quest mic (gender + effects from the web UI) */
             {
                 int vg=0, vr=0, ve=0, vw=0; bool vsub=false;
                 bsdr_app_get_voicefx(&app, &vg, &vr, &ve, &vw, &vsub);
@@ -1492,9 +1537,12 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--no-cloud-video") == 0) opt.no_cloud_video = true;
         else if (strcmp(argv[i], "--video-decoupled") == 0) opt.video_decoupled = true;
         else if (strcmp(argv[i], "--cpu") == 0) opt.cpu_only = true;
+        else if (strcmp(argv[i], "--gpu") == 0) opt.gpu_encode = true;
         else if (strcmp(argv[i], "--lan-1x") == 0) opt.lan_1x = true;
         else if (strcmp(argv[i], "--vaapi") == 0) opt.use_vaapi = true;
         else if (strcmp(argv[i], "--kmsgrab") == 0) opt.use_kmsgrab = true;
+        else if (strcmp(argv[i], "--x11") == 0) opt.force_x11 = true;
+        else if (strcmp(argv[i], "--wayland") == 0 || strcmp(argv[i], "--pipewire") == 0) opt.force_pipewire = true;
         else if (strcmp(argv[i], "--sendmmsg") == 0) opt.use_sendmmsg = true;
         else if (strcmp(argv[i], "--no-cloud-audio") == 0) opt.no_cloud_audio = true;
         else if (strcmp(argv[i], "--sniff-mic") == 0) opt.sniff_mic = true;
@@ -1557,8 +1605,8 @@ int main(int argc, char **argv) {
 "\n"
 "OWNER MIC (intercept the headset owner's voice)\n"
 "  --sniff-mic          Sniff the Quest's room mic (plain Opus RTP to the cloud, which\n"
-"                       it never sends us) and expose it as the BSDR-Quest-OwnerMic\n"
-"                       source — owner-only, distinct from the room-wide BSDR-Quest-Mic.\n"
+"                       it never sends us) and expose it as the BSDR_QuestMic\n"
+"                       virtual microphone (the headset owner's voice).\n"
 "                       Uses --quest_ip if set, else the paired headset. The privileged\n"
 "                       capture runs in a helper started via sudo (prompts on the terminal);\n"
 "                       can also be toggled live from the web panel. Also runnable as root.\n"
@@ -1606,8 +1654,13 @@ int main(int argc, char **argv) {
 "                           stays valid; this flag reverts to fresh ephemeral each time.\n"
 "\n"
 "PERFORMANCE\n"
-"  --cpu                    Force CPU scale/convert (default: try the CUDA GPU\n"
-"                           pipeline, hwupload+scale_cuda, and fall back to CPU).\n"
+"  --cpu                    Force CPU scale + libx264 encode. This is the DEFAULT on\n"
+"                           Linux: x264 keeps low-bitrate text sharper than NVENC (which\n"
+"                           lacks psychovisual RD). Also enables the overlay/faceswap path.\n"
+"  --gpu                    Opt into the CUDA/NVENC pipeline (hwupload+scale_cuda+nvenc)\n"
+"                           for GPU offload / high bitrate / game content. Default on\n"
+"                           Windows/macOS. Saved settings and this flag persist across\n"
+"                           restarts; an explicit --cpu/--gpu on the command line wins.\n"
 "  --lan-1x                 Send LAN video once instead of 2x — halves the uplink\n"
 "                           on a weak WiFi link (default: 2x, like the official host).\n"
 "  --vaapi                  Encode on the iGPU via VAAPI instead of NVENC (frees the\n"

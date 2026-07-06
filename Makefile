@@ -64,7 +64,7 @@ MEDIA_SRC_SCTP  := src/sctp.c
 # NB: threed.c is in CORE_SRC, not here — agent.c's main() calls bsdr_threed_mode_parse
 # unconditionally, so it must link in core-only builds too (the SBS transform it also
 # provides is only *applied* on the BSDR_HAVE_CAPTURE path).
-MEDIA_SRC_VIDEO := src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/fileaudio.c
+MEDIA_SRC_VIDEO := src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/fileaudio.c src/capture_pipewire.c
 MEDIA_SRC_AUDIO := src/audio.c src/micsniff.c src/micsniff_capture.c
 MEDIA_SRC_ALL   := $(MEDIA_SRC_SCTP) $(MEDIA_SRC_VIDEO) $(MEDIA_SRC_AUDIO)
 
@@ -251,8 +251,11 @@ $(BUILD)/%.o: src/%.c $(CONFIG_MK) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # vendored miniz (third-party): compile warning-free (-w), no bsdr includes needed.
+# _LARGEFILE64_SOURCE makes glibc define __USE_LARGEFILE64, so miniz takes its
+# fopen64/ftello64 large-file I/O path (miniz.h documents this) instead of the
+# fallback branch that emits a "may not support large files" #pragma message.
 $(BUILD)/miniz.o: third_party/miniz/miniz.c | $(BUILD)
-	$(CC) $(CFLAGS) -w -c $< -o $@
+	$(CC) $(CFLAGS) -D_LARGEFILE64_SOURCE=1 -w -c $< -o $@
 
 $(LIB): $(CORE_OBJ)
 	rm -f $@

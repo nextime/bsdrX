@@ -502,7 +502,7 @@ static void pactl_unload(int module) {
 
 /* Unload any leftover bsdr_* virtual devices from a previous run that didn't clean up (killed,
  * Ctrl-C force-quit, or crashed). PulseAudio keeps them loaded forever otherwise, so they pile up
- * and apps may latch a stale, dead BSDR-Quest-Mic. Self-healing: run this before (re)creating. */
+ * and apps may latch a stale, dead BSDR_QuestMic. Self-healing: run this before (re)creating. */
 static void pactl_unload_stale(void) {
     FILE *f = popen("pactl list short modules 2>/dev/null", "r");
     if (!f) return;
@@ -540,17 +540,18 @@ bool bsdr_audio_devices_create(bsdr_audio_devices *d) {
     if (system("pactl set-default-sink bsdr_speaker 2>/dev/null") != 0) { /* ok */ }
     snprintf(d->monitor_source, sizeof(d->monitor_source), "bsdr_speaker.monitor");
 
-    /* virtual mic: a null-sink we play the Quest mic into, exposed as a source */
+    /* Cloud room-audio sink: a null-sink the cloud path can decode the room mix into. We no longer
+     * expose it as a capturable "BSDR_QuestMic" source — that room-wide mic went unused and only
+     * duplicated the owner-mic sniffer's device (now the single "BSDR_QuestMic", see micsniff.c).
+     * The sink stays so cloud_mic_main still has a valid playback target (harmless if unheard). */
     d->mic_sink_module = pactl_load(
         "module-null-sink sink_name=bsdr_micsink "
-        "sink_properties=device.description=BSDR-Quest-MicSink");
+        "sink_properties=device.description=BSDR_QuestMicSink");
     snprintf(d->mic_sink, sizeof(d->mic_sink), "bsdr_micsink");
-    d->mic_source_module = pactl_load(
-        "module-remap-source master=bsdr_micsink.monitor source_name=bsdr_quest_mic "
-        "source_properties=device.description=BSDR-Quest-Mic");
+    d->mic_source_module = -1;   /* no room-mic source device */
 
     d->active = true;
-    BSDR_INFO("bsdr.audio", "virtual devices: capture %s, mic sink %s (apps see BSDR-Quest-Mic)",
+    BSDR_INFO("bsdr.audio", "virtual devices: capture %s, mic sink %s",
               d->monitor_source, d->mic_sink);
     return true;
 }

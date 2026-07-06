@@ -28,6 +28,7 @@ class AudioIO(private val projection: MediaProjection) {
     private val rate = 48000
     private var record: AudioRecord? = null
     private var track: AudioTrack? = null
+    private var roomTrack: AudioTrack? = null
     private var thread: Thread? = null
     @Volatile private var running = false
 
@@ -71,6 +72,23 @@ class AudioIO(private val projection: MediaProjection) {
 
         NativeBridge.micListener = { pcm, frames, _ -> track?.write(pcm, 0, frames) }
 
+        // room mic (other participants' voices from the cloud SFU): a SEPARATE track with
+        // USAGE_MEDIA so it's grabbable by AudioPlaybackCapture ("internal audio" recorders) —
+        // Android's closest thing to the desktop BSDR_RoomMic virtual mic (no user-space virtual
+        // input device exists). Distinct from the VOICE_COMMUNICATION mic-out above.
+        roomTrack = AudioTrack.Builder()
+            .setAudioAttributes(AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+            .setAudioFormat(AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(rate)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+            .setBufferSizeInBytes(maxOf(minOut, rate))
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build().also { it.play() }
+        NativeBridge.roomListener = { pcm, frames, _ -> roomTrack?.write(pcm, 0, frames) }
+
         record?.startRecording()
         thread = Thread({ captureLoop() }, "bsdr-audio").also { it.start() }
     }
@@ -89,10 +107,12 @@ class AudioIO(private val projection: MediaProjection) {
     fun stop() {
         running = false
         NativeBridge.micListener = null
+        NativeBridge.roomListener = null
         try { thread?.join(300) } catch (_: InterruptedException) {}
         try { record?.stop(); record?.release() } catch (e: Exception) { Log.w(TAG, "record stop", e) }
         try { track?.stop(); track?.release() } catch (e: Exception) { Log.w(TAG, "track stop", e) }
-        record = null; track = null
+        try { roomTrack?.stop(); roomTrack?.release() } catch (e: Exception) { Log.w(TAG, "roomTrack stop", e) }
+        record = null; track = null; roomTrack = null
     }
 
     companion object { private const val TAG = "bsdr.audio" }

@@ -66,4 +66,27 @@ typedef struct {
 } bsdr_model_dl;
 void bsdr_model_download_state(bsdr_model_dl *out);
 
+/* ---- face-swap models (insightface SCRFD + ArcFace + inswapper) ------------------------------
+ * Same shape as the depth store, but the face-swap engine needs THREE files, non-commercial, kept
+ * in <model cache>/faceswap: det_10g.onnx + w600k_r50.onnx (from the insightface buffalo_l pack)
+ * and inswapper_128.onnx. Downloaded from upstream mirrors on demand; unpinned (no sha), so a
+ * manual zip import stays the reliable path. */
+#define BSDR_FACESWAP_NFILES 3
+extern const char *const bsdr_faceswap_files[BSDR_FACESWAP_NFILES];  /* canonical filenames */
+
+/* <model cache>/faceswap (created if missing). Returns 0 on success. */
+int bsdr_faceswap_model_dir(char *out, size_t cap);
+/* 1 if `filename` (one of bsdr_faceswap_files) is present in the face-swap dir. */
+int bsdr_faceswap_file_present(const char *filename);
+/* 1 if all three face-swap models are present. */
+int bsdr_faceswap_models_ready(void);
+/* Kick off a BACKGROUND download of any missing face-swap models. Idempotent; one at a time.
+ * Returns 0 if started/already-complete, -1 if it couldn't start. Progress via _download_state. */
+int bsdr_faceswap_download_start(void);
+/* Snapshot of the face-swap download (separate from the depth one). */
+void bsdr_faceswap_download_state(bsdr_model_dl *out);
+/* Import any of the face-swap models found in a local zip (a buffalo_l pack and/or an inswapper zip)
+ * into the face-swap dir. Returns the number of files imported, or -1 on error. */
+int bsdr_faceswap_import_zip(const char *zip_path);
+
 #endif /* BSDR_MODEL_STORE_H */

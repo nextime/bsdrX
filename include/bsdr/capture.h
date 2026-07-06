@@ -37,6 +37,10 @@ typedef struct {
     int cpu_only;          /* --cpu: force CPU scale/convert (no CUDA filter graph) */
     int use_vaapi;         /* --vaapi: encode on the iGPU via VAAPI (frees the dGPU; AMD = radeonsi) */
     int use_kmsgrab;       /* --kmsgrab: capture via DRM/KMS instead of x11grab (zero-copy w/ --vaapi) */
+    /* Wayland: desktop capture backend selection (Linux). Default autodetect = try X11 (x11grab)
+     * first, fall back to the xdg-desktop-portal + PipeWire path on a Wayland session. */
+    int force_x11;         /* --x11: never use the Wayland portal (x11grab/kmsgrab only) */
+    int force_pipewire;    /* --wayland / --pipewire: always use the portal + PipeWire path */
     const char *input_file;/* non-NULL: decode this file instead of grabbing the screen (re-encodes
                             * so an overlay can be composited). Forces the CPU scale path. */
     int loop;              /* file mode: seek back to 0 at EOF */
@@ -72,7 +76,7 @@ struct bsdr_faceswap;
 void bsdr_capture_set_faceswap(bsdr_capture *c, struct bsdr_faceswap *fs);
 
 /* Decode an image file (jpg/png/…) to a freshly malloc'd packed-RGB buffer (caller frees). Sets
- * *w/*h. Returns 0 on success. Used to load the face-swap source image. */
+ * *w and *h. Returns 0 on success. Used to load the face-swap source image. */
 int bsdr_capture_decode_image_rgb(const char *path, uint8_t **rgb, int *w, int *h);
 
 /* Grab + encode one frame. On a produced access unit, sets *au (valid until the

@@ -57,4 +57,29 @@ int bsdr_list_windows(const char *display, bsdr_window *out, int max) {
     EnumWindows(enum_cb, (LPARAM)&c);
     return c.count;
 }
+
+/* Each connected monitor as a capture region (gdigrab crops to x/y/w/h). */
+struct mon_ctx { bsdr_window *out; int max, count; };
+static BOOL CALLBACK mon_cb(HMONITOR mon, HDC dc, LPRECT r, LPARAM lp) {
+    (void)dc; (void)r;
+    struct mon_ctx *c = (struct mon_ctx *)lp;
+    if (c->count >= c->max) return FALSE;
+    MONITORINFOEXA mi; mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoA(mon, (MONITORINFO *)&mi)) return TRUE;
+    bsdr_window *o = &c->out[c->count++];
+    o->id = 0;
+    o->x = mi.rcMonitor.left; o->y = mi.rcMonitor.top;
+    o->w = mi.rcMonitor.right - mi.rcMonitor.left;
+    o->h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    snprintf(o->title, sizeof o->title, "%s%s", mi.szDevice,
+             (mi.dwFlags & MONITORINFOF_PRIMARY) ? " (primary)" : "");
+    return TRUE;
+}
+int bsdr_list_monitors(const char *display, bsdr_window *out, int max) {
+    (void)display;
+    if (!out || max <= 0) return 0;
+    struct mon_ctx c = { out, max, 0 };
+    EnumDisplayMonitors(NULL, NULL, mon_cb, (LPARAM)&c);
+    return c.count;
+}
 #endif /* _WIN32 */

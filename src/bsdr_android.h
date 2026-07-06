@@ -74,6 +74,11 @@ void bsdr_android_push_audio(const int16_t *pcm, int frames, int channels);
  * bsdr_jni.c (calls the NativeBridge mic callback). */
 void bsdr_android_emit_mic(const int16_t *pcm, int frames, int channels);
 
+/* cloud_stream -> Kotlin: decoded ROOM voice (other participants) out to a dedicated MEDIA
+ * AudioTrack — audible and capturable by AudioPlaybackCapture (Android's answer to BSDR_RoomMic;
+ * no user-space virtual input device exists). Implemented in bsdr_jni.c. */
+void bsdr_android_emit_room(const int16_t *pcm, int frames, int channels);
+
 /* ---- input: inject_android -> Kotlin AccessibilityService -----------------*/
 typedef enum {
     BSDR_AINPUT_MOVE = 1,   /* a,b = cursor x,y px */
