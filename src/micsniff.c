@@ -91,7 +91,7 @@
 #elif defined(_WIN32)
 #define OWNER_SINK   BSDR_MIC_DEVICE_NAME  /* VB-CABLE, renamed "BSRD_Mic" by the installer */
 #else
-#define OWNER_SINK   "bsdr_ownersink"      /* PulseAudio null-sink we create */
+#define OWNER_SINK   "bsdr_micsink"         /* the persistent BSDR_QuestMic sink audio.c created */
 #endif
 #define OWNER_SOURCE "bsdr_quest_owner_mic"
 #define OWNER_DESC   "BSDR_QuestMic"   /* the single Quest mic device apps see (was -OwnerMic) */
@@ -326,6 +326,54 @@ static int  get_forwarding(void) { return proc_read("/proc/sys/net/ipv4/ip_forwa
 static void set_forwarding(int v){ proc_write("/proc/sys/net/ipv4/ip_forward", v); }
 static int  get_redirects(void) { return proc_read("/proc/sys/net/ipv4/conf/all/send_redirects"); }
 static void set_redirects(int v){ proc_write("/proc/sys/net/ipv4/conf/all/send_redirects", v); }
+/* iptables/nft live in /sbin:/usr/sbin, which may be absent from an inherited PATH — force it.
+ * Statement form (trailing ';') so it also prefixes shell loops, not just simple commands. */
+#define FW_PATH "PATH=/usr/sbin:/sbin:/usr/bin:/bin; "
+static int  have_cmd(const char *c) { char b[110]; snprintf(b, sizeof b, FW_PATH "command -v %s >/dev/null 2>&1", c); return system(b) == 0; }
+/* Open (add=1) or close (add=0) the forwarding path for the Quest so it keeps internet while we MITM:
+ *  - FORWARD ACCEPT so a DROP policy (Docker/ufw/firewalld) doesn't eat the relayed packets, and
+ *  - POSTROUTING MASQUERADE on the uplink so the Quest's forwarded packets leave with OUR source IP.
+ *    Without this, a Wi-Fi AP's IP-source-guard drops a frame from our MAC carrying the Quest's IP
+ *    (it looks spoofed), which silently kills the Quest's uplink -> "no internet". Masquerading makes
+ *    the traffic look like ours; conntrack routes the replies back to the Quest.
+ * IDEMPOTENT + NON-DESTRUCTIVE: our iptables rules are tagged with a unique comment, and we ONLY
+ * ever delete rules carrying that tag. So a crash that leaks our rules can't accumulate duplicates
+ * on relaunch (we drain our tagged copies first), and the user's own pre-existing FORWARD/NAT rules
+ * (which don't carry our tag) are never touched. nft/pf/WinNAT already use our own named container.
+ * Prefer iptables (its FORWARD ACCEPT is terminal, beating the DROP policy); fall back to nftables. */
+#define FW_TAG "-m comment --comment bsdrX-mitm"
+static void fw_forward(int add, const char *quest, const char *iface) {
+    char cmd[460];
+    const char *oif = (iface && iface[0]) ? iface : "";
+    if (have_cmd("iptables")) {
+        /* drain all stale OUR-tagged copies (loop -D until it fails), then insert one each if add */
+        snprintf(cmd, sizeof cmd, FW_PATH "while iptables -D FORWARD -s %s " FW_TAG " -j ACCEPT 2>/dev/null; do :; done", quest); if (system(cmd)) {}
+        snprintf(cmd, sizeof cmd, FW_PATH "while iptables -D FORWARD -d %s " FW_TAG " -j ACCEPT 2>/dev/null; do :; done", quest); if (system(cmd)) {}
+        if (oif[0]) snprintf(cmd, sizeof cmd, FW_PATH "while iptables -t nat -D POSTROUTING -s %s -o %s " FW_TAG " -j MASQUERADE 2>/dev/null; do :; done", quest, oif);
+        else        snprintf(cmd, sizeof cmd, FW_PATH "while iptables -t nat -D POSTROUTING -s %s " FW_TAG " -j MASQUERADE 2>/dev/null; do :; done", quest);
+        if (system(cmd)) {}
+        if (add) {
+            snprintf(cmd, sizeof cmd, FW_PATH "iptables -I FORWARD -s %s " FW_TAG " -j ACCEPT 2>/dev/null", quest); if (system(cmd)) {}
+            snprintf(cmd, sizeof cmd, FW_PATH "iptables -I FORWARD -d %s " FW_TAG " -j ACCEPT 2>/dev/null", quest); if (system(cmd)) {}
+            if (oif[0]) snprintf(cmd, sizeof cmd, FW_PATH "iptables -t nat -I POSTROUTING -s %s -o %s " FW_TAG " -j MASQUERADE 2>/dev/null", quest, oif);
+            else        snprintf(cmd, sizeof cmd, FW_PATH "iptables -t nat -I POSTROUTING -s %s " FW_TAG " -j MASQUERADE 2>/dev/null", quest);
+            if (system(cmd)) {}
+        }
+    } else if (have_cmd("nft")) {
+        /* our own table -> delete it first (clears any stale from a crash), then rebuild fresh */
+        if (system(FW_PATH "nft delete table inet bsdr_mitm 2>/dev/null")) {}
+        if (add) {
+            if (system(FW_PATH "nft add table inet bsdr_mitm 2>/dev/null")) {}
+            if (system(FW_PATH "nft 'add chain inet bsdr_mitm fwd { type filter hook forward priority -300 ; policy accept ; }' 2>/dev/null")) {}
+            if (system(FW_PATH "nft 'add chain inet bsdr_mitm post { type nat hook postrouting priority 100 ; }' 2>/dev/null")) {}
+            snprintf(cmd, sizeof cmd, FW_PATH "nft add rule inet bsdr_mitm fwd ip saddr %s accept 2>/dev/null", quest); if (system(cmd)) {}
+            snprintf(cmd, sizeof cmd, FW_PATH "nft add rule inet bsdr_mitm fwd ip daddr %s accept 2>/dev/null", quest); if (system(cmd)) {}
+            if (oif[0]) snprintf(cmd, sizeof cmd, FW_PATH "nft add rule inet bsdr_mitm post ip saddr %s oifname \"%s\" masquerade 2>/dev/null", quest, oif);
+            else        snprintf(cmd, sizeof cmd, FW_PATH "nft add rule inet bsdr_mitm post ip saddr %s masquerade 2>/dev/null", quest);
+            if (system(cmd)) {}
+        }
+    }
+}
 #elif defined(__APPLE__)
 static int sysctl_get(const char *n){ int v=0; size_t l=sizeof v; return sysctlbyname(n,&v,&l,NULL,0)==0?v:-1; }
 static void sysctl_set(const char *n,int v){ (void)sysctlbyname(n,NULL,NULL,&v,sizeof v); }
@@ -333,6 +381,27 @@ static int  get_forwarding(void){ return sysctl_get("net.inet.ip.forwarding"); }
 static void set_forwarding(int v){ sysctl_set("net.inet.ip.forwarding", v); }
 static int  get_redirects(void){ return sysctl_get("net.inet.ip.redirect"); }
 static void set_redirects(int v){ sysctl_set("net.inet.ip.redirect", v); }
+/* macOS: NAT the Quest's uplink via pf so a Wi-Fi AP's source-guard doesn't drop our forwarded
+ * frames (same reason as the Linux MASQUERADE). Load the rule into a com.apple sub-anchor, which
+ * /etc/pf.conf already references by default (its nat-anchor line globs com.apple), so we don't
+ * disturb the user's rules; then enable pf if macOS shipped it disabled (remembering so we can
+ * restore on teardown). pf passes by default, so no FORWARD-accept / rp_filter dance is needed. */
+static int g_pf_we_enabled = 0;
+static void fw_forward(int add, const char *quest, const char *iface) {
+    const char *oif = (iface && iface[0]) ? iface : "en0";
+    char cmd[512];
+    if (add) {
+        snprintf(cmd, sizeof cmd,
+                 "printf 'nat on %s from %s to any -> (%s)\\n' | /sbin/pfctl -a com.apple/bsdr_mitm -f - 2>/dev/null",
+                 oif, quest, oif);
+        if (system(cmd)) {}
+        if (system("/sbin/pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'") != 0)
+            { if (system("/sbin/pfctl -e 2>/dev/null") == 0) g_pf_we_enabled = 1; }
+    } else {
+        if (system("/sbin/pfctl -a com.apple/bsdr_mitm -F all 2>/dev/null")) {}
+        if (g_pf_we_enabled) { if (system("/sbin/pfctl -d 2>/dev/null")) {} g_pf_we_enabled = 0; }
+    }
+}
 #endif
 
 /* ---- helper (root): capture pump + optional MITM ---- */
@@ -361,7 +430,7 @@ int bsdr_micsniff_helper_main(int argc, char **argv) {
     if (!cap) { fprintf(stderr, "micsniff-helper: %s\n", err); uint8_t st = 1; (void)!write(c, &st, 1); close(c); return 3; }
 
     uint32_t quest_be = inet_addr(quest);
-    int ifidx = -1, ip_fwd_was = -1, redir_was = -1;
+    int ifidx = -1, ip_fwd_was = -1, redir_was = -1, rp_all_was = -1, rp_if_was = -1;
     uint8_t our_mac[6], quest_mac[6], gw_mac[6]; uint32_t our_ip = 0, gw_be = 0;
     int have_qmac = 0, have_gmac = 0, have_mine = 0;
     if (mitm && gw) {
@@ -371,6 +440,16 @@ int bsdr_micsniff_helper_main(int argc, char **argv) {
         have_gmac = (resolve_mac(gw_be, gw_mac) == 0);
         ip_fwd_was = get_forwarding(); redir_was = get_redirects();
         set_forwarding(1); set_redirects(0);
+        /* Keep the Quest online while we sit in the path: MASQUERADE/NAT its uplink so a Wi-Fi AP's
+         * source-guard doesn't drop our forwarded frames (Linux: also open a DROP FORWARD policy). */
+        fw_forward(1, quest, iface);
+#if defined(__linux__)
+        /* Linux only: strict reverse-path filtering also drops the asymmetric MITM'd forwards. */
+        rp_all_was = proc_read("/proc/sys/net/ipv4/conf/all/rp_filter");
+        proc_write("/proc/sys/net/ipv4/conf/all/rp_filter", 0);
+        if (iface && iface[0]) { char p[160]; snprintf(p, sizeof p, "/proc/sys/net/ipv4/conf/%s/rp_filter", iface);
+                                 rp_if_was = proc_read(p); proc_write(p, 0); }
+#endif
         if (!have_mine || !have_qmac || !have_gmac)
             fprintf(stderr, "micsniff-helper: MITM degraded (mine=%d qmac=%d gmac=%d)\n", have_mine, have_qmac, have_gmac);
     }
@@ -385,8 +464,11 @@ int bsdr_micsniff_helper_main(int argc, char **argv) {
             uint64_t now = bsdr_now_ms();
             if (now - last_arp >= 1000) {           /* ~1 s ARP cadence */
                 uint8_t f[42];
+                /* Poison ONLY the Quest (tell it the gateway is at our MAC) so its uplink transits us.
+                 * We deliberately do NOT poison the gateway: the uplink is MASQUERADEd to our IP, so
+                 * the replies come back to us via conntrack and we forward them on — no need to hijack
+                 * the Quest's downlink, which keeps the gateway's ARP clean and the setup less fragile. */
                 if (have_qmac) { build_arp(f, ARPOP_REPLY, our_mac, gw_be, quest_mac, quest_be); mc_cap_inject(cap, f, 42); }
-                if (have_gmac) { build_arp(f, ARPOP_REPLY, our_mac, quest_be, gw_mac, gw_be); mc_cap_inject(cap, f, 42); }
                 last_arp = now;
             }
         }
@@ -398,14 +480,24 @@ int bsdr_micsniff_helper_main(int argc, char **argv) {
         if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) break;
     }
 
-    if (mitm && have_mine && have_qmac && have_gmac)   /* heal both caches */
+    if (mitm && have_mine && have_qmac && have_gmac)   /* heal the Quest's cache (only it was poisoned) */
         for (int i = 0; i < 3; i++) {
             uint8_t f[42];
             build_arp(f, ARPOP_REPLY, gw_mac, gw_be, quest_mac, quest_be); mc_cap_inject(cap, f, 42);
-            build_arp(f, ARPOP_REPLY, quest_mac, quest_be, gw_mac, gw_be); mc_cap_inject(cap, f, 42);
             bsdr_sleep_ms(150);
         }
-    if (mitm) { if (ip_fwd_was >= 0) set_forwarding(ip_fwd_was); if (redir_was >= 0) set_redirects(redir_was); }
+    if (mitm) {
+        if (ip_fwd_was >= 0) set_forwarding(ip_fwd_was);
+        if (redir_was >= 0) set_redirects(redir_was);
+        fw_forward(0, quest, iface);   /* remove NAT (+ Linux FORWARD ACCEPT / nft table) */
+#if defined(__linux__)
+        if (rp_all_was >= 0) proc_write("/proc/sys/net/ipv4/conf/all/rp_filter", rp_all_was);
+        if (rp_if_was >= 0 && iface && iface[0]) {
+            char p[160]; snprintf(p, sizeof p, "/proc/sys/net/ipv4/conf/%s/rp_filter", iface);
+            proc_write(p, rp_if_was);
+        }
+#endif
+    }
     mc_cap_close(cap);
     close(c);
     return 0;
@@ -644,6 +736,22 @@ static void win_forward_restore(struct bsdr_micsniff *s) {
     s->w_router_handle = s->w_router_ovl = NULL; s->w_router_on = 0;
 }
 
+/* NAT the Quest's forwarded uplink to our address (WinNAT, Windows 10+) so a Wi-Fi AP's source-guard
+ * doesn't drop a frame from our MAC carrying the Quest's IP — the same "no internet" failure fixed on
+ * Linux with MASQUERADE and on macOS with pf. EnableRouter only routes; it doesn't rewrite the source.
+ * Best-effort via PowerShell; needs the WinNAT service. */
+static void win_nat_enable(struct bsdr_micsniff *s) {
+    char cmd[320];
+    if (system("powershell -NoProfile -Command \"Remove-NetNat -Name bsdr_mitm -Confirm:$false -ErrorAction SilentlyContinue\" >NUL 2>&1")) {}
+    snprintf(cmd, sizeof cmd,
+        "powershell -NoProfile -Command \"New-NetNat -Name bsdr_mitm -InternalIPInterfaceAddressPrefix %s/32 -ErrorAction SilentlyContinue\" >NUL 2>&1",
+        s->quest_ip);
+    if (system(cmd)) {}
+}
+static void win_nat_disable(void) {
+    if (system("powershell -NoProfile -Command \"Remove-NetNat -Name bsdr_mitm -Confirm:$false -ErrorAction SilentlyContinue\" >NUL 2>&1")) {}
+}
+
 static void sniff_main(void *arg) {
     struct bsdr_micsniff *s = (struct bsdr_micsniff *)arg;
     BSDR_INFO("bsdr.micsniff", "%s-sniffing Quest %s room mic (Npcap) -> %s",
@@ -657,8 +765,8 @@ static void sniff_main(void *arg) {
                 if (!s->w_have_qmac) s->w_have_qmac = (win_resolve_mac(s->quest_be, s->w_our_ip, s->w_quest_mac) == 0);
                 if (!s->w_have_gmac) s->w_have_gmac = (win_resolve_mac(s->w_gw_be,  s->w_our_ip, s->w_gw_mac)    == 0);
                 uint8_t f[42];
+                /* poison ONLY the Quest (its uplink transits us); NAT handles the return path */
                 if (s->w_have_qmac) { build_arp(f, BSDR_ARP_REPLY, s->w_our_mac, s->w_gw_be, s->w_quest_mac, s->quest_be); mc_cap_inject(s->cap, f, 42); }
-                if (s->w_have_gmac) { build_arp(f, BSDR_ARP_REPLY, s->w_our_mac, s->quest_be, s->w_gw_mac, s->w_gw_be); mc_cap_inject(s->cap, f, 42); }
                 s->w_last_arp = now;
             }
         }
@@ -675,11 +783,10 @@ static void sniff_main(void *arg) {
         captured++;
         handle_ip(s, buf, n);
     }
-    if (s->mitm && s->w_have_mine && s->w_have_qmac && s->w_have_gmac)   /* heal both caches */
+    if (s->mitm && s->w_have_mine && s->w_have_qmac && s->w_have_gmac)   /* heal the Quest's cache */
         for (int i = 0; i < 3; i++) {
             uint8_t f[42];
             build_arp(f, BSDR_ARP_REPLY, s->w_gw_mac, s->w_gw_be, s->w_quest_mac, s->quest_be); mc_cap_inject(s->cap, f, 42);
-            build_arp(f, BSDR_ARP_REPLY, s->w_quest_mac, s->quest_be, s->w_gw_mac, s->w_gw_be); mc_cap_inject(s->cap, f, 42);
             bsdr_sleep_ms(150);
         }
     BSDR_INFO("bsdr.micsniff", "owner-mic sniffer stopped (%ld frames decoded)", s->decoded);
@@ -708,6 +815,7 @@ static int start_capture(struct bsdr_micsniff *s, const char *password) {
             BSDR_ERROR("bsdr.micsniff", "MITM: EnableRouter failed (run as Administrator) — passive only");
             s->mitm = 0;
         } else {
+            win_nat_enable(s);   /* SNAT the Quest's uplink to our IP (Wi-Fi source-guard) */
             s->w_have_qmac = (win_resolve_mac(s->quest_be, s->w_our_ip, s->w_quest_mac) == 0);
             s->w_have_gmac = (win_resolve_mac(s->w_gw_be,  s->w_our_ip, s->w_gw_mac)    == 0);
             struct in_addr ga; ga.s_addr = s->w_gw_be;
@@ -720,6 +828,7 @@ static int start_capture(struct bsdr_micsniff *s, const char *password) {
     return 0;
 }
 static void stop_capture(struct bsdr_micsniff *s) {
+    win_nat_disable();
     win_forward_restore(s);
     if (s->cap) { mc_cap_close(s->cap); s->cap = NULL; }
 }
@@ -784,10 +893,20 @@ bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) {
     if (s->remote_port <= 0 && !s->iface[0]) {
         BSDR_ERROR("bsdr.micsniff", "no capture interface (pass --sniff-iface)"); free(s); return NULL; }
 
+#if defined(__APPLE__) || defined(_WIN32)
+    /* mac/win: the installed loopback (BlackHole / VB-CABLE) IS the mic apps record from. */
     if (!bsdr_virtual_mic_create(OWNER_SINK, OWNER_SOURCE, OWNER_DESC, &s->sink_mod, &s->src_mod)) goto fail;
+#else
+    /* Linux: the persistent BSDR_QuestMic (audio.c's bsdr_micsink remap-source) is the device — we
+     * just play the decoded voice into that sink, so the mic stays one always-visible device. */
+    s->sink_mod = s->src_mod = -1;
+#endif
     s->player = bsdr_audio_player_new(OWNER_SINK, 1);
+    if (!s->player)   /* the sink comes up with a streaming session; the voice still feeds compctl */
+        BSDR_WARN("bsdr.micsniff", "virtual-mic sink '%s' not up (no active session?); "
+                  "owner voice will still drive computer-control", OWNER_SINK);
     int err = 0; s->dec = opus_decoder_create(48000, 1, &err);
-    if (!s->player || err != OPUS_OK || !s->dec) { BSDR_ERROR("bsdr.micsniff", "player/decoder init failed"); goto fail; }
+    if (err != OPUS_OK || !s->dec) { BSDR_ERROR("bsdr.micsniff", "decoder init failed"); goto fail; }
 
     if (start_capture(s, cfg->password) != 0) goto fail;
     s->thr = bsdr_thread_start(sniff_main, s);

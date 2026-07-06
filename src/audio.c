@@ -186,6 +186,7 @@ struct bsdr_audio_recv {
     uint64_t tick;     /* monotonic counter for LRU eviction */
     volatile int duck; /* voice-activity duck: mix ONLY the loudest stream, mute the rest (owner
                         * isolation while a voice command is captured over the cloud fallback). */
+    int cloud_trailer; /* strip the 8-byte BigSoup trailer [u32 ssrc][u32 frame_id] before decode */
     bsdr_mic_stream streams[BSDR_MIC_STREAMS];
     int16_t pcm[BSDR_OPUS_FRAME * 2];   /* one mixed 20 ms frame (interleaved) */
 };
@@ -245,6 +246,7 @@ int bsdr_audio_recv_feed(bsdr_audio_recv *r, uint8_t *pkt, int len) {
     }
     if (len <= hdr) return 0;
     int plen = len - hdr;
+    if (r->cloud_trailer && plen > 8) plen -= 8;   /* drop the 8-byte [ssrc][frame_id] cloud trailer */
     if (plen > (int)sizeof(r->streams[0].jb[0].data)) return 0;
     uint16_t seq  = (uint16_t)((pkt[2] << 8) | pkt[3]);
     uint32_t ssrc = ((uint32_t)pkt[8] << 24) | ((uint32_t)pkt[9] << 16) |
@@ -345,6 +347,9 @@ int bsdr_audio_recv_playout(bsdr_audio_recv *r) {
 
 void bsdr_audio_recv_set_duck(bsdr_audio_recv *r, int on) {
     if (r) r->duck = on ? 1 : 0;
+}
+void bsdr_audio_recv_enable_cloud_trailer(bsdr_audio_recv *r) {
+    if (r) r->cloud_trailer = 1;
 }
 
 void bsdr_audio_recv_free(bsdr_audio_recv *r) {
@@ -540,18 +545,20 @@ bool bsdr_audio_devices_create(bsdr_audio_devices *d) {
     if (system("pactl set-default-sink bsdr_speaker 2>/dev/null") != 0) { /* ok */ }
     snprintf(d->monitor_source, sizeof(d->monitor_source), "bsdr_speaker.monitor");
 
-    /* Cloud room-audio sink: a null-sink the cloud path can decode the room mix into. We no longer
-     * expose it as a capturable "BSDR_QuestMic" source — that room-wide mic went unused and only
-     * duplicated the owner-mic sniffer's device (now the single "BSDR_QuestMic", see micsniff.c).
-     * The sink stays so cloud_mic_main still has a valid playback target (harmless if unheard). */
+    /* The single Quest mic. A null-sink (bsdr_micsink) that the owner-mic sniffer plays the decoded
+     * headset voice into, exposed as a capture source apps record as "BSDR_QuestMic". Created with
+     * the session so the device stays visible/selectable the whole time (it's silent until the owner
+     * mic is started); the cloud room-audio path can also feed the same sink. */
     d->mic_sink_module = pactl_load(
         "module-null-sink sink_name=bsdr_micsink "
         "sink_properties=device.description=BSDR_QuestMicSink");
     snprintf(d->mic_sink, sizeof(d->mic_sink), "bsdr_micsink");
-    d->mic_source_module = -1;   /* no room-mic source device */
+    d->mic_source_module = pactl_load(
+        "module-remap-source master=bsdr_micsink.monitor source_name=bsdr_quest_mic "
+        "source_properties=device.description=BSDR_QuestMic");
 
     d->active = true;
-    BSDR_INFO("bsdr.audio", "virtual devices: capture %s, mic sink %s",
+    BSDR_INFO("bsdr.audio", "virtual devices: capture %s, mic %s (apps see BSDR_QuestMic)",
               d->monitor_source, d->mic_sink);
     return true;
 }

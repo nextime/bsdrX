@@ -516,54 +516,7 @@ static void cloud_audio_send_main(void *arg) {
     bsdr_audio_sender_free(tx); bsdr_pa_close(cap);
     BSDR_INFO("bsdr.cloud", "audio-out stopped");
 }
-/* relay -> virtual mic. PLAIN RTP (pt 100): incoming room mic audio (the Quest /
- * other users), decoded and played into the BSRD virtual mic. */
-struct mic_cb_ctx { bsdr_audio_player *play; bsdr_app *app; };
-static void mic_pcm_cb(const int16_t *pcm, int frames, int channels, void *user) {
-    struct mic_cb_ctx *c = (struct mic_cb_ctx *)user;
-    (void)channels;
-    bsdr_audio_player_push(c->play, pcm, frames);
-    /* NB: the computer-control cloud fallback (room_pcm_cb) is now fed by cloud_roommic_main from
-     * the SFU's micPort (the actual room voice) — NOT from here (audio_port = the screen's own
-     * audio). This thread only keeps the legacy screen-audio-into-micsink playback. */
-}
-static void cloud_mic_main(void *arg) {
-    struct cloud_audio_shared *sh = (struct cloud_audio_shared *)arg;
-    bsdr_audio_player *play = bsdr_audio_player_new(sh->dev->mic_sink, BSDR_AUDIO_CHANNELS);
-    struct mic_cb_ctx ctx = { play, sh->cs->app };
-    bsdr_audio_recv *rx = bsdr_audio_recv_new(NULL /*plain*/, BSDR_AUDIO_PT_DEFAULT, BSDR_AUDIO_SSRC,
-                                              BSDR_AUDIO_CHANNELS, mic_pcm_cb, &ctx);
-    if (!play || !rx) {
-        if (play) bsdr_audio_player_free(play);
-        if (rx) bsdr_audio_recv_free(rx);
-        return;
-    }
-    uint8_t buf[2048];
-    uint64_t next_play = bsdr_now_ms();   /* 20 ms playout clock for the jitter buffer */
-    while (!sh->cs->stop) {
-        /* Arm the voice-activity duck only while a command is captured over the cloud fallback. */
-        bsdr_app *app = sh->cs->app;
-        bsdr_audio_recv_set_duck(rx, (app && app->cloud_mic_fallback && app->cloud_mic_duck) ? 1 : 0);
-        int n = bsdr_udp_recv(sh->udp, buf, sizeof(buf), 5);   /* short timeout so playout stays on time */
-        if (n > 0) bsdr_audio_recv_feed(rx, buf, n);
-        uint64_t now = bsdr_now_ms();
-        while ((int64_t)(now - next_play) >= 0) {
-            bsdr_audio_recv_playout(rx);
-            next_play += 20;
-        }
-    }
-    bsdr_audio_recv_free(rx); bsdr_audio_player_free(play);
-}
-/* ---- Room mic: the Bigscreen room's VOICE mix (other participants), consumed from the SFU's
- * micPort. This is the actual room audio the cloud sends us — the remote-desktop relay does NOT
- * carry it, and the owner's own voice comes from the LAN sniffer (BSDR_QuestMic). Wire format
- * reversed in bsandroid/bsa_media.c: plain RTP, payload = [Opus][u32 ssrc LE][u32 frame_id LE]
- * (8-byte trailer), each packet sent twice (dedupe by frame_id), Opus MONO @ 48 kHz. mediasoup
- * PlainTransport = comedia, so we punch a receive-only port open with an empty RTCP RR and refresh
- * it on each ~1 s recv timeout. Feeds (a) the computer-control voice pipeline (room_pcm_cb — the
- * WiFi fallback when sniff/MITM/relay aren't available) and (b) an optional "BSDR_RoomMic" virtual
- * microphone when the user enables Room mic. */
-/* Per-platform sink the decoded room voice is rendered into (apps then record it as BSDR_RoomMic).
+/* Per-platform sink the decoded ROOM audio is rendered into (apps then record it as BSDR_RoomMic).
  * Mirrors micsniff's OWNER_SINK: a dedicated PulseAudio null-sink on Linux; the installed loopback
  * device (VB-CABLE / BlackHole) on Windows / macOS. */
 #if defined(__APPLE__)
@@ -573,100 +526,67 @@ static void cloud_mic_main(void *arg) {
 #else
 #  define ROOM_SINK "bsdr_roomsink"
 #endif
-static int cloud_rtp_payload(const uint8_t *b, int n, const uint8_t **pl, size_t *pll) {
-    if (n < 12 || (b[0] >> 6) != 2) return -1;
-    int pt = b[1] & 0x7f; if (pt >= 72 && pt <= 76) return -1;      /* RTCP (rtcp-mux) — ignore */
-    size_t h = 12 + 4 * (b[0] & 0x0f);
-    if (b[0] & 0x10) { if ((size_t)n < h + 4) return -1;            /* RFC 3550 §5.3.1 extension */
-        size_t ew = ((size_t)b[h + 2] << 8) | b[h + 3]; h += 4 + 4 * ew; }
-    if ((size_t)n <= h) return -1;
-    *pl = b + h; *pll = (size_t)n - h; return 0;
-}
-static void cloud_roommic_main(void *arg) {
-    bsdr_cloud_stream *cs = (bsdr_cloud_stream *)arg;
-    const uint8_t rr[8] = { 0x80, 201, 0x00, 0x01, 0, 0, 0, 0 };   /* empty RTCP Receiver Report */
-    bsdr_udp udp; int have_udp = 0;
-    OpusDecoder *dec = NULL;
-    uint32_t a_ssrc = 0, last_fid = 0; int have = 0;
-    uint8_t buf[2048]; int16_t pcm[5760];
+/* Room mic: the Bigscreen ROOM audio (other participants) the SFU sends back to us on the SAME audio
+ * port we send the desktop audio on — no separate join/consume, no micPort. Decoded (jitter buffer +
+ * per-participant SSRC mixing) and redirected to the BSDR_RoomMic virtual mic + the computer-control
+ * cloud fallback (room_pcm_cb). The payload carries the 8-byte [ssrc][frame_id] trailer, so the recv
+ * strips it before Opus. */
+struct mic_cb_ctx { bsdr_audio_player *play; bsdr_app *app; };
+static void mic_pcm_cb(const int16_t *pcm, int frames, int channels, void *user) {
+    struct mic_cb_ctx *c = (struct mic_cb_ctx *)user;
+    (void)channels;
 #if !defined(BSDR_PLATFORM_ANDROID)
-    /* Desktop: expose the room voice as a real input device via a platform loopback
-     * (PulseAudio null-sink / VB-CABLE / BlackHole). Android has no virtual input device, so it
-     * plays the room voice to a dedicated MEDIA AudioTrack instead (below) — audible and grabbable
-     * by AudioPlaybackCapture "internal audio" recorders. Either way it also feeds computer control. */
+    if (c->play) bsdr_audio_player_push(c->play, pcm, frames);            /* -> BSDR_RoomMic device */
+#else
+    if (c->app && c->app->room_mic_want) bsdr_android_emit_room(pcm, frames, channels);
+#endif
+    if (c->app && c->app->cloud_mic_fallback && c->app->room_pcm_cb)      /* computer-control fallback */
+        c->app->room_pcm_cb(c->app->room_pcm_user, pcm, frames, channels);
+}
+static void cloud_mic_main(void *arg) {
+    struct cloud_audio_shared *sh = (struct cloud_audio_shared *)arg;
+    bsdr_cloud_stream *cs = sh->cs;
+    struct mic_cb_ctx ctx = { NULL, cs->app };
+    bsdr_audio_recv *rx = bsdr_audio_recv_new(NULL /*plain*/, BSDR_AUDIO_PT_DEFAULT, BSDR_AUDIO_SSRC,
+                                              BSDR_AUDIO_CHANNELS, mic_pcm_cb, &ctx);
+    if (!rx) return;
+    bsdr_audio_recv_enable_cloud_trailer(rx);   /* room audio carries the 8-byte [ssrc][frame_id] trailer */
+#if !defined(BSDR_PLATFORM_ANDROID)
     bsdr_audio_player *play = NULL; int rm_sink = -1, rm_src = -1, dev_up = 0;
 #endif
+    uint8_t buf[2048];
+    uint64_t next_play = bsdr_now_ms();   /* 20 ms playout clock for the jitter buffer */
     while (!cs->stop) {
         int want_dev = cs->app && cs->app->room_mic_want;
-        int wanted = cs->app && (cs->app->room_mic_want || cs->app->cloud_mic_fallback);
-        /* Lazily obtain the mic peer only when the room mic (or the compctl cloud fallback) is
-         * wanted — the room-join registers us as a participant, so we don't do it unconditionally.
-         * Prefer a micPort already on the /rooms screen; otherwise POST /room/{id}/join for it. */
-        if (wanted && !have_udp) {
-            char mic_ip[64] = ""; int mic_port = 0;
-            if (cs->scr.mic_port > 0) { snprintf(mic_ip, sizeof mic_ip, "%s", cs->scr.media_ip); mic_port = cs->scr.mic_port; }
-            else if (cs->scr.room_id[0]) {
-                char tok[2048]; bsdr_app_get_access_token(cs->app, tok, sizeof tok);
-                bsdr_cloud_screen ms;
-                if (tok[0] && bsdr_cloud_join_room(tok, cs->scr.room_id, &ms) && ms.mic_port > 0) {
-                    snprintf(mic_ip, sizeof mic_ip, "%s", ms.mic_media_ip[0] ? ms.mic_media_ip : ms.media_ip);
-                    mic_port = ms.mic_port;
-                }
-            }
-            if (mic_port <= 0) { bsdr_sleep_ms(3000); continue; }   /* nothing to consume yet — retry */
-            /* source port kept out of the sticky video/audio/data tuple ([3] array) */
-            uint16_t msrc = (cs->app->cloud_src_port > 0) ? (uint16_t)(cs->app->cloud_src_port + 3) : 0;
-            if (!bsdr_udp_open(&udp, msrc, mic_ip, (uint16_t)mic_port)) {
-                BSDR_WARN("bsdr.cloud", "room mic: udp -> %s:%d failed", mic_ip, mic_port);
-                bsdr_sleep_ms(3000); continue;
-            }
-            int oerr = 0; dec = opus_decoder_create(48000, 1, &oerr);
-            if (oerr != OPUS_OK || !dec) { BSDR_WARN("bsdr.cloud", "room mic: opus decoder failed");
-                                           bsdr_udp_close(&udp); bsdr_sleep_ms(3000); continue; }
-            bsdr_udp_send(&udp, rr, sizeof rr);                         /* comedia punch */
-            have_udp = 1;
-            BSDR_INFO("bsdr.cloud", "room mic: consuming %s:%d (plain RTP, Opus mono)", mic_ip, mic_port);
-        }
-        if (!have_udp) { bsdr_sleep_ms(200); continue; }   /* not wanted yet — idle */
 #if !defined(BSDR_PLATFORM_ANDROID)
-        /* live-toggle the BSDR_RoomMic virtual device from the web UI */
+        /* live-toggle the BSDR_RoomMic device from the web UI (the audio port stays consumed either
+         * way — for the compctl fallback — but only rendered to the device when Room mic is on) */
         if (want_dev && !dev_up) {
-            if (bsdr_virtual_mic_create(ROOM_SINK, "bsdr_room_mic", "BSDR_RoomMic", &rm_sink, &rm_src)) {
-                play = bsdr_audio_player_new(ROOM_SINK, 1); dev_up = 1;
-                BSDR_INFO("bsdr.cloud", "room mic: BSDR_RoomMic virtual device up");
-            } else dev_up = 1;   /* platform routes to a shared cable/no-op — don't retry every loop */
+            if (bsdr_virtual_mic_create(ROOM_SINK, "bsdr_room_mic", "BSDR_RoomMic", &rm_sink, &rm_src))
+                play = bsdr_audio_player_new(ROOM_SINK, BSDR_AUDIO_CHANNELS);
+            dev_up = 1;
+            BSDR_INFO("bsdr.cloud", "room mic: BSDR_RoomMic up (consuming the room audio port %d)", cs->scr.audio_port);
         } else if (!want_dev && dev_up) {
             if (play) { bsdr_audio_player_free(play); play = NULL; }
             bsdr_virtual_mic_destroy(rm_sink, rm_src); rm_sink = rm_src = -1; dev_up = 0;
         }
+        ctx.play = play;
 #endif
-        int n = bsdr_udp_recv(&udp, buf, sizeof buf, 1000);
-        if (n <= 0) { bsdr_udp_send(&udp, rr, sizeof rr); continue; }   /* timeout doubles as punch refresh */
-        const uint8_t *pl; size_t pll;
-        if (cloud_rtp_payload(buf, n, &pl, &pll) != 0 || pll <= 8) continue;
-        const uint8_t *tr = pl + (pll - 8);
-        uint32_t ssrc = (uint32_t)tr[0] | ((uint32_t)tr[1] << 8) | ((uint32_t)tr[2] << 16) | ((uint32_t)tr[3] << 24);
-        uint32_t fid  = (uint32_t)tr[4] | ((uint32_t)tr[5] << 8) | ((uint32_t)tr[6] << 16) | ((uint32_t)tr[7] << 24);
-        if (!have || ssrc != a_ssrc) { a_ssrc = ssrc; last_fid = fid; have = 1; }   /* track active sender */
-        else if (fid == last_fid) continue;                                          /* dup (sent 2×) */
-        else last_fid = fid;
-        int frames = opus_decode(dec, pl, (opus_int32)(pll - 8), pcm, 5760, 0);
-        if (frames <= 0) continue;
-#if !defined(BSDR_PLATFORM_ANDROID)
-        if (play) bsdr_audio_player_push(play, pcm, frames);
-#else
-        if (want_dev) bsdr_android_emit_room(pcm, frames, 1);   /* -> capturable MEDIA AudioTrack */
-#endif
-        if (cs->app && cs->app->cloud_mic_fallback && cs->app->room_pcm_cb)
-            cs->app->room_pcm_cb(cs->app->room_pcm_user, pcm, frames, 1);   /* compctl voice pipeline */
+        /* Arm the voice-activity duck only while a command is captured over the cloud fallback. */
+        bsdr_audio_recv_set_duck(rx, (cs->app && cs->app->cloud_mic_fallback && cs->app->cloud_mic_duck) ? 1 : 0);
+        int n = bsdr_udp_recv(sh->udp, buf, sizeof(buf), 5);   /* short timeout so playout stays on time */
+        if (n > 0) bsdr_audio_recv_feed(rx, buf, n);
+        uint64_t now = bsdr_now_ms();
+        while ((int64_t)(now - next_play) >= 0) {
+            bsdr_audio_recv_playout(rx);
+            next_play += 20;
+        }
     }
 #if !defined(BSDR_PLATFORM_ANDROID)
     if (play) bsdr_audio_player_free(play);
     if (dev_up) bsdr_virtual_mic_destroy(rm_sink, rm_src);
 #endif
-    if (dec) opus_decoder_destroy(dec);
-    if (have_udp) bsdr_udp_close(&udp);
-    BSDR_INFO("bsdr.cloud", "room mic stopped");
+    bsdr_audio_recv_free(rx);
 }
 /* audio channel owner: plain RTP, comedia latch, then send + mic threads. */
 static void cloud_audio_main(void *arg) {
@@ -692,13 +612,11 @@ static void cloud_audio_main(void *arg) {
     strcpy(dev.mic_sink, "bsdr_micsink");
     struct cloud_audio_shared sh = { cs, &udp, &dev };
     bsdr_thread *st = bsdr_thread_start(cloud_audio_send_main, &sh);
+    /* the receive side of this same audio socket IS the room audio -> BSDR_RoomMic + compctl fallback */
     bsdr_thread *mt = bsdr_thread_start(cloud_mic_main, &sh);
-    /* room voice (other participants) on the SFU's micPort -> BSDR_RoomMic + compctl fallback */
-    bsdr_thread *rmt = bsdr_thread_start(cloud_roommic_main, cs);
     while (!cs->stop) bsdr_sleep_ms(100);
     if (st) bsdr_thread_join(st);
     if (mt) bsdr_thread_join(mt);
-    if (rmt) bsdr_thread_join(rmt);
     bsdr_udp_close(&udp);
 }
 #endif /* BSDR_HAVE_AUDIO */

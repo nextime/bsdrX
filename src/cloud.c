@@ -371,6 +371,54 @@ bool bsdr_cloud_join_room(const char *access_token, const char *room_id, bsdr_cl
     return false;
 }
 
+bool bsdr_cloud_get_room(const char *access_token, const char *room_id, bsdr_cloud_screen *out) {
+    memset(out, 0, sizeof(*out));
+    if (!room_id || !room_id[0]) return false;
+    /* GET /room/{id} with the FULL room id, URL-encoded (only ':' needs escaping in a Bigscreen id).
+     * This mirrors bsandroid's cloud.getRoom(enc(roomId)). */
+    char enc[192]; size_t eo = 0;
+    for (const char *p = room_id; *p && eo < sizeof enc - 4; p++) {
+        if (*p == ':') { enc[eo++] = '%'; enc[eo++] = '3'; enc[eo++] = 'A'; }
+        else enc[eo++] = *p;
+    }
+    enc[eo] = 0;
+    char req[4096];
+    snprintf(req, sizeof(req),
+        "GET /room/%s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Authorization: Bearer %s\r\n"
+        "x-access-token: %s\r\n"
+        "Accept: application/json\r\n"
+        "Connection: close\r\n\r\n",
+        enc, BSDR_CLOUD_API2_HOST, bsdr_cloud_api_key(), access_token);
+    static char resp[131072];
+    int n = https_request(BSDR_CLOUD_API2_HOST, req, resp, sizeof(resp));
+    if (n < 0) { BSDR_WARN("bsdr.cloud", "GET /room: connection failed"); return false; }
+    int code = status_code(resp);
+    out->http_status = code;
+    const char *body = strstr(resp, "\r\n\r\n");
+    if (code / 100 != 2 || !body) { BSDR_WARN("bsdr.cloud", "GET /room -> HTTP %d", code); return false; }
+    body += 4;
+    BSDR_INFO("bsdr.cloud", "GET /room body (%d B): %.4000s", (int)strlen(body), body);
+    /* The room-voice micPort is on OUR peer: scan from "localUser" so the flat key-search grabs that
+     * mediaPeer's ipAddress + micPort (the screen peer earlier in the body has no micPort). */
+    const char *scan = strstr(body, "\"localUser\"");
+    if (!scan) scan = body;
+    double v;
+    if (bsdr_json_get_str(scan, "ipAddress", out->media_ip, sizeof(out->media_ip)) &&
+        bsdr_json_get_double(scan, "micPort", &v) && (int)v > 0) {
+        out->mic_port = (int)v;
+        if (bsdr_json_get_double(scan, "audioPort", &v)) out->audio_port = (int)v;
+        if (bsdr_json_get_double(scan, "dataPort",  &v)) out->data_port  = (int)v;
+        bsdr_json_get_str(scan, "userSessionId", out->session_id, sizeof(out->session_id));
+        out->found = true;
+        BSDR_INFO("bsdr.cloud", "GET /room: mic peer %s mic=%d", out->media_ip, out->mic_port);
+        return true;
+    }
+    BSDR_WARN("bsdr.cloud", "GET /room: no localUser micPort");
+    return false;
+}
+
 /* ---- WS presence ---- */
 #include "bsdr/platform.h"
 struct bsdr_cloud_ws { SSL_CTX *ctx; BIO *bio; bsdr_thread *thr; volatile int stop; };

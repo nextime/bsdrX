@@ -62,8 +62,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #ifndef _WIN32
 #  include <sys/uio.h>     /* struct iovec for --sendmmsg batching */
+#endif
+#if defined(__linux__) && !defined(BSDR_PLATFORM_ANDROID)
+#  include <sys/resource.h>   /* setpriority: raise scheduler priority for the encode path */
 #endif
 
 typedef struct {
@@ -1002,9 +1006,25 @@ void bsdr_agent_options_default(bsdr_agent_options *o) {
 #endif
 }
 
+/* Ask the scheduler to favour us: the capture -> H.264 encode -> send loop is latency-sensitive, so a
+ * negative nice keeps it responsive under desktop load. Best-effort — a negative nice needs
+ * CAP_SYS_NICE (or root); without it the kernel refuses and we just stay at the default, no error. */
+static void raise_priority(void) {
+#if defined(__linux__) && !defined(BSDR_PLATFORM_ANDROID)
+    errno = 0;
+    if (setpriority(PRIO_PROCESS, 0, -10) == 0)
+        BSDR_INFO("bsdr.agent", "process priority raised (nice -10) for the encode/send path");
+    else
+        BSDR_DEBUG("bsdr.agent", "could not raise priority (%s); grant CAP_SYS_NICE "
+                   "(setcap cap_sys_nice+ep build/bsdr_agent) or run niced for smoother encode",
+                   strerror(errno));
+#endif
+}
+
 int bsdr_agent_run(const bsdr_agent_options *opt) {
     g_running = 1;
     BSDR_INFO("bsdr.agent", "bsdrX %s starting (Bigscreen Remote Desktop host)", BSDR_VERSION);
+    raise_priority();
     agent_t a;
     memset(&a, 0, sizeof(a));
     a.video           = opt->video;

@@ -80,6 +80,13 @@ bool bsdr_cloud_get_rooms(const char *access_token, bsdr_cloud_screen *out);
  * 2xx with a usable mic peer. NB: this registers as a room participant — call only when needed. */
 bool bsdr_cloud_join_room(const char *access_token, const char *room_id, bsdr_cloud_screen *out);
 
+/* GET {cloudApiServerUrl}/room/{id} -> the full room state. The room-voice `micPort` lives on the
+ * caller's OWN peer here (localUser.mediaPeer), not on the shared-screen peer /rooms returns — so
+ * this is how bsdrX resolves the room mic (bsandroid does the same: join is best-effort, then
+ * GET /room/{id}). Fills out->media_ip + out->mic_port from the localUser peer. Returns true on a
+ * 2xx that yields a usable mic peer. */
+bool bsdr_cloud_get_room(const char *access_token, const char *room_id, bsdr_cloud_screen *out);
+
 /* WS presence connection (so this host shows online and a Quest can add a screen).
  * Opens wss://main-shark-cloud/<base64(JSON{accessToken,systemInfo})> and keeps it
  * alive on a background thread until closed. */

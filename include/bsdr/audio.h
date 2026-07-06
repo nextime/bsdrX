@@ -66,6 +66,9 @@ int bsdr_audio_recv_playout(bsdr_audio_recv *r);
 /* Voice-activity duck: when on, playout mixes ONLY the loudest active stream and mutes the rest
  * (owner isolation while a voice command is captured over the cloud room-audio fallback). */
 void bsdr_audio_recv_set_duck(bsdr_audio_recv *r, int on);
+/* Strip the 8-byte BigSoup cloud trailer ([u32 ssrc][u32 frame_id]) before Opus decode — the room
+ * audio the SFU sends back on the audio port carries it (as the sender appends). */
+void bsdr_audio_recv_enable_cloud_trailer(bsdr_audio_recv *r);
 void bsdr_audio_recv_free(bsdr_audio_recv *r);
 
 /* --- PulseAudio I/O (libpulse simple) -------------------------------------*/

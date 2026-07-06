@@ -119,6 +119,9 @@ void bsdr_app_init(bsdr_app *a) {
     a->lock = bsdr_mutex_new();
     snprintf(a->source, sizeof(a->source), "desktop");
     a->file_volume = 100;   /* media bar default */
+#if defined(__ANDROID__)
+    a->sniff_method = 2;    /* Android has no local packet capture — only the router relay works */
+#endif
     a->threed_deepness = 35; a->threed_convergence = 0;   /* comfortable defaults when 3D is enabled */
     a->threed_full = 0;      /* default: light half-SBS (full-res is ~4x the load; opt-in) */
     a->voice_fx_on = true;   /* voice changer master enable (sliders still default to 0 = no effect) */
@@ -896,6 +899,9 @@ void bsdr_app_set_sniff(bsdr_app *a, bool want, const char *password) {
 void bsdr_app_set_sniff_method(bsdr_app *a, int method) {
     bsdr_mutex_lock(a->lock);
     if (method < 0 || method > 2) method = 0;
+#if defined(__ANDROID__)
+    method = 2;   /* Android can't sniff or MITM locally — force the router relay */
+#endif
     a->sniff_method = method;
     a->sniff_mitm = (method == 1);
     a->sniff_dirty = true;

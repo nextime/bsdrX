@@ -146,24 +146,49 @@ static const char PAGE[] =
 
 "<div class=card><h2>Headset mic</h2>"
 "<div id=sniff class=status>...</div>"
+#if defined(__ANDROID__)
+"<div class=hint>The Quest never sends its mic to this device — the headset owner's voice only goes to "
+"the Bigscreen room (cloud). A <b>router companion</b> (<b>bsdr_micrelay</b>) on your router intercepts "
+"that stream and forwards it here (<b>Relay</b>), where it's exposed as a virtual microphone "
+"<b>BSDR_QuestMic</b>. Set the relay port below.</div>"
+#else
 "<div class=hint>The Quest never sends its mic to this PC — the headset owner's voice only goes to the "
 "Bigscreen room (cloud). This intercepts that stream off the LAN and exposes it as a virtual "
 "microphone <b>BSDR_QuestMic</b>. <b>Sniff</b> (passive) needs this PC to see the headset's traffic "
 "(be the gateway or a mirror port); <b>MITM</b> ARP-reroutes it through this PC on a switched LAN; "
 "<b>Relay</b> takes the mic from a router companion. Sniff/MITM need the root password (used once "
 "for a helper, never stored).</div>"
+#endif
 "<div class=row><label style=width:auto;color:var(--muted)>Method</label>"
 "<select id=snmethod onchange=snMethodChange() style=width:auto>"
-"<option value=0>Sniff (passive)</option><option value=1>MITM (ARP)</option><option value=2>Relay (router)</option></select></div>"
+#if !defined(__ANDROID__)
+/* Sniff & MITM both need local packet capture — impossible on Android (no CAP_NET_RAW, and Wi-Fi
+ * managed mode can't see another station); Android's owner mic is relay-only. */
+"<option value=0>Sniff (passive)</option>"
+"<option value=1>MITM (ARP)</option>"
+#endif
+"<option value=2>Relay (router)</option></select></div>"
 "<div class=row id=relayrow style=display:none><label style=width:auto;color:var(--muted)>Router relay port</label>"
 "<input id=relayport type=number min=0 max=65535 placeholder='e.g. 45099 (bsdr_micrelay)' onchange=relayPortSet() style=width:12em>"
 "<span class=hint style=margin-left:8px>the router companion forwards the mic here — <b>required on Android</b> (no local sniff)</span></div>"
-"<div class=row><input id=snpw type=password class=grow placeholder='root (sudo) password — only if not already root'>"
+"<div class=row>"
+#if !defined(__ANDROID__)
+/* sniff/MITM run a root helper; Android is relay-only (no capture) so it needs no password */
+"<input id=snpw type=password class=grow placeholder='root (sudo) password — only if not already root'>"
+#endif
 "<button id=snbtn class=p onclick=toggleSniff()>Start mic</button></div>"
-"<div class=hint><b>On Wi-Fi</b>, MITM can't work (the AP isolates stations). Run the "
-"<b>router companion</b> <b>bsdr_micrelay</b> on your router — it captures the headset's uplink "
-"there and forwards it here (<b>Relay</b> method, or start bsdrX with <code>--sniff-remote PORT</code>). "
-"Prebuilt binaries for common routers are in <b>bsdrX_relay.zip</b>; see bsdr_micrelay(1).</div>"
+#if defined(__ANDROID__)
+"<div class=hint>Run the <b>router companion</b> <b>bsdr_micrelay</b> on your router — it captures the "
+"headset's uplink there and forwards it here (set the <b>Relay</b> port above). Prebuilt binaries for "
+"common routers are in <b>bsdrX_relay.zip</b>; see bsdr_micrelay(1).</div>"
+#else
+"<div class=hint><b>On Wi-Fi</b>, MITM works <i>unless</i> the AP enforces <b>client isolation</b> "
+"(a.k.a. AP/station isolation) — bsdrX NATs the headset's uplink so the AP's source-guard doesn't "
+"drop it. If isolation is on, clients can't reach each other and neither MITM nor Sniff can see the "
+"headset; run the <b>router companion</b> <b>bsdr_micrelay</b> on your router instead (<b>Relay</b> "
+"method, or start bsdrX with <code>--sniff-remote PORT</code>). Prebuilt binaries for common routers "
+"are in <b>bsdrX_relay.zip</b>; see bsdr_micrelay(1).</div>"
+#endif
 /* realtime voice changer on the Quest mic */
 "<div class=sub2><div class=t>Voice changer <span class=badge>realtime</span>"
 "<label style='margin-left:auto;width:auto;font-weight:400'><input id=vfxon type=checkbox style=width:auto onchange=voicefx()> enable</label></div>"
@@ -184,8 +209,13 @@ static const char PAGE[] =
 "<b>Robot</b> = ring-mod timbre; <b>Echo</b> = trailing echo; <b>Whisper</b> = breathy. Applies to the "
 "Quest mic everywhere (virtual mic, computer-control, cloud).</div>"
 "<div class=row><label style=width:auto><input id=vsub type=checkbox style=width:auto onchange=voicefx()> "
+#if defined(__ANDROID__)
+"Substitute into the cloud (relay): stop the headset&#8217;s original voice and inject the changed audio</label></div>"
+"<div class=hint>Requires <b>Relay</b> active (we rewrite the headset&#8594;cloud packets in "
+#else
 "Substitute into the cloud (MITM/relay): stop the headset&#8217;s original voice and inject the changed audio</label></div>"
 "<div class=hint>Requires <b>MITM</b> or <b>Relay</b> active (we rewrite the headset&#8594;cloud packets in "
+#endif
 "flight via NFQUEUE) and the agent running with <b>root / CAP_NET_ADMIN</b> on Linux. Otherwise the change "
 "is still heard on the local virtual mic and the cloud-room fallback.</div></div>"
 /* Room mic: the OTHER participants' voices, consumed from the cloud room's SFU (micPort). Distinct
@@ -197,16 +227,16 @@ static const char PAGE[] =
 "<div class=hint>Pulls the <b>other people's voices</b> from your Bigscreen room out of the cloud "
 "(the room's mediasoup mic mix) and exposes them as a virtual microphone <b>BSDR_RoomMic</b> — record "
 "the room into OBS, a call, etc. This is the room voice, separate from <b>BSDR_QuestMic</b> (your own "
-"voice off the LAN). It also powers <b>computer control</b> when sniff/MITM/relay aren&#8217;t available. "
+"voice off the LAN). It also powers <b>computer control</b> when the <b>BSDR_QuestMic</b> isn&#8217;t available. "
 "Requires <b>Internet sharing</b> on (that&#8217;s the cloud connection that carries the room). Linux "
 "exposes a dedicated device; on Windows/macOS it routes into VB-CABLE/BlackHole.</div></div></div>"
 
 "<div class=card><h2>Source</h2>"
 "<div class=row>"
-"<label><input type=radio name=src value=desktop onclick=src('desktop') style=width:auto> Desktop</label> "
-"<label><input type=radio name=src value=file onclick=src('file') style=width:auto> Video file</label> "
-"<label><input type=radio name=src value=webcam onclick=src('webcam') style=width:auto> Webcam</label> "
-"<label><input type=radio name=src value=webcam3d onclick=src('webcam3d') style=width:auto> Stereo 3D (2 cams)</label></div>"
+"<label><input type=radio name=src value=desktop onclick=pickSrc('desktop') style=width:auto> Desktop</label> "
+"<label><input type=radio name=src value=file onclick=pickSrc('file') style=width:auto> Video file</label> "
+"<label><input type=radio name=src value=webcam onclick=pickSrc('webcam') style=width:auto> Webcam</label> "
+"<label><input type=radio name=src value=webcam3d onclick=pickSrc('webcam3d') style=width:auto> Stereo 3D (2 cams)</label></div>"
 "<div class=row id=winrow><label style=width:auto;color:var(--muted)>Capture</label>"
 "<select id=win class=grow onchange=selWin()></select>"
 "<button onclick=loadWindows() title='Rescan windows/screens' style=width:auto>&#8635;</button></div>"
@@ -330,14 +360,14 @@ static const char PAGE[] =
 "<div id=ccstatus class=status style=margin-bottom:8px>...</div>"
 "<div class=hint>Turns the in-VR voice-command <b>balloon</b> on. Drag it anywhere over the "
 "desktop; a click starts a listen-until-silence capture, then the LLM drives the desktop "
-"(type text, key combos, click, scroll, launch apps). Requires the <b>Quest mic</b> (sniff / MITM / "
-"relay) running — the only source of your voice — and an LLM endpoint set above.</div>"
+"(type text, key combos, click, scroll, launch apps). Requires the <b>Quest mic</b> running "
+"— the only source of your voice — and an LLM endpoint set above.</div>"
 "<div class=row><label style=width:auto><input id=ccvis type=checkbox style=width:auto onchange=setVision()> "
 "Vision (let the model take a desktop screenshot when a request needs it)</label></div>"
 "<div class=row><label style=width:auto><input id=ownmiclocal type=checkbox style=width:auto onchange=ownMicLocalToggle()> "
-"Use <b>this computer's microphone</b> as the Quest mic (no headset sniff/MITM/relay needed).</label></div>"
+"Use <b>this computer's microphone</b> as the Quest mic (no headset mic capture needed).</label></div>"
 "<div class=row><label style=width:auto><input id=cloudmic type=checkbox style=width:auto onchange=cloudmicToggle()> "
-"Quest mic via cloud room when the LAN sniffer/companion isn't available (WiFi). Isolates the owner "
+"Quest mic via cloud room when the LAN sniffer/companion isn't available (e.g. Wi-Fi client isolation). Isolates the owner "
 "(loudest speaker) only while a command is spoken.</label></div>"
 "<div class=row><button id=ccbtn class=p onclick=toggleCompctl()>Enable computer control</button></div></div>"
 "</div>"
@@ -379,7 +409,7 @@ static const char PAGE[] =
 "function srcRows(m){let cam=(m==='webcam'||m==='webcam3d');"
 "winrow.style.display=(m==='desktop')?'flex':'none';winhint.style.display=(m==='desktop')?'block':'none';filerow.style.display=(m==='file')?'flex':'none';"
 "camrow.style.display=cam?'flex':'none';camrowR.style.display=(m==='webcam3d')?'flex':'none';camhint.style.display=cam?'block':'none';}"
-"function src(m){camMode=m;srcRows(m);"
+"function pickSrc(m){camMode=m;srcRows(m);"
 "if(m==='webcam'||m==='webcam3d'){loadCams().then(pickCam);}else{api('/api/source',{mode:m,path:path.value});}}"
 "async function loadCams(){let r=await api('/api/webcams');cams=(r&&r.cams)||[];renderCams();}"
 "function camCtl(id,cur){if(cams.length){return '<select id='+id+' class=grow onchange=pickCam()>'+cams.map(function(c){return '<option value=\"'+c.id+'\"'+(c.id===cur?' selected':'')+'>'+c.name+'</option>'}).join('')+'</select>';}"
@@ -413,7 +443,11 @@ static const char PAGE[] =
 "function togglePause(){api('/api/pause',{toggle:true})}"
 "function disconnect(){api('/api/disconnect',{})}"
 "function toggleShare(){api('/api/share',{toggle:true})}"
+#if defined(__ANDROID__)
+"function toggleSniff(){let on=snbtn.dataset.on==='1';api('/api/sniff',{want:on?0:1,password:''})}"
+#else
 "function toggleSniff(){let on=snbtn.dataset.on==='1';api('/api/sniff',{want:on?0:1,password:snpw.value}).then(()=>{snpw.value=''})}"
+#endif
 "function snMethodChange(){relayrow.style.display=(+snmethod.value===2)?'flex':'none';api('/api/sniffmethod',{method:+snmethod.value})}"
 "function voicefx(){api('/api/voicefx',{on:vfxon.checked?1:0,gender:+vgender.value,robot:+vrobot.value,echo:+vecho.value,whisper:+vwhisper.value,substitute:vsub.checked?1:0})}"
 "function relayPortSet(){api('/api/relayport',{port:+relayport.value})}"
@@ -512,6 +546,7 @@ static void respond(bsdr_socket_t c, int code, const char *ctype, const char *bo
     char hdr[256];
     int n = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 %d OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+        "Cache-Control: no-store\r\n"   /* never cache the panel/API — a stale page kept old JS around */
         "Connection: close\r\n\r\n", code, ctype, blen);
     if (n < 0) return;
     size_t hn = (size_t)n < sizeof(hdr) ? (size_t)n : sizeof(hdr) - 1;  /* clamp truncation */
