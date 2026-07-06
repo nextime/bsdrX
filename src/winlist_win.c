@@ -22,6 +22,7 @@
 #include "bsdr/winlist.h"
 #include <windows.h>
 #include <string.h>
+#include <stdio.h>
 
 struct enum_ctx { bsdr_window *out; int max; int count; };
 

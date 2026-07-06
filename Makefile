@@ -158,7 +158,7 @@ OSX_BUILD  ?= build-osx          # per-arch override so x86_64/arm64 don't clobb
 # ffmpeg avfoundation/videotoolbox desktop capture. Derived from the canonical
 # groups: the shared video+audio units + the macOS CoreAudio backend. sctp.c is
 # supplied separately via SCTP_SRC in the osxcross recipe, so it's excluded here.
-OSX_MEDIA_SRC  := $(MEDIA_SRC_VIDEO) $(MEDIA_SRC_AUDIO) src/audio_coreaudio.c src/macos_compat.c
+OSX_MEDIA_SRC  := $(MEDIA_SRC_VIDEO) $(MEDIA_SRC_AUDIO) src/audio_coreaudio.c src/macos_compat.c src/webcam_macos.m
 OSX_MEDIA_DEF  := -DBSDR_ENABLE_SCTP=1 -DBSDR_ENABLE_VIDEO=1 -DBSDR_HAVE_CAPTURE=1 -DBSDR_ENABLE_AUDIO=1 -DBSDR_HAVE_AUDIO=1 -DBSDR_HAVE_PCAP=1
 # ffmpeg (avdevice/avfilter/avformat/avcodec/swscale/swresample/avutil) drives the
 # avfoundation grab + h264_videotoolbox encode; the frameworks below are what those
@@ -191,7 +191,8 @@ CORE_SRC := src/log.c src/net.c src/json.c src/input_decode.c \
             src/depth_onnx.c src/model_store.c src/webcam.c src/voicefx.c src/faceswap.c src/micsub.c \
             $(INJECT_SRC) $(WINLIST_SRC) $(SCTP_SRC) $(MEDIA_SRC)
 # miniz (vendored, third_party) backs model_store.c's zip import; built in every config.
-CORE_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(CORE_SRC)) $(BUILD)/miniz.o
+# Map both .c and .m (macOS AVFoundation shims) sources to objects.
+CORE_OBJ := $(patsubst src/%.m,$(BUILD)/%.o,$(patsubst src/%.c,$(BUILD)/%.o,$(CORE_SRC))) $(BUILD)/miniz.o
 
 LIB   := $(BUILD)/libbsdr_core.a
 AGENT := $(BUILD)/bsdr_agent$(EXEEXT)
@@ -250,6 +251,11 @@ $(BUILD):
 $(BUILD)/%.o: src/%.c $(CONFIG_MK) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Obj-C (.m) units — macOS only (webcam_macos.m). clang selects the Obj-C frontend by extension;
+# the AVFoundation/Foundation frameworks it needs are already in OSX_MEDIA_LIBS.
+$(BUILD)/%.o: src/%.m $(CONFIG_MK) | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # vendored miniz (third-party): compile warning-free (-w), no bsdr includes needed.
 # _LARGEFILE64_SOURCE makes glibc define __USE_LARGEFILE64, so miniz takes its
 # fopen64/ftello64 large-file I/O path (miniz.h documents this) instead of the
@@ -301,10 +307,15 @@ windows: windows-media
 # Derived from the canonical groups (sctp carried in-list; windows-media passes
 # SCTP_SRC= empty) + the Windows WASAPI virtual-mic backend.
 WIN_MEDIA_SRC := $(MEDIA_SRC_ALL) src/audio_wasapi.c
+# Owner-mic cloud SUBSTITUTION on Windows: WinDivert (rewrites the forwarded Quest->cloud voice while
+# we're the MITM). Enabled when WIN_DEPS carries the WinDivert SDK (windivert.h + WinDivert.lib); the
+# WinDivert.dll + WinDivert64.sys ship in the bundle. Absent -> micsub.c compiles its no-op stub.
+WIN_WINDIVERT_DEF  = $(if $(wildcard $(WIN_DEPS)/include/windivert.h),-DBSDR_HAVE_WINDIVERT=1,)
+WIN_WINDIVERT_LIBS = $(if $(wildcard $(WIN_DEPS)/include/windivert.h),-lWinDivert,)
 WIN_MEDIA_DEF := -DBSDR_ENABLE_SCTP=1 -DBSDR_ENABLE_VIDEO=1 -DBSDR_HAVE_CAPTURE=1 \
-                 -DBSDR_ENABLE_AUDIO=1 -DBSDR_HAVE_AUDIO=1 -DBSDR_HAVE_PCAP=1
+                 -DBSDR_ENABLE_AUDIO=1 -DBSDR_HAVE_AUDIO=1 -DBSDR_HAVE_PCAP=1 $(WIN_WINDIVERT_DEF)
 WIN_MEDIA_LIBS := -lavdevice -lavfilter -lavformat -lavcodec -lswscale -lswresample -lavutil \
-                  -lopus -lsrtp2 -lusrsctp -lssl -lcrypto -lwpcap -lPacket \
+                  -lopus -lsrtp2 -lusrsctp -lssl -lcrypto -lwpcap -lPacket $(WIN_WINDIVERT_LIBS) \
                   -lpthread -lws2_32 -liphlpapi -luser32 -lbcrypt -lcrypt32 -lgdi32 \
                   -lole32 -loleaut32 -luuid -lstrmiids -lwinmm -lksuser -lavrt -lmfplat -lmfuuid -lm
 windows-media:

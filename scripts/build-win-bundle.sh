@@ -42,6 +42,13 @@ done
 # onnxruntime (in-process depth) — ship it if the deps include it (+ DirectML.dll if present)
 [ -f "$WIN_DEPS/bin/onnxruntime.dll" ] && cp "$WIN_DEPS/bin/onnxruntime.dll" "$STAGE/"
 [ -f "$WIN_DEPS/bin/DirectML.dll" ] && cp "$WIN_DEPS/bin/DirectML.dll" "$STAGE/"
+# WinDivert (owner-mic cloud voice SUBSTITUTION): dual-licensed LGPLv3/GPLv2, so we redistribute it.
+# The .dll is imported by the exe; the .sys is the kernel driver WinDivert.dll loads on first use.
+if [ -f "$WIN_DEPS/bin/WinDivert.dll" ]; then
+  cp "$WIN_DEPS/bin/WinDivert.dll" "$STAGE/"
+  [ -f "$WIN_DEPS/bin/WinDivert64.sys" ] && cp "$WIN_DEPS/bin/WinDivert64.sys" "$STAGE/"
+  [ -f "$WIN_DEPS/licenses/WinDivert-LICENSE.txt" ] && cp "$WIN_DEPS/licenses/WinDivert-LICENSE.txt" "$STAGE/"
+fi
 WP=$(dirname "$(command -v "$WIN_HOST-gcc")")/../"$WIN_HOST"/lib/libwinpthread-1.dll
 [ -f "$WP" ] || WP=/usr/"$WIN_HOST"/lib/libwinpthread-1.dll
 cp "$WP" "$STAGE/"
@@ -64,8 +71,14 @@ Runtime prerequisites (install once):
   * VB-CABLE - https://vb-audio.com/Cable/  (virtual microphone for headset audio
              and voice computer-control; the installer names the device "BSRD_Mic").
 
-The bundled DLLs (FFmpeg av*/sw* + libwinpthread-1.dll) must stay next to
-bsdr_agent.exe. Windows 10 or later is required (Universal CRT).
+Bundled (no separate install):
+  * WinDivert (WinDivert.dll + WinDivert64.sys) - powers owner-mic cloud voice
+    SUBSTITUTION (making the room hear your changed voice while you MITM the
+    headset). Dual-licensed LGPLv3/GPLv2; loaded on first use, needs Administrator.
+    Keep both files next to bsdr_agent.exe.
+
+The bundled DLLs (FFmpeg av*/sw* + libwinpthread-1.dll + WinDivert) must stay next
+to bsdr_agent.exe. Windows 10 or later is required (Universal CRT).
 EOF
 
 # ---- 4. zip ------------------------------------------------------------------

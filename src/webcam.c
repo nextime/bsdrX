@@ -110,9 +110,16 @@ int bsdr_webcam_list(bsdr_webcam_dev *out, int max) {
     return bsdr_android_cameras(out, max);
 }
 
-#else  /* macOS + anything else: avfoundation addresses cameras by numeric index and enumerating
-        * their names needs AVFoundation (Obj-C), which we don't pull in here. Report none; the web UI
-        * exposes a manual "camera index" field on this platform so the operator can still pick one. */
+#elif defined(__APPLE__)
+/* macOS enumerates cameras via AVFoundation (Obj-C) in webcam_macos.m; forward to it so the source
+ * picker and the stereo-3D two-camera selectors get a real dropdown (no manual index). */
+extern int bsdr_macos_camera_list(bsdr_webcam_dev *out, int max);
+int bsdr_webcam_list(bsdr_webcam_dev *out, int max) {
+    return bsdr_macos_camera_list(out, max);
+}
+
+#else  /* other platforms: no enumeration backend. Report none; the web UI still exposes a manual
+        * device field so the operator can pick one by hand. */
 int bsdr_webcam_list(bsdr_webcam_dev *out, int max) {
     (void)out; (void)max;
     return 0;

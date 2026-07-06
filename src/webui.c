@@ -242,9 +242,10 @@ static const char PAGE[] =
 "<button onclick=loadWindows() title='Rescan windows/screens' style=width:auto>&#8635;</button></div>"
 "<div class=hint id=winhint>Choose <b>Whole desktop</b>, a single <b>Screen:</b> (one monitor), or a "
 "single <b>window</b>. On Wayland the portal shows its own picker instead.</div>"
-/* Webcam picker: filled from /api/webcams. First select = camera (single) or LEFT eye (stereo);
- * second select = RIGHT eye, shown only in stereo mode. On platforms that can't enumerate (macOS),
- * these fall back to a manual device/index field (renderCams). */
+/* Webcam picker: filled from /api/webcams (all four platforms enumerate — Linux V4L2, Windows
+ * DirectShow, macOS AVFoundation, Android CameraManager). First select = camera (single) or LEFT eye
+ * (stereo); second select = RIGHT eye, shown only in stereo mode. If enumeration ever returns nothing,
+ * camCtl falls back to a manual device/index field (renderCams). */
 "<div class=row id=camrow style=display:none><label style=width:auto;color:var(--muted)>Camera</label>"
 "<span id=camsel class=grow></span>"
 "<button onclick=loadCams() title='Rescan cameras' style=width:auto>&#8635;</button></div>"

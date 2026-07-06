@@ -430,7 +430,10 @@ int bsdr_micsniff_helper_main(int argc, char **argv) {
     if (!cap) { fprintf(stderr, "micsniff-helper: %s\n", err); uint8_t st = 1; (void)!write(c, &st, 1); close(c); return 3; }
 
     uint32_t quest_be = inet_addr(quest);
-    int ifidx = -1, ip_fwd_was = -1, redir_was = -1, rp_all_was = -1, rp_if_was = -1;
+    int ifidx = -1, ip_fwd_was = -1, redir_was = -1;
+#if defined(__linux__)
+    int rp_all_was = -1, rp_if_was = -1;   /* rp_filter sysctls are Linux-only (/proc) */
+#endif
     uint8_t our_mac[6], quest_mac[6], gw_mac[6]; uint32_t our_ip = 0, gw_be = 0;
     int have_qmac = 0, have_gmac = 0, have_mine = 0;
     if (mitm && gw) {

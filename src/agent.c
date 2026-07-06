@@ -1345,7 +1345,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                     if (!qip[0] && quest_ip) snprintf(qip, sizeof qip, "%s", quest_ip);
                     if (qip[0]) {
                         micsub = bsdr_micsub_start(qip, 4787);
-                        if (!micsub) bsdr_app_set_sniff_status(&app, true, "active — substitution unavailable (need root/libnetfilter_queue)");
+                        if (!micsub) bsdr_app_set_sniff_status(&app, true, "active — substitution unavailable (need admin + NFQUEUE/WinDivert)");
                     }
                 } else if (!can_sub && micsub) {
                     bsdr_micsub_stop(micsub); micsub = NULL;

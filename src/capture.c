@@ -41,6 +41,28 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__APPLE__)
+#include <CoreGraphics/CoreGraphics.h>
+/* macOS gates screen capture behind the Screen Recording TCC permission (10.15+). Without it,
+ * avfoundation silently hands back black/zero frames or fails to open. Preflight first (no prompt);
+ * if we don't have it, trigger the one-time system dialog — same UX as Android's MediaProjection
+ * grant. Returns 1 if access is (now) granted, 0 otherwise. Weak-linked so the binary still loads on
+ * a pre-10.15 macOS, where capture just proceeds unchecked. */
+extern bool CGPreflightScreenCaptureAccess(void) __attribute__((weak_import));
+extern bool CGRequestScreenCaptureAccess(void)  __attribute__((weak_import));
+static int macos_ensure_screen_capture_access(void) {
+    if (!CGPreflightScreenCaptureAccess) return 1;     /* symbol absent (< 10.15): nothing to gate */
+    if (CGPreflightScreenCaptureAccess()) return 1;    /* already granted */
+    BSDR_WARN("bsdr.capture", "Screen Recording permission not granted — requesting it now "
+              "(approve bsdrX in System Settings > Privacy & Security > Screen Recording, then retry)");
+    int granted = CGRequestScreenCaptureAccess ? CGRequestScreenCaptureAccess() : 0;
+    if (!granted)
+        BSDR_ERROR("bsdr.capture", "Screen Recording permission denied; grant it in "
+                   "System Settings > Privacy & Security > Screen Recording and restart bsdrX");
+    return granted;
+}
+#endif
+
 struct bsdr_capture {
     AVFormatContext *fmt;
     AVCodecContext *dec;
@@ -634,6 +656,7 @@ bsdr_capture *bsdr_capture_open(const bsdr_capture_config *cfg_in) {
     av_dict_set(&opts, "draw_mouse", NULL, 0);
     av_dict_set(&opts, "capture_cursor", "1", 0);
     cfg.cpu_only = 1;                             /* no VAAPI/CUDA on macOS -> CPU sws -> videotoolbox */
+    macos_ensure_screen_capture_access();         /* guided one-time TCC prompt (like Android's grant) */
     const AVInputFormat *ifmt = av_find_input_format("avfoundation");
     if (!ifmt) { BSDR_ERROR("bsdr.capture", "avfoundation not available"); av_dict_free(&opts); goto fail; }
     char avdev[32];
@@ -968,7 +991,9 @@ read_frame:
     if (avcodec_receive_frame(c->dec, c->raw) != 0) return 0;
     if (c->is_file) cap_pace(c, c->raw->pts);
 
-have_raw:;
+#ifdef BSDR_HAVE_PIPEWIRE
+have_raw:;   /* jump target for the Wayland/PipeWire fast-path above; absent (and unreferenced) otherwise */
+#endif
     /* Voice-command balloon: composite onto the SOURCE frame (before scale/convert/
      * upload) so it survives both the CPU and the GPU (VAAPI/CUDA) encode paths — no
      * CPU-encode fallback needed. Only a software packed-RGB32 frame can be drawn on;

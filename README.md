@@ -213,18 +213,18 @@ encoder paths, and the build targets).
 
 | Feature | Linux | Windows | macOS | Android |
 |---|:---:|:---:|:---:|:---:|
-| Screen/desktop capture → headset | ✅ Xorg (x11grab) + Wayland (portal/PipeWire) | ✅ gdigrab | ⚠️ avfoundation (grant Screen Recording) | ✅ MediaProjection |
+| Screen/desktop capture → headset | ✅ Xorg (x11grab) + Wayland (portal/PipeWire) | ✅ gdigrab | ✅ avfoundation (guided Screen Recording grant) | ✅ MediaProjection |
 | Window capture (single window) | ✅ | ✅ | ❌ (no enumeration) | ❌ (whole screen only) |
 | Video file / URL / playlist source | ✅ | ✅ | ✅ | ✅ (MediaExtractor transcode) |
-| Webcam source | ✅ V4L2 | ✅ DirectShow | ⚠️ AVFoundation (manual index, no dropdown) | ✅ CameraManager |
-| Stereo-3D two-camera | ✅ | ✅ | ⚠️ (manual indices) | ✅ |
+| Webcam source | ✅ V4L2 | ✅ DirectShow | ✅ AVFoundation (enumerated dropdown) | ✅ CameraManager |
+| Stereo-3D two-camera | ✅ | ✅ | ✅ | ✅ |
 | Hardware (GPU) encode | ✅ NVENC/CUDA + VAAPI + kmsgrab | ✅ NVENC / AMF / QSV / MediaFoundation | ✅ VideoToolbox | ✅ MediaCodec |
 | CPU encode (x264) | ✅ | ✅ | ✅ (fallback) | — (HW codec) |
 | 2D→3D `fast` heuristic | ✅ | ✅ | ✅ | ✅ |
 | 2D→3D built-in ONNX tiers | ✅ CUDA | ✅ DirectML | ✅ CoreML | ✅ NNAPI |
 | Face swap | ✅ | ✅ | ✅ | ✅ (all need ONNX Runtime + models) |
 | Voice changer (DSP) | ✅ | ✅ | ✅ | ✅ |
-| Voice substitution into cloud | ✅ NFQUEUE (root) | ❌ | ❌ | ❌ (Linux-only) |
+| Voice substitution into cloud | ✅ NFQUEUE (root) | ⚠️ WinDivert (Admin) | ❌ (no divert socket) | ❌ |
 | Owner-mic **Sniff** (passive) | ✅ (root helper) | ⚠️ Npcap + Admin | ⚠️ libpcap (root) | ❌ (no local capture) |
 | Owner-mic **MITM** (ARP) | ✅ | ⚠️ Npcap + Admin (in-process) | ⚠️ | ❌ |
 | Owner-mic **Relay** (`bsdr_micrelay`) | ✅ | ✅ | ✅ | ✅ (its only method) |
@@ -243,13 +243,18 @@ encoder paths, and the build targets).
 - The **owner-mic sniffer needs raw packet capture** — Linux (root helper), macOS
   (libpcap, root), Windows (Npcap + Administrator). **Android has no local capture**,
   so it gets the owner mic **only via the router relay** (`bsdr_micrelay`).
-- **MITM (ARP)** is a switched-LAN technique; over **Wi-Fi** use the **Relay** method.
-  Cloud **voice substitution** is Linux-only (NFQUEUE).
+- **MITM (ARP)** is a switched-LAN technique; over **Wi-Fi** it still works unless the AP enforces
+  client isolation (bsdrX NATs the headset uplink so the AP's source-guard doesn't drop it) — if
+  isolation is on, use the **Relay**. Cloud **voice substitution** rewrites the headset's outbound
+  voice in flight while we MITM it: **Linux** via NFQUEUE (root), **Windows** via bundled **WinDivert**
+  (Administrator). macOS has no userland packet-divert primitive, so it's not supported there.
 - The virtual mic depends on a loopback driver you must install: **VB-CABLE** on
   Windows, **BlackHole** on macOS (PulseAudio is native on Linux).
 - **Hardware encoding matches the GPU vendor**: Windows picks NVENC / AMF (AMD) /
   QSV (Intel) / MediaFoundation, macOS uses **VideoToolbox**, Linux uses NVENC/CUDA
-  or VAAPI. macOS screen capture needs the **Screen Recording** permission.
+  or VAAPI. macOS screen capture requires the OS **Screen Recording** permission — bsdrX
+  now triggers the system grant dialog on first use (a one-time approval, like Android's
+  MediaProjection) instead of failing silently.
 - **Android input** is capped by the AccessibilityService (gestures + text keys;
   relative mouse and gamepad are dropped). **Screen-blank** is desktop-only.
 
