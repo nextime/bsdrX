@@ -232,11 +232,12 @@ encoder paths, and the build targets).
 | Headset mic → virtual input device | ✅ PulseAudio (`BSDR_QuestMic`) | ⚠️ VB-CABLE (install) | ⚠️ BlackHole (install) | ✅ AudioTrack |
 | Room mic (cloud room voice → `BSDR_RoomMic`) | ✅ PulseAudio device | ⚠️ VB-CABLE (shared) | ⚠️ BlackHole (shared) | ⚠️ MEDIA AudioTrack (capturable, not a mic) |
 | Input: mouse + keyboard | ✅ uinput | ✅ SendInput | ✅ CGEvent | ⚠️ AccessibilityService (gestures + text; no relative mouse) |
-| Input: gamepad | ✅ uinput virtual XInput | ⚠️ needs ViGEmBus (not bundled → logged) | ❌ (logged, unsupported) | ❌ (no Accessibility analog) |
+| Input: gamepad | ✅ uinput virtual XInput | ⚠️ needs ViGEmBus (guided install in panel) | ❌ (logged, unsupported) | ❌ (no Accessibility analog) |
 | Computer control (voice → LLM → input) | ✅ | ✅ | ✅ | ✅ (device mic; no owner-mic gate) |
 | Internet sharing (cloud relay) | ✅ | ✅ | ✅ | ✅ |
 | Privacy screen-blank | ✅ (RandR/X11) | ❌ | ❌ | ❌ (hidden) |
 | Local web control panel | ✅ browser | ✅ browser | ✅ browser | ✅ embedded WebView |
+| 3rd-party dependency helper (panel) | ✅ libpcap (detect + distro hints) | ✅ WinDivert bundled; Npcap / VB-CABLE / ViGEmBus guided | ✅ BlackHole guided | — (no external deps) |
 | Automatic LAN pairing / discovery | ✅ | ✅ | ✅ | ✅ |
 
 **Key caveats:**
