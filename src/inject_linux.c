@@ -33,6 +33,9 @@
 
 struct bsdr_injector {
     int mouse, absdev, kbd, pad;
+    int touch;                     /* multitouch (ABS_MT) device for touch pointer mode */
+    int touch_x, touch_y;          /* last pointer position (device units), for a touch-down at point */
+    bool touching;                 /* a finger is currently down (touch mode) */
     int screen_w, screen_h;
     bool ok;
     /* Sticky modifiers: the Quest's soft keyboard sends a modifier (Ctrl/Shift/
@@ -49,6 +52,49 @@ struct bsdr_injector {
 };
 
 #define BSDR_LATCH_TIMEOUT_MS 1500   /* a sticky modifier no key consumed is auto-released */
+
+/* Pointer mode (process-global; the injector is per-session). 0 = mouse, 1 = real touch. */
+static int g_touch_mode = 0;
+void bsdr_injector_touch_mode(int on) { g_touch_mode = on ? 1 : 0; }
+
+#if defined(BSDR_HAVE_XTEST)
+#include <X11/Xlib.h>
+#include <X11/extensions/XTest.h>
+/* Type a Unicode character uinput can't (non-ASCII from the headset's soft keyboard) via X11 XTEST:
+ * temporarily map a spare keycode to the Unicode keysym (0x01000000|cp), fake a press, then clear it.
+ * X11/XWayland only. Returns 1 if injected, 0 otherwise (caller then logs it unmapped). */
+static int x11_type_unicode(uint16_t ch) {
+    static Display *dpy = NULL;
+    static int tried = 0;
+    if (!dpy && !tried) { tried = 1; dpy = XOpenDisplay(NULL); }
+    if (!dpy) return 0;
+    int min_kc = 8, max_kc = 255, per = 0;
+    XDisplayKeycodes(dpy, &min_kc, &max_kc);
+    KeySym *map = XGetKeyboardMapping(dpy, min_kc, max_kc - min_kc + 1, &per);
+    if (!map || per < 1) { if (map) XFree(map); return 0; }
+    int spare = -1;
+    for (int kc = max_kc; kc >= min_kc; kc--) {
+        int used = 0;
+        for (int j = 0; j < per; j++) if (map[(kc - min_kc) * per + j]) { used = 1; break; }
+        if (!used) { spare = kc; break; }
+    }
+    XFree(map);
+    if (spare < 0) return 0;
+    KeySym ks = (KeySym)(0x01000000u | (unsigned)ch);
+    KeySym two[2] = { ks, ks };
+    XChangeKeyboardMapping(dpy, spare, 2, two, 1);
+    XSync(dpy, False);
+    XTestFakeKeyEvent(dpy, spare, True, 0);
+    XTestFakeKeyEvent(dpy, spare, False, 0);
+    XSync(dpy, False);
+    KeySym none[2] = { 0, 0 };
+    XChangeKeyboardMapping(dpy, spare, 2, none, 1);   /* release the borrowed keycode */
+    XSync(dpy, False);
+    return 1;
+}
+#else
+static int x11_type_unicode(uint16_t ch) { (void)ch; return 0; }
+#endif
 
 static unsigned long long mono_ms(void) {
     struct timespec ts;
@@ -298,6 +344,21 @@ bsdr_injector *bsdr_injector_create(int screen_w, int screen_h) {
                              prels, 2, absxy, 2, INPUT_PROP_POINTER);
     inj->absdev = -1;           /* folded into the unified pointer (inj->mouse) */
 
+    /* Touch pointer mode: a type-B multitouch touchscreen so the headset's tap/drag arrive as REAL
+     * touch events (the DE interprets them as touch gestures, not mouse). Created always; used only
+     * when the mode is on. INPUT_PROP_DIRECT marks it a touchscreen (absolute, screen-mapped). */
+    int ev_tch[] = { EV_KEY, EV_ABS };
+    int tkeys[] = { BTN_TOUCH };
+    struct uinput_abs_setup tabs[6];
+    memset(tabs, 0, sizeof tabs);
+    tabs[0].code = ABS_MT_SLOT;        tabs[0].absinfo.maximum = 9;
+    tabs[1].code = ABS_MT_TRACKING_ID; tabs[1].absinfo.maximum = 65535;
+    tabs[2].code = ABS_MT_POSITION_X;  tabs[2].absinfo.maximum = inj->screen_w;
+    tabs[3].code = ABS_MT_POSITION_Y;  tabs[3].absinfo.maximum = inj->screen_h;
+    tabs[4].code = ABS_X;              tabs[4].absinfo.maximum = inj->screen_w;
+    tabs[5].code = ABS_Y;              tabs[5].absinfo.maximum = inj->screen_h;
+    inj->touch = make_device("bsdr-virtual-touch", ev_tch, 2, tkeys, 1, NULL, 0, tabs, 6, INPUT_PROP_DIRECT);
+
     int ev_kbd[] = { EV_KEY };
     int kkeys[KEY_MAX];
     int nk = 0;
@@ -361,7 +422,14 @@ static void emit_key(struct bsdr_injector *inj, const bsdr_input_event *ev) {
               ev->u.key.down ? "DOWN" : "UP", ev->u.key.is_vk, ev->u.key.value,
               (ev->u.key.value >= 32 && ev->u.key.value < 127) ? (char)ev->u.key.value : '.', code);
     if (code < 0) {
-        BSDR_WARN("bsdr.inject", "unmapped key value=0x%02x is_vk=%d",
+        /* Character with no US-layout keycode (accented/CJK/symbol from the headset's soft keyboard):
+         * inject it as Unicode text via XTEST on the key-DOWN (swallow the UP). Falls back to a log if
+         * XTEST is unavailable (no X11 / built without it). */
+        if (!ev->u.key.is_vk && ev->u.key.value >= 0x20) {
+            if (ev->u.key.down && x11_type_unicode(ev->u.key.value)) return;
+            if (!ev->u.key.down) return;
+        }
+        BSDR_WARN("bsdr.inject", "unmapped key value=0x%04x is_vk=%d (no keycode; Unicode fallback needs X11/XTEST)",
                   ev->u.key.value, ev->u.key.is_vk);
         return;
     }
@@ -441,6 +509,22 @@ static void emit_gamepad(struct bsdr_injector *inj, const bsdr_gamepad *g) {
     syn(fd);
 }
 
+/* Type-B single-finger touch at inj->touch_x/y. phase: 0 = down, 1 = move, 2 = up. */
+static void touch_emit(struct bsdr_injector *inj, int phase) {
+    static int track = 0;
+    int fd = inj->touch;
+    if (fd < 0) return;
+    emit(fd, EV_ABS, ABS_MT_SLOT, 0);
+    if (phase == 0) { emit(fd, EV_ABS, ABS_MT_TRACKING_ID, ++track); emit(fd, EV_KEY, BTN_TOUCH, 1); }
+    if (phase != 2) {
+        emit(fd, EV_ABS, ABS_MT_POSITION_X, inj->touch_x);
+        emit(fd, EV_ABS, ABS_MT_POSITION_Y, inj->touch_y);
+        emit(fd, EV_ABS, ABS_X, inj->touch_x);
+        emit(fd, EV_ABS, ABS_Y, inj->touch_y);
+    } else { emit(fd, EV_ABS, ABS_MT_TRACKING_ID, -1); emit(fd, EV_KEY, BTN_TOUCH, 0); }
+    syn(fd);
+}
+
 void bsdr_injector_handle(bsdr_injector *inj, const bsdr_input_event *ev) {
     if (!inj->ok) { BSDR_INFO("bsdr.inject", "[null-inject] kind=%d", ev->kind); return; }
     /* Safety net: a sticky modifier that no key consumed within the timeout is released, so a
@@ -459,11 +543,23 @@ void bsdr_injector_handle(bsdr_injector *inj, const bsdr_input_event *ev) {
             syn(inj->mouse);
             break;
         case BSDR_EV_MOVE_ABS:
+            if (g_touch_mode && inj->touch >= 0) {   /* touch: track the point; drag while a finger is down */
+                inj->touch_x = (int)(ev->u.move_abs.x * inj->screen_w);
+                inj->touch_y = (int)(ev->u.move_abs.y * inj->screen_h);
+                if (inj->touching) touch_emit(inj, 1);
+                break;
+            }
             emit(inj->mouse, EV_ABS, ABS_X, (int)(ev->u.move_abs.x * inj->screen_w));
             emit(inj->mouse, EV_ABS, ABS_Y, (int)(ev->u.move_abs.y * inj->screen_h));
             syn(inj->mouse);
             break;
         case BSDR_EV_BUTTON:
+            if (g_touch_mode && inj->touch >= 0 && ev->u.button.button == BSDR_BTN_LEFT) {
+                if (ev->u.button.down) { inj->touching = true;  touch_emit(inj, 0); }  /* tap/drag start */
+                else                   { inj->touching = false; touch_emit(inj, 2); }  /* lift */
+                break;
+            }
+            if (g_touch_mode && inj->touch >= 0) break;   /* no touch analog for right/middle — ignore */
             emit(inj->mouse, EV_KEY, mouse_btn_code(ev->u.button.button),
                  ev->u.button.down ? 1 : 0);
             syn(inj->mouse);
@@ -485,5 +581,6 @@ void bsdr_injector_destroy(bsdr_injector *inj) {
     g_clean_mouse = g_clean_abs = g_clean_kbd = g_clean_pad = -1;
     release_pressed(inj->mouse, inj->absdev, inj->kbd, inj->pad);  /* no latched buttons */
     destroy_fds(inj->mouse, inj->absdev, inj->kbd, inj->pad);
+    if (inj->touch >= 0) { ioctl(inj->touch, UI_DEV_DESTROY); close(inj->touch); }
     free(inj);
 }

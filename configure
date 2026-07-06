@@ -303,6 +303,13 @@ fi
 if [ "$enable_video" = yes ] && [ "$target" = linux ]; then
     WINLIST_SRC="src/winlist.c"
     MEDIA_LIBS="$MEDIA_LIBS -lX11"
+    # Unicode keyboard fallback: uinput is keycode-only, so type non-mappable characters via X11 XTEST
+    # (keysym remap). X11/XWayland only; absent -> those characters are dropped with a log.
+    if have_pkg xtst; then
+        MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_XTEST=1"
+        MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS xtst 2>/dev/null || echo -lXtst)"
+        echo "configure: Unicode keyboard fallback = X11 XTEST"
+    fi
 elif [ "$target" = windows ]; then
     WINLIST_SRC="src/winlist_win.c"
 else

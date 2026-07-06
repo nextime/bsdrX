@@ -86,6 +86,7 @@ typedef struct bsdr_app {
     volatile unsigned file_seek_gen; /* bump to request a seek to file_seek_frac */
     double file_seek_frac;        /* seek target 0..1 (written before bumping file_seek_gen) */
     bool blank_want;              /* privacy: blank the physical monitor while the Quest is connected */
+    bool pointer_touch;           /* input pointer mode: 0 = mouse (tap/drag as clicks), 1 = real touch */
     /* 2D->3D side-by-side: applied on the encode path (forces CPU scale). Read by the LAN streamer
      * when it (re)opens the capture; a change takes effect on the next capture reopen. */
     int threed_mode;              /* bsdr_threed_mode: 0 off / 1 fast / 2 ai */
@@ -181,6 +182,7 @@ void bsdr_app_block_quest(bsdr_app *a, const char *ip);
 void bsdr_app_set_paired(bsdr_app *a, bool paired, const char *name, const char *ip);
 void bsdr_app_set_streaming(bsdr_app *a, bool streaming);
 void bsdr_app_set_blank(bsdr_app *a, bool on);   /* privacy screen-blank toggle */
+void bsdr_app_set_pointer_touch(bsdr_app *a, bool on);   /* input pointer mode: mouse vs real touch */
 /* 2D->3D config (clamped; takes effect on the next capture reopen). ai_cmd may be NULL to keep. */
 void bsdr_app_set_threed(bsdr_app *a, int mode, int deepness, int convergence, int swap, int full,
                          int tier, const char *ai_cmd);

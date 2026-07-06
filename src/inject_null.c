@@ -35,3 +35,5 @@ void bsdr_injector_handle(bsdr_injector *inj, const bsdr_input_event *ev) {
 }
 
 void bsdr_injector_destroy(bsdr_injector *inj) { free(inj); }
+
+void bsdr_injector_touch_mode(int on) { (void)on; }

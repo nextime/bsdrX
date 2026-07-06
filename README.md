@@ -235,12 +235,14 @@ encoder paths, and the build targets).
 | Voice changer (DSP) | ✅ | ✅ | ✅ | ✅ |
 | Voice substitution — local (in-flight, no relay) | ✅ NFQUEUE (root) | ⚠️ WinDivert (Admin) | ⚠️ ARP-MITM+BPF (wired only, experimental) | ❌ (no local capture) |
 | Voice substitution — via relay | ✅ | ✅ | ✅ | ✅ (its only method) |
-| Owner-mic **Sniff** (passive) | ✅ (root helper) | ⚠️ Npcap + Admin | ⚠️ libpcap (root) | ❌ (no local capture) |
+| Owner-mic **Sniff** (passive) | ✅ (root helper) | ✅ bundled WinDivert (in-path) · ⚠️ Npcap (promisc/SPAN) | ✅ libpcap (built-in) · root | ❌ (no local capture) |
 | Owner-mic **MITM** (ARP) | ✅ | ⚠️ Npcap + Admin (in-process) | ⚠️ | ❌ |
 | Owner-mic **Relay** (`bsdr_micrelay`) | ✅ | ✅ | ✅ | ✅ (its only method) |
 | Headset mic → virtual input device | ✅ PulseAudio (`BSDR_QuestMic`) | ⚠️ VB-CABLE (install) | ⚠️ BlackHole (install) | ✅ AudioTrack |
 | Room mic (cloud room voice → `BSDR_RoomMic`) | ✅ PulseAudio device | ⚠️ VB-CABLE (shared) | ⚠️ BlackHole (shared) | ⚠️ MEDIA AudioTrack (capturable, not a mic) |
-| Input: mouse + keyboard | ✅ uinput | ✅ SendInput | ✅ CGEvent | ⚠️ AccessibilityService (gestures + text; no relative mouse) |
+| Input: mouse + keyboard | ✅ uinput (+ touch mode) | ✅ SendInput (+ touch mode) | ✅ CGEvent (mouse only) | ⚠️ AccessibilityService (gestures + text; no relative mouse) |
+| Input: pointer as touchpad (tap/drag touch) | ✅ uinput multitouch | ✅ InjectTouchInput | ❌ (no touch API → mouse) | — (native touch) |
+| Keyboard: Unicode / international text | ✅ XTEST (X11/XWayland) | ✅ KEYEVENTF_UNICODE | ✅ CGEvent Unicode string | ✅ (soft keyboard) |
 | Input: gamepad | ✅ uinput virtual XInput | ⚠️ needs ViGEmBus (guided install in panel) | ❌ (logged, unsupported) | ❌ (no Accessibility analog) |
 | Computer control (voice → LLM → input) | ✅ | ✅ | ✅ | ✅ (device mic; no owner-mic gate) |
 | Internet sharing (cloud relay) | ✅ | ✅ | ✅ | ✅ |
@@ -252,8 +254,12 @@ encoder paths, and the build targets).
 **Key caveats:**
 
 - The **owner-mic sniffer needs raw packet capture** — Linux (root helper), macOS
-  (libpcap, root), Windows (Npcap + Administrator). **Android has no local capture**,
-  so it gets the owner mic **only via the router relay** (`bsdr_micrelay`).
+  (libpcap is built into macOS; root for BPF). On **Windows** the passive Sniff works with
+  the **bundled WinDivert** when this PC is in the headset's path (its gateway); **Npcap**
+  (+ Administrator) is only needed for promiscuous/SPAN sniffing or **MITM** (ARP is L2,
+  which WinDivert can't do). The panel's **Dependencies** card can fetch+launch the official
+  Npcap installer on request. **Android has no local capture**, so it gets the owner mic
+  **only via the router relay** (`bsdr_micrelay`).
 - **MITM (ARP)** is a switched-LAN technique; over **Wi-Fi** it still works unless the AP enforces
   client isolation (bsdrX NATs the headset uplink so the AP's source-guard doesn't drop it) — if
   isolation is on, use the **Relay**.
@@ -382,7 +388,7 @@ any feature whose libraries are missing.
 
 ```bash
 ./configure              # detects host OS, OpenSSL, media deps, and ONNX Runtime
-make                     # -> build/bsdr_agent (full media)
+make                     # builds for the platform you're ON (macOS -> osx; else native) -> build/bsdr_agent
 make check               # build + run the test suite
 sudo make install        # bin + man pages (DESTDIR honored)
 man bsdr_agent           # full option reference

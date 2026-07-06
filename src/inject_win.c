@@ -37,15 +37,48 @@
 struct bsdr_injector {
     bool ctrl_held;
     WORD remap_arrow;   /* VK_UP/VK_DOWN whose down we remapped (0 = none) */
+    int  sw, sh;        /* screen pixels, for touch injection coordinates */
+    int  tx, ty;        /* last pointer pixel position (for a touch-down / drag) */
+    bool touching;
 };
 
 static bool is_ctrl_vk(WORD vk) { return vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL; }
 
+/* Pointer mode (process-global; the injector is per-session). 0 = mouse, 1 = real touch. */
+static int g_touch_mode = 0;
+void bsdr_injector_touch_mode(int on) { g_touch_mode = on ? 1 : 0; }
+
 bsdr_injector *bsdr_injector_create(int screen_w, int screen_h) {
-    (void)screen_w; (void)screen_h;
     BSDR_INFO("bsdr.inject", "Windows SendInput injector ready "
               "(gamepad requires ViGEmBus; not bundled)");
-    return calloc(1, sizeof(struct bsdr_injector));
+    struct bsdr_injector *inj = calloc(1, sizeof(struct bsdr_injector));
+    if (inj) {
+        inj->sw = screen_w > 0 ? screen_w : GetSystemMetrics(SM_CXSCREEN);
+        inj->sh = screen_h > 0 ? screen_h : GetSystemMetrics(SM_CYSCREEN);
+    }
+    return inj;
+}
+
+/* Real touch injection (Windows 8+). phase: 0 down, 1 move, 2 up. One finger at (px,py) pixels. */
+static void touch_win(int phase, int px, int py) {
+    static int ready = -1;
+    if (ready < 0) ready = InitializeTouchInjection(1, TOUCH_FEEDBACK_DEFAULT) ? 1 : 0;
+    if (ready != 1) return;
+    POINTER_TOUCH_INFO c;
+    ZeroMemory(&c, sizeof c);
+    c.pointerInfo.pointerType = PT_TOUCH;
+    c.pointerInfo.pointerId = 0;
+    c.pointerInfo.ptPixelLocation.x = px;
+    c.pointerInfo.ptPixelLocation.y = py;
+    c.touchFlags = TOUCH_FLAG_NONE;
+    c.touchMask  = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_PRESSURE;
+    c.pressure   = 32000;
+    c.rcContact.left = px - 2; c.rcContact.right = px + 2;
+    c.rcContact.top  = py - 2; c.rcContact.bottom = py + 2;
+    c.pointerInfo.pointerFlags = (phase == 0) ? (POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT)
+                               : (phase == 1) ? (POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT)
+                                              : POINTER_FLAG_UP;
+    InjectTouchInput(1, &c);
 }
 
 static void send_mouse(DWORD flags, LONG dx, LONG dy, DWORD data) {
@@ -78,18 +111,30 @@ static void send_key_unicode(WCHAR ch, BOOL down) {
 }
 
 void bsdr_injector_handle(bsdr_injector *inj, const bsdr_input_event *ev) {
-    (void)inj;
     switch (ev->kind) {
         case BSDR_EV_MOVE_REL:
             send_mouse(MOUSEEVENTF_MOVE, ev->u.move_rel.dx, ev->u.move_rel.dy, 0);
             break;
         case BSDR_EV_MOVE_ABS:
+            if (g_touch_mode && inj) {            /* touch: track the point; drag while a finger is down */
+                inj->tx = (int)(ev->u.move_abs.x * inj->sw);
+                inj->ty = (int)(ev->u.move_abs.y * inj->sh);
+                if (inj->touching) touch_win(1, inj->tx, inj->ty);
+                break;
+            }
             send_mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
                        (LONG)(ev->u.move_abs.x * 65535.0),
                        (LONG)(ev->u.move_abs.y * 65535.0), 0);
             break;
         case BSDR_EV_BUTTON: {
             BOOL d = ev->u.button.down;
+            if (g_touch_mode && inj) {
+                if (ev->u.button.button == BSDR_BTN_LEFT) {
+                    if (d) { inj->touching = true;  touch_win(0, inj->tx, inj->ty); }
+                    else   { inj->touching = false; touch_win(2, inj->tx, inj->ty); }
+                }
+                break;                            /* right/middle have no touch analog — ignore */
+            }
             switch (ev->u.button.button) {
                 case BSDR_BTN_LEFT:
                     send_mouse(d ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP, 0, 0, 0); break;

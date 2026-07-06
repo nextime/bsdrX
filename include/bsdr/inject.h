@@ -32,4 +32,11 @@ bsdr_injector *bsdr_injector_create(int screen_w, int screen_h);
 void bsdr_injector_handle(bsdr_injector *inj, const bsdr_input_event *ev);
 void bsdr_injector_destroy(bsdr_injector *inj);
 
+/* Pointer mode (process-global; the injector is per-session so this is the live toggle the web UI
+ * flips): 0 = mouse (absolute move + click; a tap is a click, hold+move is a drag), 1 = TOUCH — map
+ * the headset's pointer to real touchscreen events (tap/drag) where the OS supports injecting them
+ * (Linux uinput multitouch, Windows InjectTouchInput). macOS has no public touch-injection API, so it
+ * stays in mouse mode regardless. Safe to call any time, including before any injector exists. */
+void bsdr_injector_touch_mode(int on);
+
 #endif /* BSDR_INJECT_H */

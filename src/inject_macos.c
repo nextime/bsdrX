@@ -190,3 +190,6 @@ void bsdr_injector_destroy(bsdr_injector *inj) {
 }
 
 #endif /* __APPLE__ */
+
+/* macOS has no public touch-injection API — touch mode falls back to the mouse path above. */
+void bsdr_injector_touch_mode(int on) { (void)on; }

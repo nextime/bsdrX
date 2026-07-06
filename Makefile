@@ -234,7 +234,18 @@ else
   ALL_TESTS :=
 endif
 
-.PHONY: all require-full-media linux windows windows-media osx osxcross check install uninstall clean distclean print-media-src
+.PHONY: native all require-full-media linux windows windows-media osx osxcross check install uninstall clean distclean print-media-src
+
+# Default target: build for the platform we're running ON. macOS -> the native 'osx' target
+# (configure + build); everything else -> the native host build. Cross-compiling to another OS is
+# still explicit (make windows / make osxcross / android).
+.DEFAULT_GOAL := native
+native:
+	@case "$$(uname -s)" in \
+	  Darwin) $(MAKE) osx ;; \
+	  *)      $(MAKE) all ;; \
+	esac
+
 all: require-full-media $(AGENT) $(TOOLS) $(ALL_TESTS)
 	@echo "bsdrX built -> $(BUILD)/  (CC=$(CC))"
 
@@ -332,7 +343,8 @@ WIN_MEDIA_DEF := -DBSDR_ENABLE_SCTP=1 -DBSDR_ENABLE_VIDEO=1 -DBSDR_HAVE_CAPTURE=
 WIN_MEDIA_LIBS := -lavdevice -lavfilter -lavformat -lavcodec -lswscale -lswresample -lavutil \
                   -lopus -lsrtp2 -lusrsctp -lssl -lcrypto -lwpcap -lPacket $(WIN_WINDIVERT_LIBS) \
                   -lpthread -lws2_32 -liphlpapi -luser32 -lbcrypt -lcrypt32 -lgdi32 \
-                  -lole32 -loleaut32 -luuid -lstrmiids -lwinmm -lksuser -lavrt -lmfplat -lmfuuid -lm
+                  -lole32 -loleaut32 -luuid -lstrmiids -lwinmm -lksuser -lavrt -lmfplat -lmfuuid \
+                  -lurlmon -lshell32 -lm
 windows-media:
 	@test -n "$(WIN_DEPS)" || { \
 	  echo "usage: make windows-media WIN_DEPS=/path/to/win-deps  (run scripts/build-win-deps.sh first)"; exit 1; }

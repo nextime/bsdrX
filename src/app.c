@@ -15,6 +15,7 @@
  * this program. If not, see <https://www.gnu.org/licenses/>.
  */
 #include "bsdr/app.h"
+#include "bsdr/inject.h"
 #include "bsdr/cloud.h"
 #include "bsdr/cloud_stream.h"
 #include "bsdr/json.h"
@@ -354,10 +355,22 @@ void bsdr_app_set_streaming(bsdr_app *a, bool streaming) {
     bsdr_mutex_unlock(a->lock);
 }
 
+static void settings_save(bsdr_app *a);   /* defined below */
+
 void bsdr_app_set_blank(bsdr_app *a, bool on) {
     bsdr_mutex_lock(a->lock);
     a->blank_want = on;
     bsdr_mutex_unlock(a->lock);
+}
+
+/* Input pointer mode: 0 = mouse (tap = click, hold+move = drag), 1 = real touch events. Process-global
+ * in the injector (per-session), so apply immediately and persist the preference. */
+void bsdr_app_set_pointer_touch(bsdr_app *a, bool on) {
+    bsdr_mutex_lock(a->lock);
+    a->pointer_touch = on;
+    bsdr_mutex_unlock(a->lock);
+    bsdr_injector_touch_mode(on ? 1 : 0);
+    settings_save(a);
 }
 
 void bsdr_app_set_threed(bsdr_app *a, int mode, int deepness, int convergence, int swap, int full,
@@ -521,11 +534,11 @@ static void settings_save(bsdr_app *a) {
     char path[600];
     if (!settings_path(path, sizeof(path))) return;
     bsdr_mutex_lock(a->lock);
-    int cpu = a->cpu_only ? 1 : 0, bro = a->bitrate_override;
+    int cpu = a->cpu_only ? 1 : 0, bro = a->bitrate_override, ptouch = a->pointer_touch ? 1 : 0;
     bsdr_mutex_unlock(a->lock);
     FILE *f = fopen(path, "w");
     if (!f) { BSDR_WARN("bsdr.app", "could not save settings to %s", path); return; }
-    fprintf(f, "cpu_only=%d\nbitrate_override=%d\n", cpu, bro);
+    fprintf(f, "cpu_only=%d\nbitrate_override=%d\npointer_touch=%d\n", cpu, bro, ptouch);
     fclose(f);
     BSDR_DEBUG("bsdr.app", "settings saved to %s", path);
 }
@@ -541,9 +554,12 @@ void bsdr_app_load_settings(bsdr_app *a) {
     while (fgets(line, sizeof(line), f)) {
         if      (sscanf(line, "cpu_only=%d", &v) == 1)         a->cpu_only = v ? true : false;
         else if (sscanf(line, "bitrate_override=%d", &v) == 1) a->bitrate_override = v > 0 ? v : 0;
+        else if (sscanf(line, "pointer_touch=%d", &v) == 1)    a->pointer_touch = v ? true : false;
     }
     recompute_bitrate_locked(a);
+    bool ptouch = a->pointer_touch;
     bsdr_mutex_unlock(a->lock);
+    bsdr_injector_touch_mode(ptouch ? 1 : 0);   /* apply the saved pointer mode */
     fclose(f);
     BSDR_INFO("bsdr.app", "loaded settings from %s (encoder=%s, bitrate override=%d)",
               path, a->cpu_only ? "cpu/x264" : "gpu/nvenc", a->bitrate_override);
@@ -954,7 +970,7 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         "\"internetSharing\":%s},"
         "\"quest\":{\"paired\":%s,\"name\":\"%s\",\"ip\":\"%s\",\"streaming\":%s,\"paused\":%s},"
         "\"source\":{\"mode\":\"%s\",\"path\":\"%s\",\"path2\":\"%s\",\"audio\":%s},"
-        "\"blank\":%s,\"cloudMic\":%s,\"ownerMicLocal\":%s,\"roomMic\":%s,\"tlsInsecure\":%s,"
+        "\"blank\":%s,\"pointerTouch\":%s,\"cloudMic\":%s,\"ownerMicLocal\":%s,\"roomMic\":%s,\"tlsInsecure\":%s,"
         "\"threed\":{\"mode\":%d,\"deepness\":%d,\"convergence\":%d,\"swap\":%s,\"full\":%s,\"tier\":%d,\"ai\":\"%s\"},"
         "\"quality\":{\"w\":%d,\"h\":%d,\"bitrate\":%d,\"brOverride\":%d,\"gpuEncode\":%s},"
         "\"voice\":{\"stt\":\"%s\",\"sttModel\":\"%s\",\"sttToken\":%s,"
@@ -968,7 +984,7 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         a->quest_paired ? "true" : "false", a->quest_name, a->quest_ip,
         a->streaming ? "true" : "false", a->paused ? "true" : "false",
         a->source, a->source_path, a->source_path2, a->audio ? "true" : "false",
-        a->blank_want ? "true" : "false", a->cloud_mic_fallback ? "true" : "false",
+        a->blank_want ? "true" : "false", a->pointer_touch ? "true" : "false", a->cloud_mic_fallback ? "true" : "false",
         a->owner_mic_local ? "true" : "false", a->room_mic_want ? "true" : "false",
         bsdr_tls_is_insecure() ? "true" : "false",
         a->threed_mode, a->threed_deepness, a->threed_convergence,

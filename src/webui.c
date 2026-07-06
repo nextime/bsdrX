@@ -137,7 +137,9 @@ static const char PAGE[] =
 "<span id=sharelbl class=grow>Internet sharing: off</span>"
 "<button id=sharebtn class=p onclick=toggleShare()>Share to Internet</button></div>"
 "<div class=row id=blankrow><label style=width:auto><input id=blank type=checkbox style=width:auto onchange=blankToggle()> "
-"Blank my physical screen while the headset is connected (privacy)</label></div></div>"
+"Blank my physical screen while the headset is connected (privacy)</label></div>"
+"<div class=row><label style=width:auto><input id=ptouch type=checkbox style=width:auto onchange=pointerModeToggle()> "
+"Use the headset pointer as a <b>touchpad</b> (real tap/drag touch events) instead of a mouse</label></div></div>"
 
 "<div class=card><h2>Headset (Quest)</h2>"
 "<div id=quest class=status>...</div>"
@@ -434,6 +436,7 @@ static const char PAGE[] =
 "function pickCam(){let a=document.getElementById('cam'),b=document.getElementById('camR');let d=a?a.value:'',d2=b?b.value:'';window._cam=d;window._camR=d2;api('/api/source',{mode:camMode,path:d,dev2:d2});}"
 "function srcpath(){api('/api/source',{mode:'file',path:path.value})}"
 "function blankToggle(){api('/api/blank',{on:blank.checked?1:0})}"
+"function pointerModeToggle(){api('/api/pointermode',{touch:ptouch.checked?1:0})}"
 "function bitrateSet(){api('/api/bitrate',{mbps:+brate.value||0})}"
 "function encoderSet(){api('/api/encoder',{gpu:+enc.value})}"
 "function fbClose(){document.getElementById('fb').style.display='none'}"
@@ -521,6 +524,7 @@ static const char PAGE[] =
 "{let m=s.source.mode;camMode=m;srcRows(m);"
 "if((m==='webcam'||m==='webcam3d')&&!camsel.firstChild){window._cam=s.source.path;window._camR=s.source.path2;loadCams();}}"
 "if(document.activeElement!==blank)blank.checked=!!s.blank;"
+"if(document.activeElement!==ptouch)ptouch.checked=!!s.pointerTouch;"
 "if(s.quality){if(document.activeElement!==brate)brate.value=s.quality.brOverride?(s.quality.brOverride/1e6):'';"
 "breff.textContent='(now '+((s.quality.bitrate||0)/1e6).toFixed(1)+' Mbps'+(s.quality.brOverride?', overriding':', from headset')+')';"
 "if(document.activeElement!==enc)enc.value=s.quality.gpuEncode?'1':'0';}"
@@ -636,6 +640,10 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/blank") == 0) {
         double on = 0; bsdr_json_get_double(body, "on", &on);
         bsdr_app_set_blank(a, on != 0);   /* takes effect while the Quest is connected */
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/pointermode") == 0) {
+        double touch = 0; bsdr_json_get_double(body, "touch", &touch);
+        bsdr_app_set_pointer_touch(a, touch != 0);   /* mouse vs real touch (live, persisted) */
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/cloudmic") == 0) {
         double on = 0; bsdr_json_get_double(body, "on", &on);

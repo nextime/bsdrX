@@ -23,6 +23,30 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <mmsystem.h>
+#include <urlmon.h>          /* URLDownloadToFileA */
+#include <shellapi.h>        /* ShellExecuteA (elevated launch) */
+
+/* Npcap can't be redistributed (licence), but we may fetch+launch the OFFICIAL installer on request —
+ * that's legal and is the "install on request" path. Version-pinned; if the URL 404s or the download
+ * fails we fall back to the instructions page. Update when Npcap ships a new release. */
+#define NPCAP_INSTALLER_URL "https://npcap.com/dist/npcap-1.79.exe"
+
+/* Download `url` to %TEMP%\<fname> and launch it elevated (UAC). Returns 1 if the installer started,
+ * 0 on any failure (caller then points the user at the instructions page). */
+static int win_download_run(const char *url, const char *fname, char *msg, int msgcap) {
+    char path[MAX_PATH];
+    DWORD tn = GetTempPathA(sizeof path, path);
+    if (tn == 0 || tn > sizeof path - 64) { snprintf(msg, msgcap, "cannot resolve %%TEMP%%"); return 0; }
+    strncat(path, fname, sizeof path - strlen(path) - 1);
+    if (URLDownloadToFileA(NULL, url, path, 0, NULL) != S_OK) {
+        snprintf(msg, msgcap, "download failed — open the instructions for the manual download link");
+        return 0;
+    }
+    HINSTANCE r = ShellExecuteA(NULL, "runas", path, NULL, NULL, SW_SHOWNORMAL);   /* elevated */
+    if ((INT_PTR)r <= 32) { snprintf(msg, msgcap, "couldn't launch the installer (UAC declined?)"); return 0; }
+    snprintf(msg, msgcap, "launched the official installer — complete it (WinPcap-compatible mode), then restart bsdrX");
+    return 1;
+}
 #endif
 
 /* ---- detection helpers (return 1 only when positively confirmed) ---- */
@@ -69,8 +93,9 @@ int bsdr_deps_list(bsdr_dep *out, int max) {
 #if defined(_WIN32)
     ADD("windivert", "WinDivert", "Owner-mic cloud voice substitution (rewrites your voice to the room)",
         "LGPLv3 / GPLv2 (bundled)", "https://reqrypt.org/windivert.html", 1, 0);
-    ADD("npcap", "Npcap", "Owner-mic Sniff / MITM packet capture",
-        "Free edition (proprietary, not redistributable)", "https://npcap.com", 0, 0);
+    ADD("npcap", "Npcap", "Owner-mic MITM (ARP L2); passive Sniff can use bundled WinDivert instead",
+        "Free edition (proprietary, not redistributable — we fetch+run the official installer)",
+        "https://npcap.com", 0, 1);
     ADD("vbcable", "VB-CABLE", "Virtual microphone: headset mic + voice computer-control",
         "Donationware (installer only)", "https://vb-audio.com/Cable/", 0, 0);
     ADD("vigembus", "ViGEmBus", "Virtual gamepad (XInput) input injection",
@@ -110,9 +135,14 @@ int bsdr_dep_install(const char *id, char *msg, int msgcap) {
             return 0;
         }
         if (deps[i].present) { snprintf(msg, msgcap, "%s is already installed.", deps[i].name); return 1; }
-        /* Not bundled, not present, and (in this build) not auto-installable: point the operator at the
-         * step-by-step instructions page, which carries the official download link. Auto-install per
-         * dep can be added here later (fetch + launch the official installer) where the license allows. */
+        /* Automatable: fetch + launch the vendor's official installer on request (legal — we don't
+         * redistribute it). Falls back to the instructions page on any failure. */
+        if (deps[i].automatable) {
+#if defined(_WIN32)
+            if (!strcmp(id, "npcap")) return win_download_run(NPCAP_INSTALLER_URL, "npcap-setup.exe", msg, msgcap);
+#endif
+        }
+        /* Otherwise point the operator at the step-by-step instructions page (has the download link). */
         snprintf(msg, msgcap, "%s must be installed manually — open the instructions for the download link and steps.", deps[i].name);
         return 0;
     }

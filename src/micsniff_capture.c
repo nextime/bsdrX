@@ -19,10 +19,21 @@
 
 #include <pcap.h>
 
+/* Windows: when Npcap is absent we can still SNIFF (capture-only) via the bundled WinDivert — it hands
+ * us forwarded IPv4 packets at the NETWORK_FORWARD layer, so a passive sniff works when this PC is the
+ * headset's gateway/in-path (no Npcap needed). It can't ARP-inject (L2), so MITM still needs Npcap. */
+#if defined(_WIN32) && defined(BSDR_HAVE_WINDIVERT)
+#include <windows.h>
+#include <windivert.h>
+#endif
+
 struct mc_cap {
     pcap_t *pd;
     int     dlt;
     char    backend[16];
+#if defined(_WIN32) && defined(BSDR_HAVE_WINDIVERT)
+    HANDLE  wd;      /* WinDivert handle (capture-only) when the pcap/Npcap engine is unavailable */
+#endif
 };
 
 /* Offset from the start of a captured frame to the IPv4 header, per DLT. -1 = not IPv4/unsupported. */
@@ -53,34 +64,67 @@ static int l2_offset(int dlt, const unsigned char *d, int caplen) {
 mc_cap *mc_cap_open(const char *iface, const char *quest_ip, char *err, size_t errlen) {
     char eb[PCAP_ERRBUF_SIZE] = "";
     pcap_t *pd = pcap_create(iface, eb);
-    if (!pd) { snprintf(err, errlen, "pcap_create(%s): %s", iface, eb); return NULL; }
-    pcap_set_snaplen(pd, 2048);
-    pcap_set_promisc(pd, 1);
-    pcap_set_timeout(pd, 300);
-    pcap_set_immediate_mode(pd, 1);                 /* deliver ASAP — low latency for audio */
-    int act = pcap_activate(pd);
-    if (act < 0) { snprintf(err, errlen, "pcap_activate(%s): %s", iface, pcap_geterr(pd));
-                   pcap_close(pd); return NULL; }
-
-    struct bpf_program fp;
-    char filt[128];
-    snprintf(filt, sizeof filt, "udp and src host %s", quest_ip);
-    if (pcap_compile(pd, &fp, filt, 1, PCAP_NETMASK_UNKNOWN) == 0) {
-        pcap_setfilter(pd, &fp);
-        pcap_freecode(&fp);
+    if (pd) {
+        pcap_set_snaplen(pd, 2048);
+        pcap_set_promisc(pd, 1);
+        pcap_set_timeout(pd, 300);
+        pcap_set_immediate_mode(pd, 1);                 /* deliver ASAP — low latency for audio */
+        int act = pcap_activate(pd);
+        if (act < 0) {
+            snprintf(err, errlen, "pcap_activate(%s): %s", iface, pcap_geterr(pd));
+            pcap_close(pd); pd = NULL;                   /* fall through to WinDivert on Windows */
+        }
     } else {
-        snprintf(err, errlen, "pcap_compile: %s", pcap_geterr(pd));  /* non-fatal: filter in decoder */
+        snprintf(err, errlen, "pcap_create(%s): %s", iface, eb);
+    }
+    if (pd) {
+        struct bpf_program fp;
+        char filt[128];
+        snprintf(filt, sizeof filt, "udp and src host %s", quest_ip);
+        if (pcap_compile(pd, &fp, filt, 1, PCAP_NETMASK_UNKNOWN) == 0) {
+            pcap_setfilter(pd, &fp);
+            pcap_freecode(&fp);
+        }
+        mc_cap *c = calloc(1, sizeof *c);
+        if (!c) { pcap_close(pd); snprintf(err, errlen, "oom"); return NULL; }
+        c->pd = pd; c->dlt = pcap_datalink(pd);
+        snprintf(c->backend, sizeof c->backend, "libpcap");
+        return c;
     }
 
-    mc_cap *c = calloc(1, sizeof *c);
-    if (!c) { pcap_close(pd); snprintf(err, errlen, "oom"); return NULL; }
-    c->pd = pd; c->dlt = pcap_datalink(pd);
-    snprintf(c->backend, sizeof c->backend, "libpcap");
-    return c;
+#if defined(_WIN32) && defined(BSDR_HAVE_WINDIVERT)
+    /* No Npcap — try WinDivert (bundled). Capture-only, forwarded-traffic layer (this PC as gateway). */
+    (void)iface;
+    char filter[160];
+    snprintf(filter, sizeof filter, "udp and ip.SrcAddr == %s", quest_ip);
+    HANDLE wd = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK_FORWARD, 0,
+                              WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
+    if (wd != INVALID_HANDLE_VALUE) {
+        mc_cap *c = calloc(1, sizeof *c);
+        if (!c) { WinDivertClose(wd); snprintf(err, errlen, "oom"); return NULL; }
+        c->wd = wd; c->pd = NULL;
+        snprintf(c->backend, sizeof c->backend, "windivert");
+        return c;
+    }
+    snprintf(err, errlen, "no Npcap, and WinDivert open failed (err %lu; run as Administrator)",
+             (unsigned long)GetLastError());
+#endif
+    return NULL;
 }
 
 int mc_cap_next(mc_cap *c, unsigned char *buf, int maxlen, int timeout_ms) {
     (void)timeout_ms;                               /* set via pcap_set_timeout at open */
+#if defined(_WIN32) && defined(BSDR_HAVE_WINDIVERT)
+    if (c->wd) {
+        UINT recvLen = 0;
+        WINDIVERT_ADDRESS addr;
+        if (!WinDivertRecv(c->wd, buf, (UINT)maxlen, &recvLen, &addr)) {
+            DWORD e = GetLastError();
+            return (e == ERROR_NO_DATA || e == ERROR_INVALID_HANDLE) ? -1 : 0;
+        }
+        return (int)recvLen;                        /* already a bare IPv4 datagram */
+    }
+#endif
     struct pcap_pkthdr *h; const unsigned char *d;
     int r = pcap_next_ex(c->pd, &h, &d);
     if (r == 0) return 0;                           /* timeout */
@@ -94,12 +138,22 @@ int mc_cap_next(mc_cap *c, unsigned char *buf, int maxlen, int timeout_ms) {
 }
 
 int mc_cap_inject(mc_cap *c, const unsigned char *frame, int len) {
+#if defined(_WIN32) && defined(BSDR_HAVE_WINDIVERT)
+    if (c->wd) return -1;                           /* WinDivert can't send L2/ARP — MITM needs Npcap */
+#endif
     return pcap_sendpacket(c->pd, frame, len);      /* raw Ethernet frame */
 }
 
 const char *mc_cap_backend(const mc_cap *c) { return c->backend; }
 
-void mc_cap_close(mc_cap *c) { if (!c) return; if (c->pd) pcap_close(c->pd); free(c); }
+void mc_cap_close(mc_cap *c) {
+    if (!c) return;
+#if defined(_WIN32) && defined(BSDR_HAVE_WINDIVERT)
+    if (c->wd) WinDivertClose(c->wd);
+#endif
+    if (c->pd) pcap_close(c->pd);
+    free(c);
+}
 
 /* ============================================================ AF_PACKET path (Linux) */
 #elif defined(__linux__)

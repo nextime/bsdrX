@@ -130,3 +130,6 @@ void bsdr_injector_handle(bsdr_injector *inj, const bsdr_input_event *ev) {
 }
 
 void bsdr_injector_destroy(bsdr_injector *inj) { free(inj); }
+
+/* Android injects via the AccessibilityService (Kotlin) — gestures already; pointer mode is n/a here. */
+void bsdr_injector_touch_mode(int on) { (void)on; }
