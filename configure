@@ -249,6 +249,22 @@ if [ "$enable_video" = yes ] && [ "$target" = linux ]; then
         echo "configure: Wayland capture OFF (install libpipewire-0.3-dev + libdbus-1-dev); x11grab/kmsgrab only"
     fi
 fi
+# --- Wayland privacy screen-blank: wlr-gamma-control (wlroots compositors) ---------------------------
+# Linux only; independent of capture. Needs libwayland-client + wayland-scanner (to generate the client
+# glue from the vendored protocol XML). Absent -> screenblank.c falls back to X11 xrandr / no-op.
+WAYLAND_GAMMA=
+if [ "$target" = linux ]; then
+    if command -v wayland-scanner >/dev/null 2>&1 && have_pkg wayland-client; then
+        MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_WAYLAND_GAMMA=1"
+        MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags wayland-client 2>/dev/null)"
+        MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS wayland-client 2>/dev/null || echo -lwayland-client)"
+        MEDIA_SRC="$MEDIA_SRC src/screenblank_wayland.c"
+        WAYLAND_GAMMA=1
+        echo "configure: Wayland privacy screen-blank = wlr-gamma-control"
+    else
+        echo "configure: Wayland screen-blank OFF (need wayland-scanner + libwayland-dev); X11/Windows/macOS unaffected"
+    fi
+fi
 if [ "$enable_audio" = yes ] && [ "$target" = macos ]; then
     # macOS FULL audio: shared Opus sender/receiver/player (audio.c) + CoreAudio I/O
     # (audio_coreaudio.c: record/playback/devices/virtual-mic via BlackHole) + the owner-mic
@@ -365,6 +381,7 @@ INJECT_SRC  = $INJECT_SRC
 WINLIST_SRC = $WINLIST_SRC
 SCTP_SRC    = $SCTP_SRC
 MEDIA_SRC   = $MEDIA_SRC
+WAYLAND_GAMMA = $WAYLAND_GAMMA
 
 CFLAGS  = $CFLAGS_OUT
 LDFLAGS = $LDFLAGS_OUT

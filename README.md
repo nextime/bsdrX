@@ -244,7 +244,7 @@ encoder paths, and the build targets).
 | Input: gamepad | ✅ uinput virtual XInput | ⚠️ needs ViGEmBus (guided install in panel) | ❌ (logged, unsupported) | ❌ (no Accessibility analog) |
 | Computer control (voice → LLM → input) | ✅ | ✅ | ✅ | ✅ (device mic; no owner-mic gate) |
 | Internet sharing (cloud relay) | ✅ | ✅ | ✅ | ✅ |
-| Privacy screen-blank | ✅ (RandR/X11) | ❌ | ❌ | ❌ (hidden) |
+| Privacy screen-blank | ✅ (RandR/X11 + wlroots Wayland) | ✅ (gamma ramp) | ✅ (CoreGraphics gamma) | ❌ (hidden) |
 | Local web control panel | ✅ browser | ✅ browser | ✅ browser | ✅ embedded WebView |
 | 3rd-party dependency helper (panel) | — (deps are build requirements) | ✅ WinDivert bundled; Npcap / VB-CABLE / ViGEmBus guided | ✅ BlackHole guided | — (no external deps) |
 | Automatic LAN pairing / discovery | ✅ | ✅ | ✅ | ✅ |
@@ -288,7 +288,7 @@ Desktop capture is autodetected per session (Xorg first, Wayland fallback; force
 | Region crop (x/y/w/h) | ✅ grab-time crop | ⚠️ portal picks source; crop is applied on scale |
 | GPU encode (NVENC / VAAPI) | ✅ | ✅ (from the PipeWire frame) |
 | Cursor in the stream | ✅ `draw_mouse` | ✅ portal `cursor_mode` (embedded) |
-| Privacy screen-blank | ✅ RandR | ❌ (no RandR; compositor-specific) |
+| Privacy screen-blank | ✅ RandR | ✅ wlr-gamma-control (wlroots: sway/Hyprland/…; ❌ GNOME/KDE) |
 | Root required | ❌ (only `--kmsgrab`) | ❌ (portal is user-session) |
 
 Needs `libpipewire-0.3` + `libdbus-1` at build time (the native `./configure` and the

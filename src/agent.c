@@ -57,6 +57,7 @@
 #include "bsdr_android.h"          /* device-mic voice bridge (no sniffer on Android) */
 #endif
 #include "bsdr/screenshot.h"
+#include "bsdr/screenblank.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -887,23 +888,11 @@ static void teardown_session(agent_t *a) {
     if (w) bsdr_thread_join(w);   /* the worker owns its own capture/udp/injector */
 }
 
-/* Privacy screen-blank: black out the PHYSICAL monitor via RandR brightness. Brightness is a gamma
- * ramp applied by the CRTC at scanout, so x11grab (which reads the framebuffer) still captures full
- * content for the Quest while the local screen shows black. Unlike DPMS it isn't woken by the
- * injected mouse/keyboard. Applied to every connected output; best-effort; no-op off X11. */
-#if !defined(_WIN32) && !defined(__APPLE__)
-static void screen_set_blank(int on) {
-    if (!getenv("DISPLAY")) return;
-    char cmd[512];
-    snprintf(cmd, sizeof cmd,
-        "for o in $(xrandr -q 2>/dev/null | grep ' connected' | cut -d' ' -f1); do "
-        "xrandr --output \"$o\" --brightness %s 2>/dev/null; done",
-        on ? "0" : "1");
-    if (system(cmd) != 0) { /* best-effort */ }
-}
-#else
-static void screen_set_blank(int on) { (void)on; }
-#endif
+/* Privacy screen-blank: black out the PHYSICAL monitor at the output gamma LUT (X11 RandR, Windows
+ * SetDeviceGammaRamp, macOS CoreGraphics, Wayland wlr-gamma-control) so capture keeps full content for
+ * the Quest while the local screen shows black — and, unlike DPMS, it isn't woken by injected input.
+ * See src/screenblank.c. */
+static void screen_set_blank(int on) { bsdr_screen_blank(on); }
 
 /* start the session worker. lock held. */
 static void spawn_worker_locked(agent_t *a) {

@@ -188,11 +188,26 @@ CORE_SRC := src/log.c src/net.c src/json.c src/input_decode.c \
             src/dtls.c src/cloud.c src/cloud_stream.c src/app.c src/webui.c \
             src/overlay.c src/httpc.c src/tls.c src/stt.c src/llm.c \
             src/compcontrol.c src/voice.c src/screenshot.c src/threed.c \
-            src/depth_onnx.c src/model_store.c src/webcam.c src/voicefx.c src/faceswap.c src/micsub.c src/deps.c \
+            src/depth_onnx.c src/model_store.c src/webcam.c src/voicefx.c src/faceswap.c src/micsub.c src/deps.c src/screenblank.c \
             $(INJECT_SRC) $(WINLIST_SRC) $(SCTP_SRC) $(MEDIA_SRC)
 # miniz (vendored, third_party) backs model_store.c's zip import; built in every config.
 # Map both .c and .m (macOS AVFoundation shims) sources to objects.
 CORE_OBJ := $(patsubst src/%.m,$(BUILD)/%.o,$(patsubst src/%.c,$(BUILD)/%.o,$(CORE_SRC))) $(BUILD)/miniz.o
+
+# Wayland privacy screen-blank: configure sets WAYLAND_GAMMA=1 (libwayland-client + wayland-scanner
+# present) and adds src/screenblank_wayland.c to MEDIA_SRC. Generate the wlr-gamma-control client glue
+# from the vendored protocol XML and link it in; screenblank_wayland.o needs the generated header.
+ifeq ($(WAYLAND_GAMMA),1)
+CFLAGS   += -I$(BUILD)
+CORE_OBJ += $(BUILD)/wlr-gamma-control-protocol.o
+$(BUILD)/wlr-gamma-control-client-protocol.h: protocols/wlr-gamma-control-unstable-v1.xml | $(BUILD)
+	wayland-scanner client-header $< $@
+$(BUILD)/wlr-gamma-control-protocol.c: protocols/wlr-gamma-control-unstable-v1.xml | $(BUILD)
+	wayland-scanner private-code $< $@
+$(BUILD)/wlr-gamma-control-protocol.o: $(BUILD)/wlr-gamma-control-protocol.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/screenblank_wayland.o: $(BUILD)/wlr-gamma-control-client-protocol.h
+endif
 
 LIB   := $(BUILD)/libbsdr_core.a
 AGENT := $(BUILD)/bsdr_agent$(EXEEXT)
@@ -321,7 +336,7 @@ WIN_MEDIA_LIBS := -lavdevice -lavfilter -lavformat -lavcodec -lswscale -lswresam
 windows-media:
 	@test -n "$(WIN_DEPS)" || { \
 	  echo "usage: make windows-media WIN_DEPS=/path/to/win-deps  (run scripts/build-win-deps.sh first)"; exit 1; }
-	$(MAKE) all BUILD=build-windows-media EXEEXT=.exe \
+	$(MAKE) all BUILD=build-windows-media EXEEXT=.exe WAYLAND_GAMMA= \
 	  CC=$(WIN_HOST)-gcc AR=$(WIN_HOST)-ar INJECT_SRC=src/inject_win.c \
 	  WINRES=build-windows-media/bsdrx_res.o WINDRES=$(WIN_HOST)-windres \
 	  SCTP_SRC= WINLIST_SRC=src/winlist_win.c MEDIA_SRC="$(WIN_MEDIA_SRC)" \
@@ -349,7 +364,7 @@ osxcross:
 	  echo "usage: make osxcross OSX_DEPS=/path/to/darwin-deps [OSX_HOST=o64|oa64] [OSX_BUILD=$(OSX_BUILD)]"; \
 	  echo "  OSX_DEPS = a prefix with darwin static libs: openssl + opus + srtp2 + usrsctp + pcap + ffmpeg. Needs osxcross in PATH."; exit 1; }
 	@command -v $(OSX_HOST)-clang >/dev/null 2>&1 || { echo "error: $(OSX_HOST)-clang not in PATH (osxcross not installed?)"; exit 1; }
-	$(MAKE) all BUILD=$(OSX_BUILD) EXEEXT= \
+	$(MAKE) all BUILD=$(OSX_BUILD) EXEEXT= WAYLAND_GAMMA= \
 	  MEDIA_SRC="$(OSX_MEDIA_SRC)" SCTP_SRC=src/sctp.c WINLIST_SRC=src/winlist_macos.c \
 	  CC=$(OSX_HOST)-clang AR="$(OSX_AR)" INJECT_SRC=src/inject_macos.c \
 	  CFLAGS="$(BASE_CFLAGS) $(OSX_MEDIA_DEF) $(OSX_ONNX_DEF) -I$(OSX_DEPS)/include" \
