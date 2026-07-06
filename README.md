@@ -125,11 +125,19 @@ A no-model, low-latency DSP voice changer applied to the headset-owner's voice b
 it reaches the virtual mic, computer-control, or the cloud room. A **master enable**
 toggle plus four knobs: **gender** (−100…100 pitch+formant shift), **robot**
 (ring-mod), **echo**, **whisper** (breathiness). Cross-platform (no FFT/ffmpeg). With
-**MITM** active, the optional **"substitute into the cloud"** option rewrites the
-headset→cloud packets in flight — **Linux** via NFQUEUE (root), **Windows** via the
-bundled **WinDivert** (Administrator) — so the *room* hears the changed voice too.
-(macOS lacks a userland packet-divert primitive, so substitution is unavailable there;
-a higher-quality RVC model tier is planned behind the same interface.)
+**MITM** or **Relay** active, the optional **"substitute into the cloud"** option makes
+the *room* hear the changed voice too. Two paths:
+- **Local, in-flight** (no router companion): rewrite the headset→cloud packets as they
+  transit this host — **Linux** via NFQUEUE (root), **Windows** via bundled **WinDivert**
+  (Administrator). **macOS-local** (experimental, wired switched LAN only): ARP-MITM +
+  BPF — the privileged helper pf-drops the headset's original owner-mic and BPF-injects
+  bsdrX's re-encoded copy in its place (macOS has no userland packet-divert primitive).
+- **Via the relay** (all four platforms, and Android's only path): the router companion
+  forwards the originals to bsdrX; bsdrX re-encodes the changed voice and hands the
+  modified RTP back; the relay drops the originals and forwards the modified audio to the
+  cloud instead. bsdrX does all the codec/DSP — the relay just shuttles and swaps.
+
+(A higher-quality RVC model tier is planned behind the same interface.)
 
 ### Microphone hijacking & capture
 
@@ -225,7 +233,8 @@ encoder paths, and the build targets).
 | 2D→3D built-in ONNX tiers | ✅ CUDA | ✅ DirectML | ✅ CoreML | ✅ NNAPI |
 | Face swap | ✅ | ✅ | ✅ | ✅ (all need ONNX Runtime + models) |
 | Voice changer (DSP) | ✅ | ✅ | ✅ | ✅ |
-| Voice substitution into cloud | ✅ NFQUEUE (root) | ⚠️ WinDivert (Admin) | ❌ (no divert socket) | ❌ |
+| Voice substitution — local (in-flight, no relay) | ✅ NFQUEUE (root) | ⚠️ WinDivert (Admin) | ⚠️ ARP-MITM+BPF (wired only, experimental) | ❌ (no local capture) |
+| Voice substitution — via relay | ✅ | ✅ | ✅ | ✅ (its only method) |
 | Owner-mic **Sniff** (passive) | ✅ (root helper) | ⚠️ Npcap + Admin | ⚠️ libpcap (root) | ❌ (no local capture) |
 | Owner-mic **MITM** (ARP) | ✅ | ⚠️ Npcap + Admin (in-process) | ⚠️ | ❌ |
 | Owner-mic **Relay** (`bsdr_micrelay`) | ✅ | ✅ | ✅ | ✅ (its only method) |
@@ -247,9 +256,12 @@ encoder paths, and the build targets).
   so it gets the owner mic **only via the router relay** (`bsdr_micrelay`).
 - **MITM (ARP)** is a switched-LAN technique; over **Wi-Fi** it still works unless the AP enforces
   client isolation (bsdrX NATs the headset uplink so the AP's source-guard doesn't drop it) — if
-  isolation is on, use the **Relay**. Cloud **voice substitution** rewrites the headset's outbound
-  voice in flight while we MITM it: **Linux** via NFQUEUE (root), **Windows** via bundled **WinDivert**
-  (Administrator). macOS has no userland packet-divert primitive, so it's not supported there.
+  isolation is on, use the **Relay**.
+- Cloud **voice substitution** makes the *room* hear the changed voice, two ways: **local, in-flight**
+  while we MITM (Linux NFQUEUE / Windows WinDivert / macOS ARP-MITM+BPF, wired & experimental — macOS
+  has no userland divert primitive), or **via the relay** on **all four platforms** (bsdrX re-encodes
+  and the router companion swaps the modified audio in for the original). Android has only the relay.
+  Enable it *before* joining a room (the SFU binds to the first RTP source).
 - The virtual mic depends on a loopback driver you must install: **VB-CABLE** on
   Windows, **BlackHole** on macOS (PulseAudio is native on Linux). The web panel's
   **Dependencies** card lists every optional external driver/program a feature needs,
@@ -327,7 +339,11 @@ Linux AppImage/`.deb` bundle enable it automatically; absent → x11grab/kmsgrab
 
 `bsdr_micrelay --iface br-lan --quest <headset-ip> --to <pc-ip>:PORT` on the router;
 `bsdr_agent --sniff-remote PORT` on the PC. The router is already in the path, so this
-works over Wi-Fi with no ARP-spoofing and no root on the PC.
+works over Wi-Fi with no ARP-spoofing and no root on the PC. It also carries **voice
+substitution** on every platform: with the voice changer's "substitute into the cloud"
+option on, bsdrX sends the re-encoded audio back to the relay, which drops the headset's
+originals (an `iptables` FORWARD rule — needs root on the router) and forwards the changed
+voice to the cloud instead. bsdrX does the codec/DSP; the relay just shuttles and swaps.
 
 ### High-level data flow
 

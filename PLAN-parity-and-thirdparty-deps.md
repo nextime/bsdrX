@@ -72,6 +72,22 @@ Web surface (all in `webui.c`, served locally, same-origin):
 - **distribute.sh**: no direct change (delegates to the above scripts).
 - **win-deps**: add WinDivert (dll/sys/lib/h) to the prefix; document in the win-deps memory.
 
+## Voice substitution — extend beyond Linux/Windows (operator-approved: relay for ALL 4 + macOS-local)
+
+Design (operator-clarified 2026-07-06): the relay stays DUMB — no Opus/DSP/NFQUEUE. bsdrX does all codec+voicefx.
+- **Relay path (all 4 platforms, via `bsdr_micrelay`)**: relay captures the Quest owner-mic → forwards originals
+  to bsdrX (as today). bsdrX decodes, voice-changes, re-encodes, and sends the MODIFIED RTP back to the relay.
+  bsdrX also sends a control msg (mode + cloud dst). In SUBSTITUTE mode the relay: (a) `iptables -I FORWARD
+  -s <quest> -d <cloud> -p udp --dport <port> -j DROP` to suppress the Quest's transit originals, and
+  (b) sends bsdrX's modified RTP to the cloud via a local UDP socket. The DROP is on FORWARD (transit); the
+  relay's sendto is OUTPUT (local) — different chains, no conflict, and mediasoup comedia binds to the relay's
+  one consistent source. Protocol: bsdrX→relay msgs are magic-tagged ("BSRL" + 'C' control | 'A' audio); relay→
+  bsdrX stays raw IPv4 (unchanged). Caveat: enable substitution BEFORE joining the room (source binds on 1st RTP).
+- **macOS-local path (wired only)**: ARP-MITM + BPF capture-drop-reinject in micsniff (no divert socket on mac);
+  pf-block the locked flow "in" + inject rewritten frame via mc_cap. Wired/no-source-guard only (raw inject uses
+  quest src IP). Experimental.
+- Shared re-encode core reused from micsub's rewrite(). All compile-verified; NEEDS live Quest+router+cloud test.
+
 ## Order of execution / STATUS
 1. **DONE + built** A1–A3 (macOS screen prompt, webcam .m, stereo). Verified: compiles+links on the
    real osxcross toolchain (bsdrx-osx-full image, `make osxcross OSX_HOST=o64 OSX_DEPS=/opt/ossl-x86_64`).
@@ -93,5 +109,10 @@ Web surface (all in `webui.c`, served locally, same-origin):
    ViGEmBus/BlackHole = instructions+official download link (licences forbid silent install or need user
    consent). `automatable` flag reserved for future fetch-and-launch installers. Runtime smoke test blocked:
    the agent gets signal-killed when detached in this sandbox (env artifact; web server binds fine).
-5. **TODO** B macOS experimental piggyback (needs micsniff↔micsub plumbing; no divert socket).
+5. **DONE + built** Voice-sub extension: (a) RELAY path for ALL 4 platforms — micsniff re-encodes the
+   voice-changed audio, sends modified RTP + control to bsdr_micrelay, which iptables-DROPs the transit
+   originals (FORWARD) and forwards the modified RTP to the cloud from a local socket (OUTPUT); (b) macOS
+   LOCAL (wired, experimental) — parent builds the modified full IPv4 datagram, the privileged helper
+   pf-drops the original + BPF-injects our copy (com.apple/bsdr_sub anchor). Both reuse one Opus encoder
+   + magic-tagged 'C'/'A' protocol. Compile-verified Linux/Win/macOS + make micrelay. NEEDS live test.
 6. **TODO** full `./distribute.sh` bundle run; live Quest tests (Win voice-sub, macOS screen/webcam).

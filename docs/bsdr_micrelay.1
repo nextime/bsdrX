@@ -23,6 +23,16 @@ bsdrX then decodes them through its normal owner-mic path, exposing the
 virtual microphone and feeding voice computer-control. Because it captures the headset's own
 uplink, the result is the owner's voice only \(em no room mixing, no MITM, no monitor mode.
 .PP
+.B Cloud voice substitution.
+When bsdrX has the voice changer's \(lqsubstitute into the cloud\(rq option on, it re\-encodes the
+changed voice and sends the modified RTP back to the relay over the same UDP link. The relay then
+installs an
+.B iptables
+FORWARD DROP for the headset\(->cloud flow (suppressing the originals) and forwards bsdrX's modified
+audio to the cloud from its own socket, so the room hears the changed voice. This needs root on the
+router (for the DROP rule); the relay does no codec work itself, and reverts to passthrough
+automatically if bsdrX stops driving it. It is controlled entirely by bsdrX \(em no extra flags.
+.PP
 The binary is fully static (bundled libpcap), so it can be copied straight onto a router. Prebuilt
 binaries for common router and PC architectures ship in
 .B bsdrX_relay.zip

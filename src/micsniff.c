@@ -116,6 +116,14 @@ struct bsdr_micsniff {
     int         sink_mod, src_mod;
     bsdr_audio_player *player;
     OpusDecoder *dec;
+    /* Cloud voice SUBSTITUTION over the relay: bsdrX re-encodes the voice-changed owner audio and
+     * sends the modified RTP back to the router companion, which forwards it to the cloud instead of
+     * the original (see bsdr_micrelay). enc is created lazily. relay_peer is learned from recvfrom. */
+    OpusEncoder *enc;
+    int          substitute;            /* 1 = send modified RTP to the relay for cloud substitution */
+    struct sockaddr_in relay_peer;      /* the router companion's src address (to send back to) */
+    int          have_relay_peer;
+    uint64_t     last_ctrl_ms;          /* throttle the relay control heartbeat */
 
     /* realtime voice changer (gender shift) applied to the decoded owner voice before it reaches the
      * virtual mic / the cloud / the command tap. 0 = off. */
@@ -182,6 +190,60 @@ static void micsniff_apply_fx(struct bsdr_micsniff *s, int16_t *pcm, int frames)
 
 /* Parse one captured IPv4 datagram: strip the 8B [ssrc][frame_id] trailer, dedupe the 2x send,
  * lock the first mono-Opus flow, decode, and play out. (parent / in-process, unprivileged) */
+/* ---- relay cloud-substitution protocol (bsdrX -> router companion) ----
+ * Messages are magic-tagged so the relay can tell them from... nothing else (relay->bsdrX stays raw
+ * IPv4). 'C' = control (mode + cloud dst), 'A' = a modified RTP packet to forward to the cloud. */
+#define RELAY_MAGIC0 'B'
+#define RELAY_MAGIC1 'S'
+#define RELAY_MAGIC2 'R'
+#define RELAY_MAGIC3 'L'
+
+/* Tell the relay whether to substitute (mode 1) or pass through (mode 0), and the cloud dst to
+ * suppress/forward-to. Throttled to ~4/s so a relay that (re)started re-learns the state. */
+static void relay_send_control(struct bsdr_micsniff *s, int mode) {
+    if (s->data_fd < 0 || !s->have_relay_peer || !s->have_flow) return;
+    uint8_t m[16];
+    m[0]=RELAY_MAGIC0; m[1]=RELAY_MAGIC1; m[2]=RELAY_MAGIC2; m[3]=RELAY_MAGIC3; m[4]='C';
+    m[5]=(uint8_t)mode;
+    memcpy(m + 6, &s->flow_dst_be, 4);                 /* cloud IP, wire order */
+    m[10]=(uint8_t)(s->flow_dport >> 8); m[11]=(uint8_t)(s->flow_dport & 0xff);
+    sendto(s->data_fd, (const char *)m, 12, 0, (struct sockaddr *)&s->relay_peer, sizeof s->relay_peer);
+}
+
+/* Send a modified RTP packet (RTP header + re-encoded Opus + original 8-byte trailer) to the relay,
+ * which forwards it to the cloud in place of the Quest's original. */
+static void relay_send_audio(struct bsdr_micsniff *s, const uint8_t *rtp_pkt, int rlen) {
+    if (s->data_fd < 0 || !s->have_relay_peer || rlen <= 0 || rlen > 1600) return;
+    uint8_t m[1610];
+    m[0]=RELAY_MAGIC0; m[1]=RELAY_MAGIC1; m[2]=RELAY_MAGIC2; m[3]=RELAY_MAGIC3; m[4]='A';
+    memcpy(m + 5, rtp_pkt, (size_t)rlen);
+    sendto(s->data_fd, (const char *)m, (size_t)(5 + rlen), 0, (struct sockaddr *)&s->relay_peer, sizeof s->relay_peer);
+}
+
+#if defined(__APPLE__)
+/* ---- macOS LOCAL substitution (wired only): the parent builds the modified full IPv4 datagram and
+ * hands it to the privileged helper, which prepends L2 and BPF-injects it toward the gateway while a
+ * pf rule drops the Quest's original. No divert socket on macOS, so this capture-drop-reinject is the
+ * only local option; it needs source=quest to survive (works on a wired switched LAN, not Wi-Fi). */
+static uint16_t csum16(const uint8_t *p, int len, uint32_t sum) {
+    while (len > 1) { sum += (uint16_t)((p[0] << 8) | p[1]); p += 2; len -= 2; }
+    if (len) sum += (uint16_t)(p[0] << 8);
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+static void fix_ip_udp_csum(uint8_t *ip, int ihl, int ulen) {
+    ip[10] = ip[11] = 0;
+    uint16_t c = csum16(ip, ihl, 0); ip[10] = (uint8_t)(c >> 8); ip[11] = (uint8_t)(c & 0xff);
+    uint8_t *udp = ip + ihl; udp[6] = udp[7] = 0;
+    uint32_t sum = 0;
+    sum += (ip[12] << 8) | ip[13]; sum += (ip[14] << 8) | ip[15];
+    sum += (ip[16] << 8) | ip[17]; sum += (ip[18] << 8) | ip[19];
+    sum += 17; sum += (uint16_t)ulen;
+    uint16_t u = csum16(udp, ulen, sum); if (u == 0) u = 0xffff;
+    udp[6] = (uint8_t)(u >> 8); udp[7] = (uint8_t)(u & 0xff);
+}
+#endif
+
 static void handle_ip(struct bsdr_micsniff *s, const uint8_t *ip, int len) {
     if (len < 20) return;
     if ((ip[0] >> 4) != 4) return;
@@ -247,6 +309,56 @@ static void handle_ip(struct bsdr_micsniff *s, const uint8_t *ip, int len) {
     micsniff_apply_fx(s, pcm, fr);
     if (s->player) bsdr_audio_player_push(s->player, pcm, fr);
     if (s->pcm_cb) s->pcm_cb(s->pcm_user, pcm, fr, 1);
+
+    /* Cloud SUBSTITUTION: re-encode the voice-changed audio (RTP header + new Opus + original 8-byte
+     * trailer preserved) and hand the modified packet to whichever inline point forwards it to the cloud
+     * in place of the original — the RELAY (modified RTP -> router companion) or, on macOS, the local
+     * privileged HELPER (modified full IPv4 datagram -> BPF inject; wired only). */
+    if (s->substitute) {
+        if (!s->enc) {
+            int e = 0; s->enc = opus_encoder_create(48000, 1, OPUS_APPLICATION_VOIP, &e);
+            if (s->enc) opus_encoder_ctl(s->enc, OPUS_SET_BITRATE(24000));
+        }
+        uint8_t nopus[1300];
+        int nolen = s->enc ? opus_encode(s->enc, pcm, fr, nopus, (int)sizeof nopus) : 0;
+        if (nolen > 0) {
+            uint64_t now = bsdr_now_ms();
+            if (s->remote_port > 0 && s->have_relay_peer && hlen + nolen + 8 <= 1600) {
+                uint8_t out[1600];
+                memcpy(out, rtp, (size_t)hlen);
+                memcpy(out + hlen, nopus, (size_t)nolen);
+                memcpy(out + hlen + nolen, tr, 8);
+                relay_send_audio(s, out, hlen + nolen + 8);
+                if (now - s->last_ctrl_ms > 250) { s->last_ctrl_ms = now; relay_send_control(s, 1); }
+            }
+#if defined(__APPLE__)
+            else if (s->mitm && s->remote_port <= 0 && s->data_fd >= 0) {
+                int new_ulen = 8 + hlen + nolen + 8;
+                int new_iplen = ihl + new_ulen;
+                if (new_iplen <= 1500 && ihl + 8 + hlen <= len) {
+                    uint8_t out[5 + 1500];
+                    out[0]=RELAY_MAGIC0; out[1]=RELAY_MAGIC1; out[2]=RELAY_MAGIC2; out[3]=RELAY_MAGIC3; out[4]='A';
+                    uint8_t *d = out + 5;
+                    memcpy(d, ip, (size_t)(ihl + 8 + hlen));               /* IP + UDP + RTP headers */
+                    memcpy(d + ihl + 8 + hlen, nopus, (size_t)nolen);
+                    memcpy(d + ihl + 8 + hlen + nolen, tr, 8);
+                    d[2]=(uint8_t)(new_iplen>>8); d[3]=(uint8_t)(new_iplen&0xff);
+                    d[ihl+4]=(uint8_t)(new_ulen>>8); d[ihl+5]=(uint8_t)(new_ulen&0xff);
+                    fix_ip_udp_csum(d, ihl, new_ulen);
+                    (void)!send(s->data_fd, (const char *)out, (size_t)(5 + new_iplen), 0);
+                    if (now - s->last_ctrl_ms > 250) {
+                        s->last_ctrl_ms = now;
+                        uint8_t cm[12];
+                        cm[0]=RELAY_MAGIC0; cm[1]=RELAY_MAGIC1; cm[2]=RELAY_MAGIC2; cm[3]=RELAY_MAGIC3; cm[4]='C';
+                        cm[5]=1; memcpy(cm + 6, &s->flow_dst_be, 4);
+                        cm[10]=(uint8_t)(s->flow_dport>>8); cm[11]=(uint8_t)(s->flow_dport&0xff);
+                        (void)!send(s->data_fd, (const char *)cm, 12, 0);
+                    }
+                }
+            }
+#endif
+        }
+    }
     if ((++s->decoded % 500) == 0)
         BSDR_DEBUG("bsdr.micsniff", "owner-mic: %ld frames decoded", s->decoded);
 }
@@ -402,6 +514,24 @@ static void fw_forward(int add, const char *quest, const char *iface) {
         if (g_pf_we_enabled) { if (system("/sbin/pfctl -d 2>/dev/null")) {} g_pf_we_enabled = 0; }
     }
 }
+/* macOS LOCAL voice substitution: pf-drop the Quest's ORIGINAL owner-mic uplink so only our injected
+ * (voice-changed) copy reaches the cloud. Loaded into its own com.apple sub-anchor (pf.conf globs it).
+ * Driven by the parent's 'C' control messages. */
+static int g_sub_pf = 0;
+static void sub_pf(int add, const char *quest, uint32_t cloud_be, int port) {
+    if (add) {
+        struct in_addr a; a.s_addr = cloud_be;
+        char cs[64]; snprintf(cs, sizeof cs, "%s", inet_ntoa(a));
+        char cmd[400];
+        snprintf(cmd, sizeof cmd,
+                 "printf 'block drop quick proto udp from %s to %s port %d\\n' | /sbin/pfctl -a com.apple/bsdr_sub -f - 2>/dev/null",
+                 quest, cs, port);
+        if (system(cmd) == 0) g_sub_pf = 1;
+    } else if (g_sub_pf) {
+        if (system("/sbin/pfctl -a com.apple/bsdr_sub -F all 2>/dev/null")) {}
+        g_sub_pf = 0;
+    }
+}
 #endif
 
 /* ---- helper (root): capture pump + optional MITM ---- */
@@ -478,10 +608,32 @@ int bsdr_micsniff_helper_main(int argc, char **argv) {
         int n = mc_cap_next(cap, pkt, sizeof pkt, 300);
         if (n < 0) break;
         if (n > 0) { if (send(c, pkt, (size_t)n, 0) < 0 && errno != EAGAIN && errno != EWOULDBLOCK) break; }
-        char b; ssize_t r = recv(c, &b, 1, MSG_PEEK | MSG_DONTWAIT);   /* parent gone? */
+        /* Read the parent's messages (SEQPACKET keeps boundaries). r==0 => parent gone. On macOS these
+         * carry LOCAL substitution: 'C' installs/removes the pf drop, 'A' is a modified IPv4 datagram to
+         * BPF-inject (with our L2 header) in place of the original. Other platforms: only detect EOF. */
+        unsigned char msg[PKT_MAX]; ssize_t r = recv(c, msg, sizeof msg, MSG_DONTWAIT);
         if (r == 0) break;
-        if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) break;
+        if (r < 0) { if (errno != EAGAIN && errno != EWOULDBLOCK) break; }
+#if defined(__APPLE__)
+        else if (r >= 5 && msg[0]=='B' && msg[1]=='S' && msg[2]=='R' && msg[3]=='L') {
+            if (msg[4] == 'C' && r >= 12) {
+                uint32_t cloud_be; memcpy(&cloud_be, msg + 6, 4);
+                int port = (msg[10] << 8) | msg[11];
+                sub_pf(msg[5] ? 1 : 0, quest, cloud_be, port);
+            } else if (msg[4] == 'A' && r > 5 && have_gmac && have_mine) {
+                uint8_t frame[14 + PKT_MAX];
+                memcpy(frame, gw_mac, 6); memcpy(frame + 6, our_mac, 6);
+                frame[12] = 0x08; frame[13] = 0x00;               /* EtherType IPv4 */
+                int iplen = (int)r - 5; if (iplen > PKT_MAX) iplen = PKT_MAX;
+                memcpy(frame + 14, msg + 5, (size_t)iplen);
+                mc_cap_inject(cap, frame, 14 + iplen);
+            }
+        }
+#endif
     }
+#if defined(__APPLE__)
+    sub_pf(0, quest, 0, 0);        /* lift the substitution drop before we heal/exit */
+#endif
 
     if (mitm && have_mine && have_qmac && have_gmac)   /* heal the Quest's cache (only it was poisoned) */
         for (int i = 0; i < 3; i++) {
@@ -633,8 +785,15 @@ static void sniff_main(void *arg) {
             continue;
         }
         if (pr < 0) { if (errno == EINTR) continue; break; }
-        ssize_t n = recv(s->data_fd, buf, sizeof buf, 0);
+        /* recvfrom so relay mode learns the router companion's address (to send substitution back). */
+        struct sockaddr_in peer; socklen_t plen = sizeof peer;
+        ssize_t n = recvfrom(s->data_fd, buf, sizeof buf, 0, (struct sockaddr *)&peer, &plen);
         if (n <= 0) break;                          /* helper gone */
+        if (s->remote_port > 0 && plen == (socklen_t)sizeof peer && peer.sin_family == AF_INET &&
+            (!s->have_relay_peer || s->relay_peer.sin_addr.s_addr != peer.sin_addr.s_addr ||
+             s->relay_peer.sin_port != peer.sin_port)) {
+            s->relay_peer = peer; s->have_relay_peer = 1;
+        }
         captured++;
         handle_ip(s, buf, (int)n);
         if (captured == 1)
@@ -849,8 +1008,14 @@ static void android_relay_main(void *arg) {
     while (!s->stop) {
         struct pollfd pfd = { .fd = s->data_fd, .events = POLLIN, .revents = 0 };
         if (poll(&pfd, 1, 300) <= 0) continue;
-        ssize_t n = recv(s->data_fd, buf, sizeof buf, 0);
+        struct sockaddr_in peer; socklen_t plen = sizeof peer;
+        ssize_t n = recvfrom(s->data_fd, buf, sizeof buf, 0, (struct sockaddr *)&peer, &plen);
         if (n <= 0) { if (n < 0) break; continue; }
+        if (plen == (socklen_t)sizeof peer && peer.sin_family == AF_INET &&
+            (!s->have_relay_peer || s->relay_peer.sin_addr.s_addr != peer.sin_addr.s_addr ||
+             s->relay_peer.sin_port != peer.sin_port)) {
+            s->relay_peer = peer; s->have_relay_peer = 1;
+        }
         handle_ip(s, buf, (int)n);
     }
 }
@@ -935,8 +1100,16 @@ void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int gender, int robot, int echo
     s->fxp.gender = gender; s->fxp.robot = robot; s->fxp.echo = echo; s->fxp.whisper = whisper;
 }
 
+void bsdr_micsniff_set_substitute(bsdr_micsniff *s, int on) {
+    if (!s) return;
+    int was = s->substitute;
+    s->substitute = on ? 1 : 0;
+    if (was && !s->substitute) relay_send_control(s, 0);   /* tell the relay to stop dropping originals */
+}
+
 void bsdr_micsniff_stop(bsdr_micsniff *s) {
     if (!s) return;
+    if (s->substitute) relay_send_control(s, 0);           /* restore passthrough before we go */
     s->stop = 1;
     if (s->thr) { bsdr_thread_join(s->thr); s->thr = NULL; }
 #if defined(__ANDROID__)
@@ -946,6 +1119,7 @@ void bsdr_micsniff_stop(bsdr_micsniff *s) {
     if (s->player) { bsdr_audio_player_free(s->player); s->player = NULL; }
 #endif
     if (s->dec) { opus_decoder_destroy(s->dec); s->dec = NULL; }
+    if (s->enc) { opus_encoder_destroy(s->enc); s->enc = NULL; }
     if (s->fx) { bsdr_voicefx_free(s->fx); s->fx = NULL; }
 #if !defined(__ANDROID__)
     if (s->sink_mod >= 0 || s->src_mod >= 0) bsdr_virtual_mic_destroy(s->sink_mod, s->src_mod);

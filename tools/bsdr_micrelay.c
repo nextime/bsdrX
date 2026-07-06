@@ -30,12 +30,66 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <stdint.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_sig(int s) { (void)s; g_stop = 1; }
+
+/* ---- cloud voice SUBSTITUTION (driven by bsdrX) ----
+ * bsdrX sends magic-tagged messages back over our socket: 'C' control (mode + cloud dst) and 'A' a
+ * modified RTP packet to forward to the cloud in place of the Quest's original. In substitute mode we
+ * (a) iptables-DROP the Quest->cloud transit flow so the router stops forwarding the originals, and
+ * (b) send bsdrX's modified RTP to the cloud from our own socket (OUTPUT chain, so the DROP — which is
+ * on FORWARD — never touches it, and the cloud SFU sees one consistent source). The relay never
+ * decodes/encodes: all codec + voice-change work stays in bsdrX. */
+#define RLY_MAGIC "BSRL"
+
+static uint64_t now_ms(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
+static int  g_sub = 0;                 /* substitute mode active */
+static int  g_drop = 0;                /* the FORWARD DROP rule is installed */
+static char g_quest[64], g_cloud[64];  /* the flow currently dropped */
+static int  g_cport = 0;
+static int  g_cloud_fd = -1;           /* UDP socket to the cloud (stable source for mediasoup) */
+
+static void drop_del(void) {
+    if (!g_drop) return;
+    char c[256];
+    snprintf(c, sizeof c, "iptables -D FORWARD -s %s -d %s -p udp --dport %d -j DROP 2>/dev/null",
+             g_quest, g_cloud, g_cport);
+    if (system(c) != 0) { /* best effort */ }
+    g_drop = 0;
+}
+static void drop_add(const char *quest, const char *cloud, int port) {
+    if (g_drop) {
+        if (!strcmp(g_quest, quest) && !strcmp(g_cloud, cloud) && g_cport == port) return;  /* unchanged */
+        drop_del();
+    }
+    snprintf(g_quest, sizeof g_quest, "%s", quest);
+    snprintf(g_cloud, sizeof g_cloud, "%s", cloud);
+    g_cport = port;
+    char c[256];
+    snprintf(c, sizeof c, "iptables -I FORWARD -s %s -d %s -p udp --dport %d -j DROP 2>/dev/null",
+             quest, cloud, port);
+    if (system(c) == 0) { g_drop = 1; fprintf(stderr, "bsdr_micrelay: substitute ON (drop %s->%s:%d)\n", quest, cloud, port); }
+    else fprintf(stderr, "bsdr_micrelay: WARNING iptables DROP failed (need root; is iptables present?)\n");
+}
+static void cloud_reopen(uint32_t cloud_be, int port) {
+    if (g_cloud_fd >= 0) { close(g_cloud_fd); g_cloud_fd = -1; }
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return;
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = cloud_be; a.sin_port = htons((uint16_t)port);
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return; }  /* stable src port */
+    g_cloud_fd = fd;
+}
 
 static void usage(const char *p) {
     fprintf(stderr,
@@ -84,14 +138,44 @@ int main(int argc, char **argv) {
     fprintf(stderr, "bsdr_micrelay: capturing %s (quest %s) -> %s:%d\n", iface, quest, host, port);
 
     unsigned char buf[2048];
-    unsigned long fwd = 0;
+    unsigned long fwd = 0, subbed = 0;
+    uint64_t last_ctrl = 0;
     while (!g_stop) {
-        int n = mc_cap_next(cap, buf, sizeof buf, 300);
+        int n = mc_cap_next(cap, buf, sizeof buf, 20);
         if (n < 0) break;
-        if (n > 0) { if (send(fd, buf, (size_t)n, 0) > 0) fwd++; }
+        if (n > 0) { if (send(fd, buf, (size_t)n, 0) > 0) fwd++; }   /* forward the original to bsdrX */
+
+        /* Drain control + modified-audio messages from bsdrX (our socket is connect()ed to it). */
+        for (;;) {
+            unsigned char m[2048];
+            ssize_t r = recv(fd, m, sizeof m, MSG_DONTWAIT);
+            if (r <= 0) break;
+            if (r < 5 || memcmp(m, RLY_MAGIC, 4) != 0) continue;
+            if (m[4] == 'C' && r >= 12) {                 /* control: mode + cloud dst */
+                int mode = m[5];
+                uint32_t cloud_be; memcpy(&cloud_be, m + 6, 4);
+                int port = (m[10] << 8) | m[11];
+                char cs[64]; struct in_addr ia; ia.s_addr = cloud_be;
+                snprintf(cs, sizeof cs, "%s", inet_ntoa(ia));
+                if (mode == 1) {
+                    if (!g_sub || g_cloud_fd < 0 || strcmp(g_cloud, cs) != 0 || g_cport != port)
+                        cloud_reopen(cloud_be, port);
+                    drop_add(quest, cs, port);
+                    g_sub = 1; last_ctrl = now_ms();
+                } else {
+                    if (g_sub) { drop_del(); g_sub = 0; fprintf(stderr, "bsdr_micrelay: substitute OFF\n"); }
+                }
+            } else if (m[4] == 'A' && g_sub && g_cloud_fd >= 0) {   /* modified RTP -> cloud */
+                if (send(g_cloud_fd, m + 5, (size_t)(r - 5), 0) > 0) subbed++;
+            }
+        }
+        /* Fail-safe: if bsdrX stops driving substitution, restore passthrough so the mic isn't muted. */
+        if (g_sub && now_ms() - last_ctrl > 2000) { drop_del(); g_sub = 0; fprintf(stderr, "bsdr_micrelay: substitute timed out -> passthrough\n"); }
     }
+    drop_del();
+    if (g_cloud_fd >= 0) close(g_cloud_fd);
     mc_cap_close(cap);
     close(fd);
-    fprintf(stderr, "bsdr_micrelay: stopped (%lu packets forwarded)\n", fwd);
+    fprintf(stderr, "bsdr_micrelay: stopped (%lu forwarded, %lu substituted)\n", fwd, subbed);
     return 0;
 }

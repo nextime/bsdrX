@@ -1335,9 +1335,13 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                 int vg=0, vr=0, ve=0, vw=0; bool vsub=false;
                 bsdr_app_get_voicefx(&app, &vg, &vr, &ve, &vw, &vsub);
                 if (sniffer) bsdr_micsniff_set_voicefx(sniffer, vg, vr, ve, vw);
+                /* Cloud SUBSTITUTION via the RELAY (all platforms incl. Android): bsdrX re-encodes the
+                 * changed voice and the router companion forwards it to the cloud in place of the
+                 * original. No-op unless the sniffer runs in router-companion mode. */
+                if (sniffer) bsdr_micsniff_set_substitute(sniffer, vsub);
 #if !defined(BSDR_PLATFORM_ANDROID)
-                /* Cloud SUBSTITUTION: rewrite the Quest->cloud owner-mic packets in flight so the room
-                 * hears the changed voice. Only possible when we're the MITM (the flow transits us). */
+                /* Cloud SUBSTITUTION in flight (LOCAL, no relay): rewrite the Quest->cloud owner-mic
+                 * packets as they transit us. Only when we're the MITM (NFQUEUE/WinDivert/macOS BPF). */
                 int can_sub = sniffer && vsub && bsdr_micsniff_is_mitm(sniffer);
                 if (can_sub && !micsub) {
                     char qip[64] = "";

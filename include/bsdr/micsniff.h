@@ -95,6 +95,13 @@ void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void 
  * / command tap. gender -100..100 (pitch/formant), robot/echo/whisper 0..100. Safe on a live sniffer. */
 void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int gender, int robot, int echo, int whisper);
 
+/* Cloud voice SUBSTITUTION over the relay: when on (and running in router-companion mode), bsdrX
+ * re-encodes the voice-changed owner audio and sends the modified RTP to the relay, which forwards it
+ * to the cloud in place of the Quest's original (the room hears the changed voice). This is the relay
+ * equivalent of the in-flight NFQUEUE/WinDivert substitution; available on every platform that can run
+ * the relay. Safe on a live sniffer / NULL. */
+void bsdr_micsniff_set_substitute(bsdr_micsniff *s, int on);
+
 #else  /* no audio backend: inert stubs */
 
 static inline int  bsdr_micsniff_helper_main(int argc, char **argv) { (void)argc; (void)argv; return 1; }
@@ -103,6 +110,7 @@ static inline void bsdr_micsniff_stop(bsdr_micsniff *s) { (void)s; }
 static inline bool bsdr_micsniff_is_mitm(const bsdr_micsniff *s) { (void)s; return false; }
 static inline void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void *user) { (void)s; (void)cb; (void)user; }
 static inline void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int g, int r, int e, int w) { (void)s;(void)g;(void)r;(void)e;(void)w; }
+static inline void bsdr_micsniff_set_substitute(bsdr_micsniff *s, int on) { (void)s; (void)on; }
 
 #endif /* BSDR_HAVE_AUDIO */
 
