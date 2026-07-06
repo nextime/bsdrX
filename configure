@@ -264,16 +264,21 @@ if [ "$enable_audio" = yes ] && [ "$target" = linux ]; then
     MEDIA_DEF="$MEDIA_DEF -DBSDR_ENABLE_AUDIO=1 -DBSDR_HAVE_AUDIO=1"
     MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags opus libpulse-simple 2>/dev/null)"
     MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS opus libpulse-simple 2>/dev/null)"
-    # Owner-mic capture: libpcap is the portable engine (macOS BPF, Windows Npcap, Linux). On
-    # Linux it's optional — without it the sniffer falls back to a zero-dependency AF_PACKET
-    # capture. Detect and prefer libpcap when present.
+    # Owner-mic capture: libpcap is the portable capture engine (macOS BPF, Windows Npcap, Linux) and
+    # a REQUIRED build dependency on Linux — the media agent won't build without it. (It's therefore
+    # not an installable "optional dependency" in the panel.)
     if pkg --exists libpcap 2>/dev/null || [ -f /usr/include/pcap.h ] || [ -f /usr/include/pcap/pcap.h ]; then
         MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_PCAP=1"
         MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags libpcap 2>/dev/null)"
         MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS libpcap 2>/dev/null || echo -lpcap)"
         echo "configure: owner-mic capture = libpcap"
     else
-        echo "configure: owner-mic capture = AF_PACKET (libpcap not found; install libpcap-dev for the portable path)"
+        echo "configure: ERROR: libpcap not found — it is a required build dependency." >&2
+        echo "  Install it and re-run ./configure:" >&2
+        echo "    Debian/Ubuntu: sudo apt install libpcap-dev" >&2
+        echo "    Fedora:        sudo dnf install libpcap-devel" >&2
+        echo "    Arch:          sudo pacman -S libpcap" >&2
+        exit 1
     fi
 fi
 

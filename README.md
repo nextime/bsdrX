@@ -77,8 +77,8 @@ re-encoded so an **in-VR media bar** (play / pause, seek, volume, exit) can be
 composited on top, and the source's own audio is streamed:
 
 - **Desktop** — the full screen (default).
-- **Window** — cast a single application window (desktop platforms with window
-  enumeration).
+- **Window** — cast a single application window (all platforms: X11/Windows window
+  lists, macOS CGWindowList + software crop, Android's MediaProjection app picker).
 - **Video file / playlist** — a local file, or a `.txt` **playlist** (one entry per
   line, looped). `--file PATH`.
 - **http / https / rtsp URL** — stream a network video source. `--file URL`.
@@ -215,7 +215,7 @@ encoder paths, and the build targets).
 | Feature | Linux | Windows | macOS | Android |
 |---|:---:|:---:|:---:|:---:|
 | Screen/desktop capture → headset | ✅ Xorg (x11grab) + Wayland (portal/PipeWire) | ✅ gdigrab | ✅ avfoundation (guided Screen Recording grant) | ✅ MediaProjection |
-| Window capture (single window) | ✅ | ✅ | ❌ (no enumeration) | ❌ (whole screen only) |
+| Window capture (single window) | ✅ | ✅ | ✅ CGWindowList + software crop | ✅ MediaProjection app picker |
 | Video file / URL / playlist source | ✅ | ✅ | ✅ | ✅ (MediaExtractor transcode) |
 | Webcam source | ✅ V4L2 | ✅ DirectShow | ✅ AVFoundation (enumerated dropdown) | ✅ CameraManager |
 | Stereo-3D two-camera | ✅ | ✅ | ✅ | ✅ |
@@ -237,7 +237,7 @@ encoder paths, and the build targets).
 | Internet sharing (cloud relay) | ✅ | ✅ | ✅ | ✅ |
 | Privacy screen-blank | ✅ (RandR/X11) | ❌ | ❌ | ❌ (hidden) |
 | Local web control panel | ✅ browser | ✅ browser | ✅ browser | ✅ embedded WebView |
-| 3rd-party dependency helper (panel) | ✅ libpcap (detect + distro hints) | ✅ WinDivert bundled; Npcap / VB-CABLE / ViGEmBus guided | ✅ BlackHole guided | — (no external deps) |
+| 3rd-party dependency helper (panel) | — (deps are build requirements) | ✅ WinDivert bundled; Npcap / VB-CABLE / ViGEmBus guided | ✅ BlackHole guided | — (no external deps) |
 | Automatic LAN pairing / discovery | ✅ | ✅ | ✅ | ✅ |
 
 **Key caveats:**
@@ -377,8 +377,9 @@ CMake is also supported:
 
 **Dependencies** (Debian/Ubuntu): `libssl-dev` (always); for media add `libsrtp2-dev`,
 ffmpeg (`libavcodec/avformat/avdevice/avutil/swscale-dev`), `libopus-dev`,
-`libpulse-dev`, `libusrsctp-dev`. NVENC needs the NVIDIA driver; desktop capture needs
-an X11 display. For the router companion: `make micrelay` (static, bundled libpcap).
+`libpulse-dev`, `libusrsctp-dev`, `libpcap-dev` (required — owner-mic capture). NVENC
+needs the NVIDIA driver; desktop capture needs an X11 display. For the router companion:
+`make micrelay` (static, bundled libpcap).
 
 ### macOS
 

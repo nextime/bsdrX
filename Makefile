@@ -350,7 +350,7 @@ osxcross:
 	  echo "  OSX_DEPS = a prefix with darwin static libs: openssl + opus + srtp2 + usrsctp + pcap + ffmpeg. Needs osxcross in PATH."; exit 1; }
 	@command -v $(OSX_HOST)-clang >/dev/null 2>&1 || { echo "error: $(OSX_HOST)-clang not in PATH (osxcross not installed?)"; exit 1; }
 	$(MAKE) all BUILD=$(OSX_BUILD) EXEEXT= \
-	  MEDIA_SRC="$(OSX_MEDIA_SRC)" SCTP_SRC=src/sctp.c WINLIST_SRC=src/winlist_null.c \
+	  MEDIA_SRC="$(OSX_MEDIA_SRC)" SCTP_SRC=src/sctp.c WINLIST_SRC=src/winlist_macos.c \
 	  CC=$(OSX_HOST)-clang AR="$(OSX_AR)" INJECT_SRC=src/inject_macos.c \
 	  CFLAGS="$(BASE_CFLAGS) $(OSX_MEDIA_DEF) $(OSX_ONNX_DEF) -I$(OSX_DEPS)/include" \
 	  LDLIBS="-L$(OSX_DEPS)/lib $(OSX_MEDIA_LIBS) $(OSX_ONNX_LIBS) -lssl -lcrypto -framework CoreGraphics -framework CoreFoundation"

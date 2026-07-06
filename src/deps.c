@@ -89,14 +89,9 @@ int bsdr_deps_list(bsdr_dep *out, int max) {
     /* libpcap ships with macOS; the Sniff/MITM path just needs root (no separate install). */
 
 #elif defined(__linux__) && !defined(__ANDROID__)
-    /* On Linux the native install (.deb / AppImage) pulls these via the package manager; listed so the
-     * panel can flag a missing optional lib. PulseAudio/PipeWire is the native virtual-audio backend
-     * (no external driver). */
-    ADD("libpcap", "libpcap", "Owner-mic Sniff / MITM packet capture",
-        "BSD (distro package)", "https://www.tcpdump.org/", 0, 0);
-#if defined(BSDR_HAVE_PCAP)
-    for (int i = 0; i < n; i++) if (!strcmp(out[i].id, "libpcap")) out[i].present = 1;
-#endif
+    /* Linux has no installable optional deps: libpcap is a REQUIRED build dependency (configure fails
+     * without it), and PulseAudio/PipeWire is the native virtual-audio backend (no external driver). So
+     * the list stays empty and the panel hides the Dependencies card. */
 #endif
 
 #undef ADD
@@ -173,14 +168,5 @@ const char *bsdr_dep_page(const char *id) {
                "(the 2-channel edition is enough).</li>"
                "<li>Run the <b>.pkg</b> and complete the install (needs your admin password).</li>"
                "<li>Restart bsdrX.</li></ol>";
-    if (!strcmp(id, "libpcap"))
-        return "<h1>libpcap</h1>"
-               "<p>libpcap is the packet-capture library the owner-mic <b>Sniff</b> / <b>MITM</b> methods "
-               "use. The <code>.deb</code> and AppImage bundle it; if you built from source, install it "
-               "with your package manager:</p>"
-               "<ul><li>Debian/Ubuntu: <code>sudo apt install libpcap0.8</code></li>"
-               "<li>Fedora: <code>sudo dnf install libpcap</code></li>"
-               "<li>Arch: <code>sudo pacman -S libpcap</code></li></ul>"
-               "<p>Then restart bsdrX. (The <b>Relay</b> method needs no local capture.)</p>";
     return NULL;
 }

@@ -63,6 +63,26 @@ static int macos_ensure_screen_capture_access(void) {
 }
 #endif
 
+/* Offset a decoded frame's plane pointers to a sub-rect origin (x,y) for software cropping. Handles
+ * planar + packed formats with chroma subsampling; x,y must already be aligned to the chroma grid
+ * (we align the crop rect to even values). Fills out[] with pointers into the frame's own buffers. */
+static void crop_frame_ptrs(const AVFrame *f, int x, int y, const uint8_t *out[4]) {
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(f->format);
+    int step[4] = { 0, 0, 0, 0 };
+    if (d) for (int comp = 0; comp < d->nb_components; comp++) {
+        int pl = d->comp[comp].plane;
+        if (pl >= 0 && pl < 4 && step[pl] == 0) step[pl] = d->comp[comp].step;
+    }
+    for (int p = 0; p < 4; p++) {
+        if (!f->data[p]) { out[p] = NULL; continue; }
+        int chroma = (p == 1 || p == 2);
+        int hsub = (chroma && d) ? d->log2_chroma_w : 0;
+        int vsub = (chroma && d) ? d->log2_chroma_h : 0;
+        int sp = step[p] ? step[p] : 1;
+        out[p] = f->data[p] + (size_t)(y >> vsub) * f->linesize[p] + (size_t)(x >> hsub) * sp;
+    }
+}
+
 struct bsdr_capture {
     AVFormatContext *fmt;
     AVCodecContext *dec;
@@ -75,6 +95,10 @@ struct bsdr_capture {
     AVPacket *opkt;    /* output (H.264) packet */
     int vstream;
     int fps;
+    /* Software crop of the decoded frame to a sub-rect (macOS: avfoundation grabs the whole display
+     * and can't crop at grab time, so the web-UI window/region x/y/w/h is applied here before scale).
+     * crop_w == 0 means no crop (the full frame is scaled). */
+    int crop_x, crop_y, crop_w, crop_h;
     int64_t frame_index;
     const char *enc_name;
     struct bsdr_overlay *overlay;
@@ -747,14 +771,40 @@ have_input:;
 #ifdef BSDR_HAVE_PIPEWIRE
 have_input_pw:;   /* PipeWire path joins here: fmt/dec already set by cap_open_pipewire (no avformat decode) */
 #endif
+#if defined(__APPLE__)
+    /* macOS single-window / region capture: avfoundation grabbed the whole display (no grab-time crop),
+     * so apply the web-UI x/y/w/h here in software. Clamp to the frame and align to even so 4:2:0 chroma
+     * isn't shifted. x11grab/gdigrab already crop at grab time, so this is macOS-only. */
+    if (!c->is_file && !c->is_webcam && !c->is_stereo && cfg.width > 0 && cfg.height > 0) {
+        /* CGWindowList/region coords are in POINTS; avfoundation captures in PIXELS. On a Retina display
+         * they differ by the backing scale, so map points->pixels by (captured pixels / display points). */
+        double sc = 1.0;
+        CGRect db = CGDisplayBounds(CGMainDisplayID());
+        if (db.size.width > 0) sc = (double)c->dec->width / db.size.width;
+        int cx = (int)((cfg.x < 0 ? 0 : cfg.x) * sc), cy = (int)((cfg.y < 0 ? 0 : cfg.y) * sc);
+        int cw = (int)(cfg.width * sc), ch = (int)(cfg.height * sc);
+        if (cx > c->dec->width  - 2) cx = c->dec->width  - 2;
+        if (cy > c->dec->height - 2) cy = c->dec->height - 2;
+        if (cx + cw > c->dec->width)  cw = c->dec->width  - cx;
+        if (cy + ch > c->dec->height) ch = c->dec->height - cy;
+        cx &= ~1; cy &= ~1; cw &= ~1; ch &= ~1;
+        if (cw >= 2 && ch >= 2 && (cw != c->dec->width || ch != c->dec->height || cx || cy)) {
+            c->crop_x = cx; c->crop_y = cy; c->crop_w = cw; c->crop_h = ch;
+            BSDR_INFO("bsdr.capture", "macOS software crop to %dx%d+%d+%d (window/region)", cw, ch, cx, cy);
+        }
+    }
+#endif
+    /* Source dims the scale reads from: the crop rect when active, else the full decoded frame. */
+    int src_w = c->crop_w ? c->crop_w : c->dec->width;
+    int src_h = c->crop_h ? c->crop_h : c->dec->height;
     /* Target dims: 0 means "derive from source". If only one is given, scale the
      * other to preserve the desktop's aspect ratio (so e.g. 720p on a 16:10 or
      * ultrawide desktop is not stretched). The Quest sizes its surface from the
      * encoded SPS, so the aspect ratio here is what the headset displays. */
     int ow = cfg.out_width, oh = cfg.out_height;
-    if (ow <= 0 && oh <= 0) { ow = c->dec->width; oh = c->dec->height; }
-    else if (ow <= 0)       ow = (int)((long)c->dec->width * oh / c->dec->height);
-    else if (oh <= 0)       oh = (int)((long)c->dec->height * ow / c->dec->width);
+    if (ow <= 0 && oh <= 0) { ow = src_w; oh = src_h; }
+    else if (ow <= 0)       ow = (int)((long)src_w * oh / src_h);
+    else if (oh <= 0)       oh = (int)((long)src_h * ow / src_w);
     ow &= ~1; oh &= ~1;   /* even dimensions for 4:2:0 */
     /* 2D->3D "full resolution per eye": render the half-SBS frame at 2x linear resolution, keeping
      * the SCREEN ASPECT (a 2x-wide frame would just make the Quest's screen double-wide, not 3D). At
@@ -822,7 +872,9 @@ have_input_pw:;   /* PipeWire path joins here: fmt/dec already set by cap_open_p
                                  c->eye_w, c->eye_h, AV_PIX_FMT_NV12, SWS_BILINEAR, NULL, NULL, NULL);
         if (!c->sws2) { BSDR_ERROR("bsdr.capture", "stereo: right sws alloc failed"); goto fail; }
     } else {
-        c->sws = sws_getContext(c->dec->width, c->dec->height, c->dec->pix_fmt,
+        /* Source size is the crop rect when a window/region crop is active (src_w/src_h), else the
+         * full frame; the per-frame scale offsets c->raw's pointers to the crop origin. */
+        c->sws = sws_getContext(src_w, src_h, c->dec->pix_fmt,
                                 ow, oh, AV_PIX_FMT_NV12, SWS_BILINEAR, NULL, NULL, NULL);
     }
     c->yuv = av_frame_alloc();
@@ -1028,8 +1080,16 @@ have_raw:;   /* jump target for the Wayland/PipeWire fast-path above; absent (an
         /* Scale into the source buffer (c->src for 3D, else c->yuv directly), composite the overlay
          * on it, then for 3D synthesise the packed SBS frame into c->yuv. */
         AVFrame *pre = c->threed ? c->src : c->yuv;
-        sws_scale(c->sws, (const uint8_t *const *)c->raw->data, c->raw->linesize,
-                  0, c->dec->height, pre->data, pre->linesize);
+        if (c->crop_w) {
+            /* Software crop (macOS window/region): scale only the sub-rect by offsetting the source
+             * plane pointers to the crop origin and feeding the crop height as the slice height. */
+            const uint8_t *cs[4];
+            crop_frame_ptrs(c->raw, c->crop_x, c->crop_y, cs);
+            sws_scale(c->sws, cs, c->raw->linesize, 0, c->crop_h, pre->data, pre->linesize);
+        } else {
+            sws_scale(c->sws, (const uint8_t *const *)c->raw->data, c->raw->linesize,
+                      0, c->dec->height, pre->data, pre->linesize);
+        }
         if (c->overlay)
             bsdr_overlay_render_nv12(c->overlay, pre->data[0], pre->linesize[0],
                                      pre->data[1], pre->linesize[1],
