@@ -28,7 +28,11 @@ typedef struct bsdr_micsub bsdr_micsub;
 bsdr_micsub *bsdr_micsub_start(const char *quest_ip, int queue_num);
 
 /* Live-update the voice change applied to the substituted audio (same knobs as voicefx). */
-void bsdr_micsub_set_voicefx(bsdr_micsub *s, int gender, int robot, int echo, int whisper);
+void bsdr_micsub_set_voicefx(bsdr_micsub *s, int gender, int formant, int volume,
+                             int robot, int echo, int whisper);
+/* Select the AI (RVC) voice tier for the substituted audio (see bsdr_micsniff_set_voiceai). */
+void bsdr_micsub_set_voiceai(bsdr_micsub *s, int on, int tier, const char *content,
+                             const char *rmvpe, const char *voice, int voice_sr, int key);
 
 /* Remove the iptables rule and stop the queue thread. */
 void bsdr_micsub_stop(bsdr_micsub *s);

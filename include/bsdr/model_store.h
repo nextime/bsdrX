@@ -33,6 +33,8 @@ const bsdr_model_info *bsdr_model_for_tier(int tier);
 
 /* The per-OS model cache directory (created if missing). Returns 0 on success. */
 int bsdr_model_dir(char *out, size_t cap);
+/* Same path, but does NOT create it — safe on a read/status poll (no mkdir). */
+int bsdr_model_dir_ro(char *out, size_t cap);
 
 /* Ensure the model for `tier` is present in the cache, downloading it if `allow_download` and it's
  * missing. On success returns 0 and writes the absolute model path into `path`. Returns -1 if the
@@ -76,6 +78,8 @@ extern const char *const bsdr_faceswap_files[BSDR_FACESWAP_NFILES];  /* canonica
 
 /* <model cache>/faceswap (created if missing). Returns 0 on success. */
 int bsdr_faceswap_model_dir(char *out, size_t cap);
+/* Same path, but does NOT create it — safe on a read/status poll (no mkdir). */
+int bsdr_faceswap_model_dir_ro(char *out, size_t cap);
 /* 1 if `filename` (one of bsdr_faceswap_files) is present in the face-swap dir. */
 int bsdr_faceswap_file_present(const char *filename);
 /* 1 if all three face-swap models are present. */

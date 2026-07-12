@@ -47,6 +47,11 @@ bsdr_socket_t bsdr_tcp_accept(bsdr_socket_t listener, struct sockaddr_in *from);
 void bsdr_set_nonblocking(bsdr_socket_t s);
 int bsdr_send_all(bsdr_socket_t s, const void *buf, size_t len);
 
+/* Sleep until `s` is readable or `timeout_ms` elapses. Returns 1 if readable,
+ * 0 on timeout, <0 on error. Lets a non-blocking-socket loop truly sleep
+ * instead of busy-polling with bsdr_sleep_ms(). Portable (poll / WSAPoll). */
+int bsdr_socket_wait_readable(bsdr_socket_t s, int timeout_ms);
+
 /* --- helpers ---------------------------------------------------------------*/
 bool bsdr_sockaddr_make(struct sockaddr_in *out, const char *ip, uint16_t port);
 void bsdr_sockaddr_ip(const struct sockaddr_in *addr, char *out, size_t outlen);

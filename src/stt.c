@@ -65,13 +65,25 @@ bool bsdr_stt_transcribe(const bsdr_stt_config *cfg,
     /* No endpoint configured -> fall back to the built-in free online service. */
     const char *endpoint = cfg->endpoint[0] ? cfg->endpoint : BSDR_STT_FREE_ENDPOINT;
     bool hf = strstr(endpoint, "huggingface") != NULL;
-    if (!cfg->endpoint[0])
-        BSDR_INFO("bsdr.stt", "no STT configured -> using free online service (%s)", endpoint);
+    if (!cfg->endpoint[0]) {
+        if (!cfg->token[0])
+            BSDR_WARN("bsdr.stt", "no STT endpoint/token set — the free anonymous HuggingFace STT was "
+                      "removed. Set an STT endpoint+token in the panel: a free-tier Groq "
+                      "(https://api.groq.com/openai/v1/audio/transcriptions, model whisper-large-v3-turbo), "
+                      "OpenAI, a HuggingFace token, or a self-hosted whisper.cpp on your LAN.");
+        else
+            BSDR_INFO("bsdr.stt", "no STT endpoint set -> HuggingFace router (%s) with your token", endpoint);
+    }
 
-    static uint8_t wav[4 * 1024 * 1024];   /* up to ~130 s mono@16k (matches the capture ceiling) */
-    size_t wav_len = build_wav(pcm, frames, rate, channels, wav, sizeof(wav));
+    /* wav + body were process-lifetime statics (~8 MB) though STT runs rarely. malloc them per call
+     * and free once the request is sent (the alloc is dwarfed by the network round-trip). */
+    const size_t WAV_CAP = 4 * 1024 * 1024;          /* up to ~130 s mono@16k (matches capture ceiling) */
+    const size_t BODY_CAP = 4 * 1024 * 1024 + 4096;
+    uint8_t *wav = malloc(WAV_CAP);
+    uint8_t *body = malloc(BODY_CAP);
+    if (!wav || !body) { free(wav); free(body); BSDR_ERROR("bsdr.stt", "oom"); return false; }
+    size_t wav_len = build_wav(pcm, frames, rate, channels, wav, WAV_CAP);
 
-    static uint8_t body[4 * 1024 * 1024 + 4096];
     size_t n = 0;
     char ctype[96];
     if (hf) {
@@ -82,12 +94,12 @@ bool bsdr_stt_transcribe(const bsdr_stt_config *cfg,
         /* OpenAI-compatible multipart/form-data: model + file */
         const char *boundary = "----bsdrXSTTb0undary";
         const char *model = cfg->model[0] ? cfg->model : "whisper-1";
-        n += snprintf((char *)body + n, sizeof(body) - n,
+        n += snprintf((char *)body + n, BODY_CAP - n,
             "--%s\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n%s\r\n"
             "--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n"
             "Content-Type: audio/wav\r\n\r\n", boundary, model, boundary);
         memcpy(body + n, wav, wav_len); n += wav_len;
-        n += snprintf((char *)body + n, sizeof(body) - n, "\r\n--%s--\r\n", boundary);
+        n += snprintf((char *)body + n, BODY_CAP - n, "\r\n--%s--\r\n", boundary);
         snprintf(ctype, sizeof(ctype), "multipart/form-data; boundary=%s", boundary);
     }
     char auth[320];
@@ -101,6 +113,7 @@ bool bsdr_stt_transcribe(const bsdr_stt_config *cfg,
     static char resp[65536];
     int r = bsdr_http_request("POST", endpoint, hdrs, nh, ctype, body, n,
                               resp, sizeof(resp));
+    free(wav); free(body);                           /* done with the request payload */
     if (r < 0) { BSDR_ERROR("bsdr.stt", "request failed"); return false; }
     int status = bsdr_http_status(resp);
     const char *bdy = bsdr_http_body(resp);

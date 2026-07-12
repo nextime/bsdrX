@@ -15,7 +15,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=bsdr-micrelay
-PKG_VERSION:=0.0.1
+PKG_VERSION:=0.0.2
 PKG_RELEASE:=1
 PKG_MAINTAINER:=Stefy Lanza <stefy@nexlab.net>
 PKG_LICENSE:=GPL-3.0-or-later

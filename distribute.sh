@@ -11,11 +11,12 @@
 #   ./distribute.sh linux windows   # only the named platforms
 #   SKIP=osx ./distribute.sh        # build all except osx
 #   ./distribute.sh --no-cache osx  # force a from-scratch rebuild of the docker image(s)
+#   ./distribute.sh --debug android # build the Android APK as debug (default is release)
 #
 # Key env overrides:
 #   WIN_DEPS   mingw dep prefix (default: ../win-deps or ./win-deps if present)
 #   ANDROID_HOME / ANDROID_SDK_ROOT   Android SDK (default: /opt/android-sdk)
-#   ANDROID_VARIANT   debug|release (default: debug)
+#   ANDROID_VARIANT   debug|release (default: release; pass --debug for a debug APK)
 #   OSXCROSS_DIR   docker-osxcross checkout (default: /storage/osxcross/docker-osxcross)
 #   NO_CLEAN=1     skip the clean step
 #   NO_CACHE=1     (or --no-cache) rebuild the docker images from scratch, ignoring
@@ -33,7 +34,7 @@ mkdir -p "$DIST"
 WIN_DEPS="${WIN_DEPS:-}"
 [ -z "$WIN_DEPS" ] && for c in "$ROOT/../win-deps" "$ROOT/win-deps"; do [ -d "$c" ] && WIN_DEPS="$(cd "$c" && pwd)" && break; done
 ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/opt/android-sdk}}"
-ANDROID_VARIANT="${ANDROID_VARIANT:-debug}"
+ANDROID_VARIANT="${ANDROID_VARIANT:-release}"   # --debug on the command line forces a debug APK
 OSXCROSS_DIR="${OSXCROSS_DIR:-/storage/osxcross/docker-osxcross}"
 LINUX_IMAGE="${LINUX_IMAGE:-bsdrx-linux-deps}"
 OSX_IMAGE="${OSX_IMAGE:-bsdrx-osx-full}"
@@ -67,6 +68,8 @@ ARGS=()
 for a in "$@"; do
   case "$a" in
     --no-cache) NO_CACHE=1 ;;
+    --debug)    ANDROID_VARIANT=debug ;;
+    --release)  ANDROID_VARIANT=release ;;
     *) ARGS+=("$a") ;;
   esac
 done
@@ -245,6 +248,21 @@ build_android(){
   if [ ! -x "$ROOT/android/gradlew" ]; then err "android/gradlew missing"; record android SKIP "no gradlew"; return; fi
   if [ ! -d "$ANDROID_HOME" ]; then err "Android SDK not found at $ANDROID_HOME (set ANDROID_HOME)"; record android SKIP "no SDK"; return; fi
   ok "Android SDK=$ANDROID_HOME  variant=$ANDROID_VARIANT"
+  # Release signing falls back to the debug keystore (see app/build.gradle) unless BSDR_KEYSTORE is set.
+  # The SDK only auto-creates that keystore on a debug build, so generate it here if missing — otherwise
+  # assembleRelease emits an uninstallable app-release-unsigned.apk and the copy below fails.
+  if [ "$ANDROID_VARIANT" = release ] && [ -z "${BSDR_KEYSTORE:-}" ]; then
+    local ks="${HOME:-/root}/.android/debug.keystore"
+    if [ ! -f "$ks" ]; then
+      if have keytool; then
+        log "  generating Android debug keystore for release signing…"
+        mkdir -p "$(dirname "$ks")"
+        keytool -genkeypair -v -keystore "$ks" -storepass android -keypass android \
+          -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+          -dname 'CN=Android Debug,O=Android,C=US' >/dev/null 2>&1 || warn "keytool failed; release APK may be unsigned"
+      else warn "keytool not found; release APK may be unsigned (set BSDR_KEYSTORE or use --debug)"; fi
+    fi
+  fi
   local task apk
   case "$ANDROID_VARIANT" in
     release) task=assembleRelease; apk="$ROOT/android/app/build/outputs/apk/release/app-release.apk";;

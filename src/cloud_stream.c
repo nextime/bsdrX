@@ -98,6 +98,7 @@ struct bsdr_cloud_stream {
      * blocking) internet sends OFF the LAN video loop too. On overflow (uplink can't keep up) the
      * oldest frame is dropped — a brief glitch until the next keyframe, not a permanent freeze. */
     bsdr_mutex *flock;
+    bsdr_cond *vcond;           /* signalled by feed_video; coupled sender sleeps on it when empty */
     struct cloud_vframe { uint8_t *buf; size_t cap, len; } vq[BSDR_CLOUD_VQ];
     int vq_head, vq_tail;       /* head = next to send, tail = next to write */
     long vq_dropped;
@@ -119,6 +120,7 @@ void bsdr_cloud_stream_feed_video(bsdr_cloud_stream *cs, const uint8_t *au, size
     struct cloud_vframe *f = &cs->vq[cs->vq_tail];
     if (len > f->cap) { uint8_t *nb = realloc(f->buf, len); if (nb) { f->buf = nb; f->cap = len; } }
     if (f->buf && len <= f->cap) { memcpy(f->buf, au, len); f->len = len; cs->vq_tail = next; }
+    if (cs->vcond) bsdr_cond_signal(cs->vcond);       /* wake the sender the instant a frame lands */
     bsdr_mutex_unlock(cs->flock);
 }
 #endif
@@ -142,20 +144,64 @@ static void cloud_latch(bsdr_udp *udp) {
  * tears the sockets down on each toggle, so with plain ephemeral ports a restart gets NEW ports
  * and the relay ignores us (no INIT-ACK, no audio/data back). Two remedies:
  *   --cloud-src-port N   : hard-pin video=N, audio=N+1, data=N+2.
- *   --cloud-sticky-ports : keep ephemeral (like the official client) on the FIRST stream to a
- *                          relay IP, then REUSE those exact ports for that IP across toggles;
- *                          a new relay IP or a process restart starts fresh. */
+ *   sticky ports (ON BY DEFAULT): keep ephemeral (like the official client) on the FIRST stream to a
+ *                          relay IP, then REUSE those exact ports for that IP across toggles AND across
+ *                          a process restart — the tuple is persisted to ~/.config/bsdr_agent/sticky_ports
+ *                          so a restarted agent rebinds the same ports and the relay's latch survives.
+ *                          A different relay IP starts fresh; an unbindable persisted port falls back to
+ *                          ephemeral (so a stale entry never blocks streaming). --cloud-no-sticky-ports
+ *                          disables it. */
 static bsdr_mutex *g_sticky_lock = NULL;
 static struct { char ip[64]; uint16_t port[3]; } g_sticky;   /* [0]=video [1]=audio [2]=data */
+static int g_sticky_loaded = 0;                              /* lazily read the persisted tuple once */
+
+/* Sticky source ports persist across a process restart so a restarted agent rebinds the SAME local
+ * ports for the same relay IP — the relay's comedia latch (keyed on our source tuple) stays valid and
+ * media/audio resume without a re-latch. Stored as: ip\nvideo\naudio\ndata. Caller holds g_sticky_lock. */
+static bool sticky_path(char *out, size_t cap) {
+    char dir[512];
+    if (!bsdr_config_dir(dir, sizeof dir)) return false;
+    snprintf(out, cap, "%s/sticky_ports", dir);
+    return true;
+}
+static void sticky_load_locked(void) {
+    if (g_sticky_loaded) return;
+    g_sticky_loaded = 1;
+    char path[600];
+    if (!sticky_path(path, sizeof path)) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char ip[64] = ""; unsigned v = 0, a = 0, d = 0;
+    if (fgets(ip, sizeof ip, f)) {
+        ip[strcspn(ip, "\r\n")] = 0;
+        if (fscanf(f, "%u\n%u\n%u", &v, &a, &d) >= 1 && ip[0]) {
+            snprintf(g_sticky.ip, sizeof g_sticky.ip, "%s", ip);
+            g_sticky.port[0] = (uint16_t)v; g_sticky.port[1] = (uint16_t)a; g_sticky.port[2] = (uint16_t)d;
+            BSDR_INFO("bsdr.cloud", "sticky ports: restored %s v=%u a=%u d=%u (survives restart)",
+                      g_sticky.ip, v, a, d);
+        }
+    }
+    fclose(f);
+}
+static void sticky_save_locked(void) {
+    char path[600];
+    if (!sticky_path(path, sizeof path)) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%s\n%u\n%u\n%u\n", g_sticky.ip, g_sticky.port[0], g_sticky.port[1], g_sticky.port[2]);
+    fclose(f);
+}
 
 static uint16_t cloud_src_pick(bsdr_app *app, const char *relay_ip, int kind, uint16_t fixed) {
     if (fixed) return fixed;                              /* --cloud-src-port wins */
     if (!app || !app->cloud_sticky_ports) return 0;      /* plain ephemeral */
     if (!g_sticky_lock) g_sticky_lock = bsdr_mutex_new();
     bsdr_mutex_lock(g_sticky_lock);
+    sticky_load_locked();                                /* seed from disk on first use */
     if (strcmp(g_sticky.ip, relay_ip) != 0) {            /* relay changed -> forget old tuple */
         snprintf(g_sticky.ip, sizeof(g_sticky.ip), "%s", relay_ip);
         g_sticky.port[0] = g_sticky.port[1] = g_sticky.port[2] = 0;
+        sticky_save_locked();
     }
     uint16_t p = g_sticky.port[kind];                    /* 0 => bind ephemeral, then record it */
     bsdr_mutex_unlock(g_sticky_lock);
@@ -164,7 +210,10 @@ static uint16_t cloud_src_pick(bsdr_app *app, const char *relay_ip, int kind, ui
 static void cloud_src_record(bsdr_app *app, const char *relay_ip, int kind, uint16_t actual) {
     if (!app || !app->cloud_sticky_ports || !actual || !g_sticky_lock) return;
     bsdr_mutex_lock(g_sticky_lock);
-    if (strcmp(g_sticky.ip, relay_ip) == 0) g_sticky.port[kind] = actual;
+    if (strcmp(g_sticky.ip, relay_ip) == 0 && g_sticky.port[kind] != actual) {
+        g_sticky.port[kind] = actual;
+        sticky_save_locked();                            /* persist the newly-bound ephemeral port */
+    }
     bsdr_mutex_unlock(g_sticky_lock);
 }
 
@@ -173,14 +222,55 @@ static void cloud_src_record(bsdr_app *app, const char *relay_ip, int kind, uint
  * here — that would open a SECOND nvenc session alongside the LAN encoder, starving it and
  * crashing the Quest. Instead set up the RTP sender + comedia latch + RTCP, then idle; the LAN
  * loop feeds us its already-encoded access units via bsdr_cloud_stream_feed_video. ---- */
+/* Open the decoupled cloud capture+encoder from the CURRENT app config. A fresh open always begins on
+ * an IDR keyframe, so releasing it while the share is paused and reopening on resume yields a clean
+ * picture within one GOP (and picks up any region/quality/3D change made during the pause). NULL on
+ * failure. Keeps cs->vid_w/vid_h in sync for the cloud trailer. */
+static bsdr_capture *cloud_open_decoupled_cap(bsdr_cloud_stream *cs) {
+    bsdr_capture_config cfg = {0};
+    cfg.fps = 30;
+    int rx=0,ry=0,rw=0,rh=0, qw=0,qh=0,qbr=0;
+    if (cs->app) { bsdr_app_get_region(cs->app, &rx,&ry,&rw,&rh);
+                   bsdr_app_get_quality(cs->app, &qw,&qh,&qbr); }
+    cfg.x=rx; cfg.y=ry; cfg.width=rw; cfg.height=rh;
+    cfg.out_width = qw>0?qw:0; cfg.out_height = qh>0?qh:0;
+    cfg.bitrate = qbr>0 ? qbr : 2000000;
+    cfg.cpu_only = cs->app && cs->app->cpu_only;
+    cfg.use_vaapi = cs->app && cs->app->use_vaapi;
+    cfg.use_kmsgrab = cs->app && cs->app->use_kmsgrab;
+    int td_mode = 0, td_deep = 0, td_conv = 0, td_swap = 0, td_full = 0;
+    if (cs->app) bsdr_app_get_threed(cs->app, &td_mode, &td_deep, &td_conv, &td_swap, &td_full, NULL, NULL, 0);
+    if (td_mode != BSDR_3D_OFF) {
+        cfg.cpu_only = 1; cfg.use_vaapi = 0; cfg.use_kmsgrab = 0;
+        if (cs->app && cs->app->cpu_only) cfg.encoder = "libx264";
+        cfg.threed_mode = (td_mode == BSDR_3D_AI) ? BSDR_3D_FAST : td_mode;
+        cfg.threed_deepness = td_deep; cfg.threed_convergence = td_conv;
+        cfg.threed_swap = td_swap; cfg.threed_full = td_full;
+    }
+    bsdr_capture *cap = bsdr_capture_open(&cfg);
+    if (cap) {
+        const char *enc=NULL; bsdr_capture_info(cap, &cs->vid_w, &cs->vid_h, &enc);
+        BSDR_INFO("bsdr.cloud", "video: OWN encode %dx%d via %s @ %dbps (decoupled)",
+                  cs->vid_w, cs->vid_h, enc?enc:"?", cfg.bitrate);
+    }
+    return cap;
+}
+
 static void cloud_video_main(void *arg) {
     bsdr_cloud_stream *cs = (bsdr_cloud_stream *)arg;
     uint16_t vfixed = (cs->app && cs->app->cloud_src_port > 0) ? (uint16_t)cs->app->cloud_src_port : 0;
     uint16_t src = cloud_src_pick(cs->app, cs->scr.media_ip, 0, vfixed);
     if (!bsdr_udp_open(&cs->vid_udp, src, cs->scr.media_ip, (uint16_t)cs->scr.video_port)) {
-        BSDR_ERROR("bsdr.cloud", "video: udp (src port %u) -> %s:%d failed",
-                   src, cs->scr.media_ip, cs->scr.video_port);
-        return;
+        /* A persisted sticky port may be unbindable (stale from a prior run) — retry ephemeral so we
+         * still stream. A user --cloud-src-port that fails is a real error and is not retried. */
+        if (src && !vfixed && bsdr_udp_open(&cs->vid_udp, 0, cs->scr.media_ip, (uint16_t)cs->scr.video_port)) {
+            BSDR_WARN("bsdr.cloud", "video: sticky src port %u unavailable, using ephemeral", src);
+            src = 0;
+        } else {
+            BSDR_ERROR("bsdr.cloud", "video: udp (src port %u) -> %s:%d failed",
+                       src, cs->scr.media_ip, cs->scr.video_port);
+            return;
+        }
     }
     { uint16_t vport = bsdr_udp_local_port(&cs->vid_udp);
       if (src == 0) cloud_src_record(cs->app, cs->scr.media_ip, 0, vport);
@@ -210,40 +300,19 @@ static void cloud_video_main(void *arg) {
      * the cloud automatically tracks the headset's bitrate/resolution. */
     bsdr_capture *cap = NULL;
     uint8_t *scratch = NULL; size_t scratch_cap = 0;
+    uint64_t paused_at = 0;   /* when the decoupled capture was last idle (for release-while-paused) */
     if (cs->decoupled) {
-        bsdr_capture_config cfg = {0};
-        cfg.fps = 30;
-        int rx=0,ry=0,rw=0,rh=0, qw=0,qh=0,qbr=0;
-        if (cs->app) { bsdr_app_get_region(cs->app, &rx,&ry,&rw,&rh);
-                       bsdr_app_get_quality(cs->app, &qw,&qh,&qbr); }
-        cfg.x=rx; cfg.y=ry; cfg.width=rw; cfg.height=rh;
-        cfg.out_width = qw>0?qw:0; cfg.out_height = qh>0?qh:0;
-        cfg.bitrate = qbr>0 ? qbr : 2000000;
-        cfg.cpu_only = cs->app && cs->app->cpu_only;
-        cfg.use_vaapi = cs->app && cs->app->use_vaapi;
-        cfg.use_kmsgrab = cs->app && cs->app->use_kmsgrab;
         /* 2D->3D: convert the decoupled cloud encode too, so internet viewers get the same SBS the
-         * LAN headset does. The capture builds the transform from cfg.threed_*; it needs the CPU NV12
-         * path. AI depth is downgraded to the fast heuristic here to avoid a second helper process. */
-        int td_mode = 0, td_deep = 0, td_conv = 0, td_swap = 0, td_full = 0;
-        if (cs->app) bsdr_app_get_threed(cs->app, &td_mode, &td_deep, &td_conv, &td_swap, &td_full, NULL, NULL, 0);
-        if (td_mode != BSDR_3D_OFF) {
-            cfg.cpu_only = 1; cfg.use_vaapi = 0; cfg.use_kmsgrab = 0;
-            if (cs->app && cs->app->cpu_only) cfg.encoder = "libx264";
-            cfg.threed_mode = (td_mode == BSDR_3D_AI) ? BSDR_3D_FAST : td_mode;
-            cfg.threed_deepness = td_deep; cfg.threed_convergence = td_conv;
-            cfg.threed_swap = td_swap; cfg.threed_full = td_full;
-        }
-        cap = bsdr_capture_open(&cfg);
+         * LAN headset does (see cloud_open_decoupled_cap). */
+        cap = cloud_open_decoupled_cap(cs);
         if (!cap) {
             BSDR_ERROR("bsdr.cloud", "video: own capture/encode open failed (GPU busy?)");
             bsdr_video_sender_free(cs->vid); cs->vid = NULL;
             bsdr_udp_close(&cs->vid_udp);
             return;
         }
-        const char *enc=NULL; bsdr_capture_info(cap, &cs->vid_w, &cs->vid_h, &enc);
-        BSDR_INFO("bsdr.cloud", "video: OWN encode %dx%d via %s @ %dbps -> %s:%d (ssrc %u; decoupled)",
-                  cs->vid_w, cs->vid_h, enc?enc:"?", cfg.bitrate, cs->scr.media_ip, cs->scr.video_port, vssrc);
+        BSDR_INFO("bsdr.cloud", "video: -> %s:%d (ssrc %u; decoupled)",
+                  cs->scr.media_ip, cs->scr.video_port, vssrc);
     } else {
         BSDR_INFO("bsdr.cloud", "video: relaying the LAN encoder -> %s:%d (ssrc %u; coupled)",
                   cs->scr.media_ip, cs->scr.video_port, vssrc);
@@ -259,7 +328,24 @@ static void cloud_video_main(void *arg) {
         /* paused (share toggled off): keep the socket + keepalives alive but send no frames. */
         if (!cs->active) {
             if (!cs->decoupled) { bsdr_mutex_lock(cs->flock); cs->vq_head = cs->vq_tail; bsdr_mutex_unlock(cs->flock); }
+            /* P2.1-lite: after a short grace period, release our OWN decoupled capture/encoder while
+             * paused — frees the second GPU encode session + its buffers (no consumer to serve). The
+             * relay tuple/keepalives stay up so the SFU sees no change; we reopen (fresh IDR) on resume,
+             * clean within one GOP. Grace avoids thrashing on a quick off/on toggle. */
+            else if (cap) {
+                if (!paused_at) paused_at = now;
+                else if (now - paused_at >= 2000) {
+                    bsdr_capture_close(cap); cap = NULL;
+                    BSDR_INFO("bsdr.cloud", "video: decoupled capture released while paused (GPU freed; reopens on resume)");
+                }
+            }
             bsdr_sleep_ms(20); continue;
+        }
+        paused_at = 0;
+        if (cs->decoupled && !cap) {   /* resumed after a release: reopen (starts on an IDR) */
+            cap = cloud_open_decoupled_cap(cs);
+            if (!cap) { bsdr_sleep_ms(50); continue; }   /* GPU still busy — retry, don't drop the stream */
+            BSDR_INFO("bsdr.cloud", "video: decoupled capture reopened on resume (fresh IDR)");
         }
 
         const uint8_t *au = NULL; size_t len = 0;
@@ -270,14 +356,25 @@ static void cloud_video_main(void *arg) {
             if (r <= 0) continue;
         } else {                                        /* coupled: dequeue a LAN-encoded AU */
             bsdr_mutex_lock(cs->flock);
+            /* Empty: sleep on the FIFO condvar (woken by feed_video) instead of a
+             * 500Hz poll. Bounded at 100ms so the ~1s keepalive above still fires
+             * and stop/pause is observed promptly. Signal-on-feed means a frame is
+             * sent the instant it arrives — this lowers latency vs the old 2ms poll. */
+            if (cs->vq_head == cs->vq_tail && cs->vcond)
+                bsdr_cond_wait_ms(cs->vcond, cs->flock, 100);
             if (cs->vq_head != cs->vq_tail) {
                 struct cloud_vframe *f = &cs->vq[cs->vq_head];
-                if (f->len > scratch_cap) { uint8_t *nb = realloc(scratch, f->len); if (nb) { scratch = nb; scratch_cap = f->len; } }
-                if (scratch && f->len <= scratch_cap) { memcpy(scratch, f->buf, f->len); len = f->len; au = scratch; }
+                /* Ownership handoff instead of a copy: swap our send buffer into the slot and take the
+                 * slot's buffer out to send after unlocking. No memcpy — the slot keeps a valid buffer
+                 * (ours) for the producer to reuse. scratch/scratch_cap now hold the in-flight frame. */
+                uint8_t *tmp = f->buf; size_t tcap = f->cap;
+                f->buf = scratch; f->cap = scratch_cap;
+                scratch = tmp; scratch_cap = tcap;
+                len = f->len; au = scratch;
                 cs->vq_head = (cs->vq_head + 1) % BSDR_CLOUD_VQ;
             }
             bsdr_mutex_unlock(cs->flock);
-            if (!au) { bsdr_sleep_ms(2); continue; }
+            if (!au) continue;
         }
         bsdr_video_send_au_cloud(cs->vid, au, len, cs->vid_w, cs->vid_h);   /* [NAL][16B trailer] + pacing */
         sent++;
@@ -320,8 +417,13 @@ static void cloud_input_main(void *arg) {
     uint16_t dfixed = (cs->app && cs->app->cloud_src_port > 0) ? (uint16_t)(cs->app->cloud_src_port + 2) : 0;
     uint16_t dsrc = cloud_src_pick(cs->app, cs->scr.media_ip, 2, dfixed);
     if (!bsdr_udp_open(&udp, dsrc, cs->scr.media_ip, (uint16_t)cs->scr.data_port)) {
-        BSDR_WARN("bsdr.cloud", "data: udp -> %s:%d failed", cs->scr.media_ip, cs->scr.data_port);
-        return;
+        if (dsrc && !dfixed && bsdr_udp_open(&udp, 0, cs->scr.media_ip, (uint16_t)cs->scr.data_port)) {
+            BSDR_WARN("bsdr.cloud", "data: sticky src port %u unavailable, using ephemeral", dsrc);
+            dsrc = 0;
+        } else {
+            BSDR_WARN("bsdr.cloud", "data: udp -> %s:%d failed", cs->scr.media_ip, cs->scr.data_port);
+            return;
+        }
     }
     if (dsrc == 0) cloud_src_record(cs->app, cs->scr.media_ip, 2, bsdr_udp_local_port(&udp));
     struct cloud_data_ctx dc = { cs, bsdr_injector_create(1920, 1080), 0 };
@@ -481,11 +583,19 @@ static void cloud_audio_send_main(void *arg) {
         BSDR_INFO("bsdr.cloud", "audio: file %s -> relay (plain RTP pt %d, ssrc %u)",
                   curpath, BSDR_AUDIO_PT_DEFAULT, assrc);
         unsigned my_seek = app->file_seek_gen;
+        int16_t silence[CLOUD_OPUS_FRAME * BSDR_AUDIO_CHANNELS];
+        memset(silence, 0, sizeof silence);
+        uint64_t last_ka = bsdr_now_ms();
         while (!sh->cs->stop) {
             bsdr_fileaudio_set_paused(fa, app->file_paused);
             if (app->file_seek_gen != my_seek) { bsdr_fileaudio_seek(fa, app->file_seek_frac); my_seek = app->file_seek_gen; }
             bsdr_audio_sender_set_gain(tx, app->file_volume);   /* media-bar volume */
             int n = bsdr_fileaudio_read(fa, pcm, CLOUD_OPUS_FRAME);
+            /* keep the audio comedia latch warm while share is OFF (see the desktop path) */
+            if (!sh->cs->active) {
+                uint64_t now = bsdr_now_ms();
+                if (now - last_ka >= 1000) { bsdr_audio_send_pcm(tx, silence, CLOUD_OPUS_FRAME); last_ka = now; }
+            } else last_ka = bsdr_now_ms();
             if (n == CLOUD_OPUS_FRAME) { if (sh->cs->active) bsdr_audio_send_pcm(tx, pcm, CLOUD_OPUS_FRAME); }
             else if (n < 0 && pl_is) {   /* clip ended -> next playlist entry */
                 bsdr_fileaudio_close(fa); fa = NULL;
@@ -508,24 +618,31 @@ static void cloud_audio_send_main(void *arg) {
     if (!cap) { BSDR_WARN("bsdr.cloud", "audio-out: capture init failed"); bsdr_audio_sender_free(tx); return; }
     BSDR_INFO("bsdr.cloud", "audio: desktop -> relay (plain RTP pt %d, +8B trailer ssrc %u)",
               BSDR_AUDIO_PT_DEFAULT, assrc);
+    /* Paused-share keepalive: the Mediasoup PlainTransport comedia-latches the audio port onto our
+     * source tuple and will NOT re-latch while the screen keeps presenting (the video keepalive keeps
+     * that alive). If the audio port goes fully silent during a share OFF, its latch is lost and audio
+     * never resumes on the next ON — the reported "no audio after stop/restart". So, exactly like the
+     * video path, keep the audio tuple warm during pause with a low-rate Opus SILENCE frame (safe for
+     * consumers). When active, real audio keeps the latch warm on its own. */
+    int16_t silence[CLOUD_OPUS_FRAME * BSDR_AUDIO_CHANNELS];
+    memset(silence, 0, sizeof silence);
+    uint64_t last_ka = bsdr_now_ms();
     while (!sh->cs->stop) {
-        /* always drain the capture (avoids a burst on resume); send only while active. */
-        if (bsdr_pa_read(cap, pcm, CLOUD_OPUS_FRAME) == CLOUD_OPUS_FRAME && sh->cs->active)
-            bsdr_audio_send_pcm(tx, pcm, CLOUD_OPUS_FRAME);
+        int got = (bsdr_pa_read(cap, pcm, CLOUD_OPUS_FRAME) == CLOUD_OPUS_FRAME);   /* always drain */
+        uint64_t now = bsdr_now_ms();
+        if (sh->cs->active) {
+            if (got) bsdr_audio_send_pcm(tx, pcm, CLOUD_OPUS_FRAME);
+            last_ka = now;
+        } else if (now - last_ka >= 1000) {
+            bsdr_audio_send_pcm(tx, silence, CLOUD_OPUS_FRAME);   /* keep the comedia latch warm */
+            last_ka = now;
+        }
     }
     bsdr_audio_sender_free(tx); bsdr_pa_close(cap);
     BSDR_INFO("bsdr.cloud", "audio-out stopped");
 }
-/* Per-platform sink the decoded ROOM audio is rendered into (apps then record it as BSDR_RoomMic).
- * Mirrors micsniff's OWNER_SINK: a dedicated PulseAudio null-sink on Linux; the installed loopback
- * device (VB-CABLE / BlackHole) on Windows / macOS. */
-#if defined(__APPLE__)
-#  define ROOM_SINK "BlackHole"
-#elif defined(_WIN32)
-#  define ROOM_SINK BSDR_MIC_DEVICE_NAME
-#else
-#  define ROOM_SINK "bsdr_roomsink"
-#endif
+/* ROOM_SINK + the BSDR_RoomMic device names are shared with botaudio.c (both can drive the device). */
+#include "bsdr/roommic.h"
 /* Room mic: the Bigscreen ROOM audio (other participants) the SFU sends back to us on the SAME audio
  * port we send the desktop audio on — no separate join/consume, no micPort. Decoded (jitter buffer +
  * per-participant SSRC mixing) and redirected to the BSDR_RoomMic virtual mic + the computer-control
@@ -557,12 +674,14 @@ static void cloud_mic_main(void *arg) {
     uint8_t buf[2048];
     uint64_t next_play = bsdr_now_ms();   /* 20 ms playout clock for the jitter buffer */
     while (!cs->stop) {
-        int want_dev = cs->app && cs->app->room_mic_want;
+        /* Defer to the bot's loopback when it owns BSDR_RoomMic: the bot-sourced mix also carries the
+         * operator's OWN voice, so the host consume (others-only) must not fight over the device. */
+        int want_dev = cs->app && cs->app->room_mic_want && !(cs->app->bot_roommic_active);
 #if !defined(BSDR_PLATFORM_ANDROID)
         /* live-toggle the BSDR_RoomMic device from the web UI (the audio port stays consumed either
          * way — for the compctl fallback — but only rendered to the device when Room mic is on) */
         if (want_dev && !dev_up) {
-            if (bsdr_virtual_mic_create(ROOM_SINK, "bsdr_room_mic", "BSDR_RoomMic", &rm_sink, &rm_src))
+            if (bsdr_virtual_mic_create(ROOM_SINK, ROOM_MIC_SINK_NAME, ROOM_MIC_LABEL, &rm_sink, &rm_src))
                 play = bsdr_audio_player_new(ROOM_SINK, BSDR_AUDIO_CHANNELS);
             dev_up = 1;
             BSDR_INFO("bsdr.cloud", "room mic: BSDR_RoomMic up (consuming the room audio port %d)", cs->scr.audio_port);
@@ -574,8 +693,17 @@ static void cloud_mic_main(void *arg) {
 #endif
         /* Arm the voice-activity duck only while a command is captured over the cloud fallback. */
         bsdr_audio_recv_set_duck(rx, (cs->app && cs->app->cloud_mic_fallback && cs->app->cloud_mic_duck) ? 1 : 0);
-        int n = bsdr_udp_recv(sh->udp, buf, sizeof(buf), 5);   /* short timeout so playout stays on time */
-        if (n > 0) bsdr_audio_recv_feed(rx, buf, n);
+        /* Wake exactly at the next 20ms playout deadline instead of a fixed 5ms
+         * poll: on silence this drops idle wakeups ~4x (200Hz -> ~50Hz) while
+         * keeping playout perfectly on time. A packet arriving earlier still
+         * returns immediately (select wakes on data), so active audio is
+         * unaffected. Clamp to [1,20]ms so a late/overdue tick still recvs briefly. */
+        {
+            int64_t to = (int64_t)next_play - (int64_t)bsdr_now_ms();
+            if (to < 1) to = 1; else if (to > 20) to = 20;
+            int n = bsdr_udp_recv(sh->udp, buf, sizeof(buf), (int)to);
+            if (n > 0) bsdr_audio_recv_feed(rx, buf, n);
+        }
         uint64_t now = bsdr_now_ms();
         while ((int64_t)(now - next_play) >= 0) {
             bsdr_audio_recv_playout(rx);
@@ -596,8 +724,13 @@ static void cloud_audio_main(void *arg) {
     uint16_t afixed = (cs->app && cs->app->cloud_src_port > 0) ? (uint16_t)(cs->app->cloud_src_port + 1) : 0;
     uint16_t asrc = cloud_src_pick(cs->app, cs->scr.media_ip, 1, afixed);
     if (!bsdr_udp_open(&udp, asrc, cs->scr.media_ip, (uint16_t)cs->scr.audio_port)) {
-        BSDR_WARN("bsdr.cloud", "audio: udp -> %s:%d failed", cs->scr.media_ip, cs->scr.audio_port);
-        return;
+        if (asrc && !afixed && bsdr_udp_open(&udp, 0, cs->scr.media_ip, (uint16_t)cs->scr.audio_port)) {
+            BSDR_WARN("bsdr.cloud", "audio: sticky src port %u unavailable, using ephemeral", asrc);
+            asrc = 0;
+        } else {
+            BSDR_WARN("bsdr.cloud", "audio: udp -> %s:%d failed", cs->scr.media_ip, cs->scr.audio_port);
+            return;
+        }
     }
     if (asrc == 0) cloud_src_record(cs->app, cs->scr.media_ip, 1, bsdr_udp_local_port(&udp));
     cloud_latch(&udp);
@@ -640,6 +773,7 @@ bsdr_cloud_stream *bsdr_cloud_stream_start(const bsdr_cloud_screen *scr,
     cs->decoupled = app && app->video_decoupled;
     cs->flock = bsdr_mutex_new();        /* FIFO mutex for the coupled (LAN-fed) video path */
     if (!cs->flock) cs->decoupled = true; /* coupled mode needs it; fall back to own-capture if alloc fails */
+    cs->vcond = bsdr_cond_new();         /* FIFO not-empty signal (coupled sender sleeps on it) */
     cs->vid_w = 1280; cs->vid_h = 720;   /* sane default until the first fed frame / own capture */
     if (app && app->cloud_no_video)
         BSDR_INFO("bsdr.cloud", "cloud video OFF (--no-cloud-video; diagnostic)");
@@ -676,6 +810,7 @@ bsdr_cloud_stream *bsdr_cloud_stream_start(const bsdr_cloud_screen *scr,
 void bsdr_cloud_stream_set_active(bsdr_cloud_stream *cs, int active) {
     if (!cs || cs->active == active) return;
     cs->active = active;
+    if (cs->vcond) bsdr_cond_signal(cs->vcond);   /* re-evaluate the pause branch promptly */
     BSDR_INFO("bsdr.cloud", "relay streaming %s (connection kept alive)", active ? "resumed" : "paused");
 }
 int bsdr_cloud_stream_active(bsdr_cloud_stream *cs) { return cs ? cs->active : 0; }
@@ -690,11 +825,13 @@ bool bsdr_cloud_stream_matches(bsdr_cloud_stream *cs, const bsdr_cloud_screen *s
 void bsdr_cloud_stream_stop(bsdr_cloud_stream *cs) {
     if (!cs) return;
     cs->stop = 1;
+    if (cs->vcond) bsdr_cond_signal(cs->vcond);   /* wake the coupled sender so it sees stop */
     if (cs->vthr) bsdr_thread_join(cs->vthr);
     if (cs->athr) bsdr_thread_join(cs->athr);
     if (cs->mthr) bsdr_thread_join(cs->mthr);
     if (cs->ithr) bsdr_thread_join(cs->ithr);
     for (int i = 0; i < BSDR_CLOUD_VQ; i++) free(cs->vq[i].buf);   /* FIFO frame buffers */
+    if (cs->vcond) bsdr_cond_free(cs->vcond);
     if (cs->flock) bsdr_mutex_free(cs->flock);
     BSDR_INFO("bsdr.cloud", "relay streaming stopped");
     free(cs);

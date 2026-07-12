@@ -76,6 +76,17 @@ static bool make_self_signed(EVP_PKEY **pkey_out, X509 **x509_out) {
     return true;
 }
 
+/* One process-wide self-signed cert/key, generated once and shared by every DTLS SSL_CTX
+ * (SSL_CTX_use_* up-ref it). The peer verifies no fingerprint, so sharing is protocol-identical and
+ * saves an EC-P256 keygen + X509 sign per bsdr_dtls_new (LAN input + cloud input each make one, on
+ * separate threads — hence the thread-safe once-init via OpenSSL's own primitive). */
+static EVP_PKEY *g_dtls_key = NULL;
+static X509     *g_dtls_cert = NULL;
+static CRYPTO_ONCE g_dtls_once = CRYPTO_ONCE_STATIC_INIT;
+static void dtls_cert_init(void) {
+    if (!make_self_signed(&g_dtls_key, &g_dtls_cert)) { g_dtls_key = NULL; g_dtls_cert = NULL; }
+}
+
 bsdr_dtls *bsdr_dtls_new(bsdr_udp *udp, bsdr_dtls_role role) {
     bsdr_dtls *d = calloc(1, sizeof(*d));
     if (!d) return NULL;
@@ -88,20 +99,15 @@ bsdr_dtls *bsdr_dtls_new(bsdr_udp *udp, bsdr_dtls_role role) {
     SSL_CTX_set_verify(d->ctx, SSL_VERIFY_NONE, NULL);
     SSL_CTX_set_tlsext_use_srtp(d->ctx, BSDR_SRTP_PROFILES);
 
-    EVP_PKEY *pkey = NULL;
-    X509 *cert = NULL;
-    if (!make_self_signed(&pkey, &cert) ||
-        SSL_CTX_use_certificate(d->ctx, cert) != 1 ||
-        SSL_CTX_use_PrivateKey(d->ctx, pkey) != 1) {
+    CRYPTO_THREAD_run_once(&g_dtls_once, dtls_cert_init);   /* generate the shared cert/key once */
+    if (!g_dtls_cert || !g_dtls_key ||
+        SSL_CTX_use_certificate(d->ctx, g_dtls_cert) != 1 ||   /* up-refs the shared cert */
+        SSL_CTX_use_PrivateKey(d->ctx, g_dtls_key) != 1) {     /* up-refs the shared key */
         BSDR_ERROR("bsdr.dtls", "cert setup failed");
-        if (cert) X509_free(cert);
-        if (pkey) EVP_PKEY_free(pkey);
         SSL_CTX_free(d->ctx);
         free(d);
         return NULL;
     }
-    X509_free(cert);
-    EVP_PKEY_free(pkey);
 
     d->ssl = SSL_new(d->ctx);
     d->rbio = BIO_new(BIO_s_mem());

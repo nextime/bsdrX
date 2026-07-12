@@ -100,8 +100,9 @@ int main(void) {
     bsdr_overlay_set_balloon_pos(o, 0.5, 0.25);
     bsdr_overlay_set_listening(o, true);
     bsdr_overlay_render_balloon(o, bgra, W * 4, W, H, 1, 1000);
-    /* sample a body pixel off-axis (avoid the white mic glyph on the center column) */
-    uint8_t *bp = bgra + ((size_t)cyp * W + (cxp + (int)(0.03 * W))) * 4;
+    /* sample a body pixel off-axis (avoid the white mic glyph on the center column). Must stay
+     * inside BALLOON_RX (0.025) and outside the mic glyph (rx/3 ≈ 0.008). */
+    uint8_t *bp = bgra + ((size_t)cyp * W + (cxp + (int)(0.015 * W))) * 4;
     if (bp[2] > bp[0]) printf("PASS balloon_listening_red\n");   /* R > B in BGRA */
     else { printf("FAIL balloon_listening_red (B=%d G=%d R=%d)\n", bp[0], bp[1], bp[2]); fail++; }
     bsdr_overlay_set_listening(o, false);
@@ -109,26 +110,28 @@ int main(void) {
     /* Send / Cancel confirm row */
     bsdr_overlay_set_balloon_pos(o, 0.5, 0.3);
     bsdr_overlay_get_balloon_pos(o, &bx, &by);
-    if (bsdr_overlay_confirm_hit(o, bx, by + 0.145) == 0) printf("PASS confirm_off_when_not_shown\n");
+    /* Tap points track the overlay geometry (BTN_DY=BALLOON_RY+0.0375, BTN_OFF=0.0475,
+     * STOP_DX=0.06, HANDLE_DY=BALLOON_RY+0.0225) — update together if the balloon is resized. */
+    if (bsdr_overlay_confirm_hit(o, bx, by + 0.0725) == 0) printf("PASS confirm_off_when_not_shown\n");
     else { printf("FAIL confirm_off_when_not_shown\n"); fail++; }
     bsdr_overlay_set_confirm(o, true);
-    if (bsdr_overlay_confirm_hit(o, bx - 0.095, by + 0.145) == 1) printf("PASS confirm_send\n");
+    if (bsdr_overlay_confirm_hit(o, bx - 0.0475, by + 0.0725) == 1) printf("PASS confirm_send\n");
     else { printf("FAIL confirm_send\n"); fail++; }
-    if (bsdr_overlay_confirm_hit(o, bx + 0.095, by + 0.145) == 2) printf("PASS confirm_cancel\n");
+    if (bsdr_overlay_confirm_hit(o, bx + 0.0475, by + 0.0725) == 2) printf("PASS confirm_cancel\n");
     else { printf("FAIL confirm_cancel\n"); fail++; }
     bsdr_overlay_set_confirm(o, false);
 
     /* stop balloon (working) */
-    if (!bsdr_overlay_stop_hit(o, bx + 0.12, by)) printf("PASS stop_off_when_idle\n");
+    if (!bsdr_overlay_stop_hit(o, bx + 0.06, by)) printf("PASS stop_off_when_idle\n");
     else { printf("FAIL stop_off_when_idle\n"); fail++; }
     bsdr_overlay_set_working(o, true);
-    double sx = bx < 0.5 ? bx + 0.12 : bx - 0.12;
+    double sx = bx < 0.5 ? bx + 0.06 : bx - 0.06;
     if (bsdr_overlay_stop_hit(o, sx, by)) printf("PASS stop_hit\n");
     else { printf("FAIL stop_hit\n"); fail++; }
     bsdr_overlay_set_working(o, false);
 
     /* history handle + feedback text drawn */
-    if (bsdr_overlay_history_hit(o, bx, by + 0.115)) printf("PASS history_handle_hit\n");
+    if (bsdr_overlay_history_hit(o, bx, by + 0.0575)) printf("PASS history_handle_hit\n");
     else { printf("FAIL history_handle_hit\n"); fail++; }
     bsdr_overlay_push_feedback(o, "hello world");
     bsdr_overlay_toggle_history(o);

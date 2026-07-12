@@ -113,9 +113,11 @@ struct bsdr_capture {
     /* ---- Wayland source (xdg-desktop-portal + PipeWire): frames arrive already-decoded (packed
      * 32-bit RGB), so we skip av_read_frame/decode and drop them straight into c->raw. fmt/dec are
      * lightweight dummies that only carry size + pix_fmt + time_base for the scale/encode setup. ---- */
-    struct bsdr_pw_capture *pw;
-    uint8_t *pw_buf;            /* packed BGR0/RGB0 frame (stride = pw_stride) filled each read */
-    int pw_stride;
+    struct bsdr_pw_capture *pw;   /* frames are borrowed zero-copy from the module (no local copy) */
+    int      pw_dmabuf_active;    /* --pw-dmabuf negotiated: frames arrive as DRM_PRIME AVFrames */
+    uint8_t *pw_fallback;         /* lazily-allocated dec-sized pad buffer, used ONLY if PipeWire ever
+                                     renegotiates to a smaller geometry than the encode pipeline (else NULL) */
+    size_t   pw_fallback_cap;
     /* ---- file-source playback (cfg.input_file) ---- */
     /* realtime face swap (borrowed engine, CPU path): NV12 <-> RGB24 scratch + scalers */
     struct bsdr_faceswap *faceswap;
@@ -201,8 +203,11 @@ static void apply_faceswap(bsdr_capture *c, AVFrame *f) {
     }
     uint8_t *rgb[1] = { c->fs_rgb }; int rs[1] = { w*3 };
     sws_scale(c->fs_to_rgb, (const uint8_t *const *)f->data, f->linesize, 0, h, rgb, rs);
-    bsdr_faceswap_process_rgb(c->faceswap, c->fs_rgb, w, h);
-    sws_scale(c->fs_from_rgb, (const uint8_t *const *)rgb, rs, 0, h, f->data, f->linesize);
+    /* Only write the swapped pixels back if a face was actually swapped. On a desktop stream no face
+     * is present most of the time -> skip the RGB->NV12 back-convert entirely. As a bonus this also
+     * avoids the lossy NV12->RGB->NV12 round-trip on those frames (the original c->yuv is untouched). */
+    if (bsdr_faceswap_process_rgb(c->faceswap, c->fs_rgb, w, h) > 0)
+        sws_scale(c->fs_from_rgb, (const uint8_t *const *)rgb, rs, 0, h, f->data, f->linesize);
 }
 
 static int open_encoder(bsdr_capture *c, const bsdr_capture_config *cfg,
@@ -254,14 +259,18 @@ static int open_encoder(bsdr_capture *c, const bsdr_capture_config *cfg,
              * concentrate bits on high-contrast text; p7 stays above real-time for 1080p30 on any
              * NVENC GPU. Busy-frame bandwidth rises to ~2x the target — exactly as the CPU path already
              * does — so cap it with --max-bitrate on a constrained (e.g. internet-share) uplink. */
-            av_opt_set(enc->priv_data, "preset", "p7", 0);    /* max-quality preset; still real-time */
+            /* Encoder effort level: quality (p7 + fullres 2-pass, default), balanced (p6 + 1-pass),
+             * performance (p4 + 1-pass). Higher levels cut encode cost for some quality loss. */
+            av_opt_set(enc->priv_data, "preset",
+                       cfg->enc_level >= 2 ? "p4" : cfg->enc_level == 1 ? "p6" : "p7", 0);
             av_opt_set(enc->priv_data, "profile", "high", 0);
             av_opt_set(enc->priv_data, "rc", "vbr", 0);       /* VBR (not CBR): don't pad static frames */
             av_opt_set_int(enc->priv_data, "spatial-aq", 1, 0);
             av_opt_set_int(enc->priv_data, "aq-strength", 8, 0);
             /* 2-pass rate control ("multipass"): the biggest quality-per-bit win at the Quest's low
-             * bitrates — allocates bits far better than 1-pass, for a negligible latency cost. */
-            av_opt_set(enc->priv_data, "multipass", "fullres", 0);
+             * bitrates — allocates bits far better than 1-pass, for a negligible latency cost. Kept
+             * only at the quality level; balanced/performance drop to 1-pass. */
+            av_opt_set(enc->priv_data, "multipass", cfg->enc_level >= 1 ? "disabled" : "fullres", 0);
             if (cfg->input_file) {
                 /* File playback has NO latency constraint -> go for maximum quality: HQ tune,
                  * look-ahead, temporal AQ and B-frames (all of which the low-latency desktop path
@@ -294,8 +303,10 @@ static int open_encoder(bsdr_capture *c, const bsdr_capture_config *cfg,
             /* 'veryfast' (not 'ultrafast'): ultrafast disables CABAC + 8x8dct, forcing the SPS to
              * Constrained Baseline (profile_idc 66) regardless of the requested profile — and the
              * Quest chokes on non-High streams. veryfast keeps the High-profile tools (idc 100),
-             * stays real-time, and looks better. zerolatency keeps it low-latency (no lookahead/B). */
-            av_opt_set(enc->priv_data, "preset", "veryfast", 0);
+             * stays real-time, and looks better. zerolatency keeps it low-latency (no lookahead/B).
+             * Balanced steps to 'faster', performance to 'superfast' (both still CABAC/High). */
+            av_opt_set(enc->priv_data, "preset",
+                       cfg->enc_level >= 2 ? "superfast" : cfg->enc_level == 1 ? "faster" : "veryfast", 0);
             av_opt_set(enc->priv_data, "tune", "zerolatency", 0);
             av_opt_set(enc->priv_data, "profile", "high", 0);
             /* SINGLE SLICE PER FRAME — critical for the Quest. The Bigscreen wire format keys frame
@@ -307,7 +318,14 @@ static int open_encoder(bsdr_capture *c, const bsdr_capture_config *cfg,
              * a file tolerates latency, so keep multi-core FRAME threading but disable slicing. */
             if (cfg->input_file)
                 av_opt_set(enc->priv_data, "x264-params", "sliced-threads=0", 0);
-            else
+            else if (cfg->enc_x264_threads > 1) {
+                /* Opt-in (P6.9): use N FRAME threads to spread software encode across cores on a
+                 * CPU-bound host, but force sliced-threads=0:slices=1 so each picture is still ONE
+                 * NAL (the Quest's reassembly requires it). Frame threading adds ~(N-1) frames of
+                 * latency, so this is off by default and only sensible for --cpu at high resolution. */
+                enc->thread_count = cfg->enc_x264_threads;
+                av_opt_set(enc->priv_data, "x264-params", "sliced-threads=0:slices=1", 0);
+            } else
                 enc->thread_count = 1;
             /* NO VBV cap on x264. It only ever runs when the operator chose the software path
              * (--cpu) or on a GPU-less box, where quality is the whole point — a max-rate/buffer
@@ -351,14 +369,15 @@ static int open_encoder_cuda(bsdr_capture *c, const bsdr_capture_config *cfg,
      * spends the same actual bits the uncapped x264 fallback does -> GPU quality matches CPU at the
      * same resolution+bitrate. (Was CBR, then hard-capped VBR, both of which held the target and
      * smeared while x264 overshot and stayed sharp.) --max-bitrate caps the target on a thin uplink. */
-    av_opt_set(enc->priv_data, "preset", "p7", 0);   /* max-quality preset; still real-time */
+    av_opt_set(enc->priv_data, "preset",                                   /* 0 p7 / 1 p6 / 2 p4 */
+               cfg->enc_level >= 2 ? "p4" : cfg->enc_level == 1 ? "p6" : "p7", 0);
     av_opt_set(enc->priv_data, "tune", "ll", 0);
     av_opt_set(enc->priv_data, "profile", "high", 0);
     av_opt_set(enc->priv_data, "rc", "vbr", 0);
     av_opt_set_int(enc->priv_data, "cq", 20, 0);
     av_opt_set_int(enc->priv_data, "spatial-aq", 1, 0);
     av_opt_set_int(enc->priv_data, "aq-strength", 8, 0);
-    av_opt_set(enc->priv_data, "multipass", "fullres", 0);   /* 2-pass RC: big low-bitrate quality win */
+    av_opt_set(enc->priv_data, "multipass", cfg->enc_level >= 1 ? "disabled" : "fullres", 0);  /* 1: 1-pass */
     enc->rc_max_rate = (int64_t)cfg->bitrate * 2;    /* 2x headroom -> matches the uncapped x264 path */
     enc->rc_buffer_size = (int64_t)cfg->bitrate * 2;
     if (avcodec_open2(enc, codec, NULL) != 0) { avcodec_free_context(&enc); return -1; }
@@ -556,7 +575,10 @@ static int open_webcam(AVFormatContext **fmt, const char *dev) {
  * already decoded to packed 32-bit RGB. Returns 0 on success. */
 static int cap_open_pipewire(bsdr_capture *c, bsdr_capture_config *cfg) {
     int w = 0, h = 0; bsdr_pw_format pf = BSDR_PW_FMT_BGR0;
-    c->pw = bsdr_pw_capture_open(0 /*whole monitor*/, 1 /*cursor embedded*/, &w, &h, &pf);
+    /* --pw-dmabuf (experimental) only makes sense paired with --vaapi (the DRM_PRIME import target).
+     * Request it; the module falls back to CPU frames if the compositor/driver can't do dmabuf. */
+    int want_db = cfg->pw_dmabuf && cfg->use_vaapi;
+    c->pw = bsdr_pw_capture_open2(0 /*whole monitor*/, 1 /*cursor embedded*/, want_db, &w, &h, &pf);
     if (!c->pw || w <= 0 || h <= 0) return -1;
     enum AVPixelFormat avf =
         pf == BSDR_PW_FMT_RGB0 ? AV_PIX_FMT_RGB0 :
@@ -570,14 +592,21 @@ static int cap_open_pipewire(bsdr_capture *c, bsdr_capture_config *cfg) {
     c->vstream = 0;
     c->dec = avcodec_alloc_context3(NULL);   /* not opened — only carries size/pixfmt for scale setup */
     if (!c->dec) return -1;
-    c->dec->pix_fmt = avf;
+    c->pw_dmabuf_active = want_db && bsdr_pw_capture_dmabuf_active(c->pw);
+    if (c->pw_dmabuf_active) {
+        /* Present the source as DRM_PRIME with the module's hw_frames_ctx, so setup_vaapi builds its
+         * hwmap(derive=vaapi) path (same as kmsgrab) and imports the dmabufs zero-copy. */
+        c->dec->pix_fmt = AV_PIX_FMT_DRM_PRIME;
+        AVBufferRef *fr = (AVBufferRef *)bsdr_pw_capture_drm_frames_ctx(c->pw);
+        c->dec->hw_frames_ctx = fr ? av_buffer_ref(fr) : NULL;
+        BSDR_INFO("bsdr.capture", "Wayland capture via PipeWire dmabuf -> VAAPI zero-copy (%dx%d)", w, h);
+    } else {
+        c->dec->pix_fmt = avf;
+        BSDR_INFO("bsdr.capture", "Wayland capture via xdg-desktop-portal + PipeWire (%dx%d)", w, h);
+    }
     c->dec->width = w; c->dec->height = h;
     c->dec->time_base = (AVRational){ 1, cfg->fps };
-    c->pw_stride = w * 4;                     /* packed 32-bit RGB, no row padding */
-    c->pw_buf = malloc((size_t)c->pw_stride * h);
-    if (!c->pw_buf) return -1;
-    cfg->use_kmsgrab = 0;                     /* PipeWire delivers CPU frames (BGR0), like x11grab */
-    BSDR_INFO("bsdr.capture", "Wayland capture via xdg-desktop-portal + PipeWire (%dx%d)", w, h);
+    cfg->use_kmsgrab = 0;                     /* PipeWire delivers the frames (dmabuf or CPU BGR0) */
     return 0;
 }
 #endif
@@ -856,6 +885,16 @@ have_input_pw:;   /* PipeWire path joins here: fmt/dec already set by cap_open_p
         if (setup_vaapi(c, &cfg, ow, oh) == 0) { c->use_gpu = 1; return c; }
         gpu_teardown(c);
         BSDR_WARN("bsdr.capture", "VAAPI pipeline unavailable -> CPU scale/convert");
+#ifdef BSDR_HAVE_PIPEWIRE
+        /* dmabuf frames can ONLY be consumed by the VAAPI graph — the CPU sws path can't read a
+         * DRM_PRIME surface. If VAAPI just failed while dmabuf was negotiated, fail the open cleanly
+         * rather than crash on a NULL filtergraph. (Experimental --pw-dmabuf; the operator can drop
+         * the flag to get the CPU MAP_BUFFERS path.) */
+        if (c->pw_dmabuf_active) {
+            BSDR_ERROR("bsdr.capture", "--pw-dmabuf: VAAPI encoder unavailable, cannot consume dmabuf");
+            goto fail;
+        }
+#endif
     } else if (!cfg.cpu_only && !c->threed) {
         if (setup_gpu(c, &cfg, ow, oh) == 0) { c->use_gpu = 1; return c; }
         gpu_teardown(c);
@@ -1014,18 +1053,62 @@ int bsdr_capture_frame(bsdr_capture *c, const uint8_t **au, size_t *len,
     }
 
 #ifdef BSDR_HAVE_PIPEWIRE
+    if (c->pw && c->pw_dmabuf_active) {
+        /* --pw-dmabuf: the frame is a DRM_PRIME dmabuf. Push it through the VAAPI graph (hwmap ->
+         * scale_vaapi -> nv12), zero-copy from the compositor surface. Only reached with --vaapi, so
+         * c->use_gpu / c->fg are set. The AVFrame's free callback returns the PipeWire buffer. */
+        AVFrame *df = (AVFrame *)bsdr_pw_capture_read_drm(c->pw);
+        if (!df) return 0;                       /* no new frame this tick */
+        df->pts = c->frame_index;
+        if (av_buffersrc_add_frame(c->fg_src, df) < 0) { av_frame_free(&df); return 0; }
+        av_frame_free(&df);                       /* buffersrc took ownership; frees our ref */
+        av_frame_unref(c->gpu);
+        if (av_buffersink_get_frame(c->fg_sink, c->gpu) < 0) return 0;
+        c->gpu->pts = c->frame_index;
+        if (avcodec_send_frame(c->enc, c->gpu) < 0) { av_frame_unref(c->gpu); return 0; }
+        av_frame_unref(c->gpu);
+        r = avcodec_receive_packet(c->enc, c->opkt);
+        if (r == 0) {
+            *au = c->opkt->data; *len = c->opkt->size;
+            *rtp_ts = (uint32_t)(c->frame_index++ * BSDR_VIDEO_CLOCK_HZ / c->fps);
+            return 1;
+        }
+        return 0;
+    }
     if (c->pw) {
-        /* Wayland: the portal/PipeWire stream already delivers packed 32-bit RGB — drop it into
-         * c->raw (an unowned wrapper over pw_buf) and skip av_read_frame/decode entirely. */
-        int got = bsdr_pw_capture_read(c->pw, c->pw_buf, c->pw_stride, c->dec->height);
+        /* Wayland: the portal/PipeWire stream already delivers packed 32-bit RGB. Borrow the frame
+         * zero-copy (valid until the next read) and wrap it in c->raw, skipping av_read_frame/decode
+         * AND the second full-frame copy the puller used to do. */
+        const uint8_t *pf = NULL; int pstride = 0, pw = 0, ph = 0;
+        int got = bsdr_pw_capture_read(c->pw, &pf, &pstride, &pw, &ph);
         if (got < 0) return -1;
         if (got == 0) return 0;                 /* no new frame this tick — try again */
+        const uint8_t *use = pf; int use_stride = pstride;
+        int need_w = c->dec->width * 4;
+        if (pstride < need_w || ph < c->dec->height) {
+            /* Rare: PipeWire renegotiated to a SMALLER geometry than the encode pipeline (c->sws /
+             * c->dec) was opened for. Zero-copy would let sws over-read past the borrowed slot, so
+             * copy into a dec-sized, zero-padded scratch instead (safe; a capture reopen picks up the
+             * new size). Normal frames never hit this — they're consumed zero-copy below. */
+            size_t need = (size_t)need_w * c->dec->height;
+            if (c->pw_fallback_cap < need) {
+                uint8_t *nb = realloc(c->pw_fallback, need);
+                if (nb) { c->pw_fallback = nb; c->pw_fallback_cap = need; }
+            }
+            if (!c->pw_fallback || c->pw_fallback_cap < need) return 0;   /* skip this frame safely */
+            memset(c->pw_fallback, 0, need);
+            int rows = ph < c->dec->height ? ph : c->dec->height;
+            int cpy  = pstride < need_w ? pstride : need_w;
+            for (int y = 0; y < rows; y++)
+                memcpy(c->pw_fallback + (size_t)y * need_w, pf + (size_t)y * pstride, (size_t)cpy);
+            use = c->pw_fallback; use_stride = need_w;
+        }
         av_frame_unref(c->raw);
         c->raw->format = c->dec->pix_fmt;
         c->raw->width  = c->dec->width;
         c->raw->height = c->dec->height;
-        c->raw->data[0]     = c->pw_buf;
-        c->raw->linesize[0] = c->pw_stride;
+        c->raw->data[0]     = (uint8_t *)use;   /* borrowed (or padded fallback); overlay may draw in place */
+        c->raw->linesize[0] = use_stride;
         goto have_raw;
     }
 #endif
@@ -1146,10 +1229,10 @@ double bsdr_capture_position(bsdr_capture *c, int *seekable) {
 void bsdr_capture_close(bsdr_capture *c) {
     if (!c) return;
 #ifdef BSDR_HAVE_PIPEWIRE
-    if (c->pw) {                              /* stop the PipeWire thread before freeing its scratch */
+    if (c->pw) {                              /* stop the PipeWire thread before freeing its buffers */
+        if (c->raw) { c->raw->data[0] = NULL; c->raw->linesize[0] = 0; }   /* borrowed frame; drop the wrapper first */
         bsdr_pw_capture_close(c->pw); c->pw = NULL;
-        if (c->raw) { c->raw->data[0] = NULL; c->raw->linesize[0] = 0; }   /* was an unowned pw_buf wrapper */
-        free(c->pw_buf); c->pw_buf = NULL;
+        free(c->pw_fallback); c->pw_fallback = NULL; c->pw_fallback_cap = 0;
         /* the dummy fmt was avformat_alloc_context()'d (never opened) -> free, don't close_input */
         if (c->fmt) { avformat_free_context(c->fmt); c->fmt = NULL; }
     }

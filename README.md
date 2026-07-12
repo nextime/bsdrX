@@ -70,6 +70,18 @@ remote friends see it. It reuses the LAN encode by default (or `--video-decouple
 for a separate encoder). Cloud features need a Bigscreen API key — see
 [Bigscreen cloud API key](#bigscreen-cloud-api-key-required-for-cloud-features).
 
+**Stop / restart is a flag flip, not a teardown** (matching the official host). Turning
+sharing off keeps the sockets open and pauses transmission; video *and* audio each keep a
+1 s keepalive on their relay port so the Mediasoup **comedia latch** never drops, and
+turning sharing back on resumes instantly from the same ports. In `--video-decoupled`
+mode the separate cloud encoder is also **released after a couple of seconds paused** (frees
+the second GPU encode session while nobody is watching) and reopened on resume with a fresh
+keyframe — the relay tuple stays latched throughout, so the reconnect is clean within one GOP. Source ports are **sticky
+by default** — reused per relay IP across share toggles *and across a process restart*
+(persisted in `~/.config/bsdr_agent/sticky_ports`), so a restarted agent rebinds the same
+ports and the relay keeps forwarding. `--cloud-src-port N` hard-pins them; `--cloud-no-sticky-ports`
+disables stickiness.
+
 ### Video source options
 
 Pick the source from the web panel (or CLI). All non-desktop sources are decoded and
@@ -119,23 +131,71 @@ CUDA·DirectML·CoreML·NNAPI). The three `.onnx` models are non-commercial so b
 never bundles them — **download on demand** into the `faceswap` model dir, or import
 a zip. Applies to whatever you're streaming (desktop / webcam / file).
 
+On a CPU-bound host, **`--faceswap-detect-every N`** runs the (dominant) face-detection
+pass only every *N* frames — reusing the last boxes in between while still swapping every
+frame — roughly halving faceswap CPU at the cost of slight tracking lag on fast head
+motion. Default is every frame (`1`); opt-in.
+
 ### Voice changer (realtime DSP)
 
 A no-model, low-latency DSP voice changer applied to the headset-owner's voice before
 it reaches the virtual mic, computer-control, or the cloud room. A **master enable**
-toggle plus four knobs: **gender** (−100…100 pitch+formant shift), **robot**
-(ring-mod), **echo**, **whisper** (breathiness). Cross-platform (no FFT/ffmpeg). With
-**MITM** or **Relay** active, the optional **"substitute into the cloud"** option makes
-the *room* hear the changed voice too. Two paths:
+toggle plus knobs: **pitch** (−100…100 pitch+formant shift), **formant** (−100…100
+tone/vocal-tract brightness), **volume** (±12 dB output gain), **robot** (ring-mod),
+**echo**, **whisper** (breathiness) — all cross-platform (no FFT/ffmpeg) and persisted
+across restarts. One-click **presets** set the sliders for you: *Feminize, Masculinize,
+Younger, Older, Chipmunk, Deep, Robot, Reset*.
+
+### AI voice (RVC voice conversion)
+
+Behind the same changer sits a model-based **AI tier** that converts your mic to a **target
+voice** (RVC) via **ONNX Runtime** — so it runs on **every platform (Linux/Windows/macOS/Android)**
+with per-platform acceleration and a CPU fallback, exactly like the 2D→3D depth engine. Tick
+**"use AI"** in the *AI voice (RVC)* card and pick a **Quality** tier — **CPU**, **Small GPU**, or
+**Big GPU** (ONNX EPs: XNNPACK/CPU, CoreML, NNAPI, DirectML, CUDA; degrades to CPU where an
+accelerator isn't present) — a **voice**, and a **pitch key** (±24 semitones). The pipeline is
+ContentVec (content) + pitch (RMVPE on the GPU tiers, a built-in DSP pitch-tracker on CPU) + the
+voice's RVC generator, streamed with an overlap crossfade so it keeps the same low-latency, in-place
+audio contract (it adds ~one window of latency and passes audio through until warmed).
+
+**Models are user-supplied / user-downloaded** (bsdrX ships no voice weights, so distribution stays
+clean). The card manages everything: **Download engine models** (the shared ContentVec + RMVPE base,
+fetched once with a progress bar) or **Import** them from a `.zip`; then **add a voice** three ways —
+**Download** an RVC `.onnx` from a URL (a **find voices online ↗** link opens an RVC-ONNX model
+search in a new tab; note many community voices ship as `.pth` and must be exported to ONNX first),
+**Add file** from a local path (with a Browse dialog), or drop one in the library dir — each listed
+with a delete button. Volume from
+the DSP knobs still applies as post-gain. All state persists.
+
+**Voice presets.** Up to **5 named custom presets** snapshot the whole changer state (AI on/tier/voice/key
+plus the DSP knobs); **save** the current setup into a slot, **apply** it in one click, or **delete** it.
+Persisted across restarts.
+
+**One pipeline, two engines.** Your mic runs through a single changer that is either the **DSP
+effects** or the **AI voice (RVC)** — turning on **use AI** overrides the DSP effects (only Volume
+carries over). **Substitute** is the shared output routing and applies to whichever engine is on.
+
+**Where the changed voice goes.** The changer **always** feeds the host's virtual mic
+(`BSDR_QuestMic`) — so OBS/calls/computer-control hear it — but it is **not** sent to the
+Quest/room unless you tick **"substitute into the cloud"** (which needs **MITM** or
+**Relay** active). This now works with **either** engine — enabling only the AI voice still
+substitutes into the room (previously it was gated on the DSP changer's own enable). So by default
+you change your own captured voice locally without altering what the room hears. Two substitution paths:
 - **Local, in-flight** (no router companion): rewrite the headset→cloud packets as they
   transit this host — **Linux** via NFQUEUE (root), **Windows** via bundled **WinDivert**
   (Administrator). **macOS-local** (experimental, wired switched LAN only): ARP-MITM +
   BPF — the privileged helper pf-drops the headset's original owner-mic and BPF-injects
   bsdrX's re-encoded copy in its place (macOS has no userland packet-divert primitive).
 - **Via the relay** (all four platforms, and Android's only path): the router companion
-  forwards the originals to bsdrX; bsdrX re-encodes the changed voice and hands the
-  modified RTP back; the relay drops the originals and forwards the modified audio to the
-  cloud instead. bsdrX does all the codec/DSP — the relay just shuttles and swaps.
+  forwards the originals to bsdrX; bsdrX re-encodes the changed voice and hands back a
+  **full modified IPv4 datagram (source = the headset)**; the companion iptables-drops the
+  originals and **RAW-injects** the modified datagram so it re-uses the headset's own
+  NAT/conntrack flow. That source preservation is essential: Bigscreen's mediasoup relay
+  uses a **comedia latch** and rejects any packet from a different source tuple — an earlier
+  build injected from a fresh companion socket (new NAT port), so the relay dropped the
+  replacement and the room heard **silence**. bsdrX does all the codec/DSP; the companion
+  just drops + raw-injects. **Update `bsdr_micrelay` on the router when you update bsdrX** —
+  the older companion doesn't understand the full-datagram (`F`) message.
 
 (A higher-quality RVC model tier is planned behind the same interface.)
 
@@ -150,7 +210,11 @@ the OS, and the voice assistant, can use). Three capture methods:
 - **Sniff** (passive) — capture the headset's traffic when this PC can already see it
   (it is the gateway, or a mirror/SPAN port). Raw packet capture, needs root/Npcap.
 - **MITM** (ARP) — on a switched LAN, ARP-spoof the headset↔gateway path so the
-  traffic transits this host. `--sniff-mitm`.
+  traffic transits this host. `--sniff-mitm`. **Best on a wired segment**: over Wi-Fi,
+  ARP-spoof + hairpin forwarding is unreliable and can briefly drop the headset's LAN
+  link (heartbeat timeout → the session ends). When you pick/start MITM on a Wi-Fi NIC
+  the web UI warns and lets you **cancel (switch to Relay) or continue anyway**; the CLI
+  logs the same warning and proceeds. Prefer **Relay** on Wi-Fi.
 - **Relay** (router companion) — run **`bsdr_micrelay`** on your router: it captures
   the headset's uplink there and forwards it to the PC's `--sniff-remote PORT`. This
   is the **Wi-Fi answer** (where MITM can't work because the AP isolates stations) and
@@ -160,6 +224,61 @@ the OS, and the voice assistant, can use). Three capture methods:
 Two more options in the panel: **"use this computer's microphone"** (skip the headset
 entirely and use the PC's own mic as the owner source) and the **cloud-room fallback**
 (pull the owner's voice from the cloud SFU when no LAN capture is available).
+
+The **capture strategy** (Sniff / MITM / Relay), the **relay port**, and the **mic on/off**
+state are **persisted** (in `~/.config/bsdr_agent/settings`) and restored on the next launch —
+so the owner mic comes back up automatically. Relay restores with no privilege; Sniff/MITM
+re-prompt for the sudo password via the panel on restart (the password is never stored). The
+**STT and LLM** endpoint, model, and token are persisted the same way — each field applies the
+moment you leave it (no separate save step) and is restored on the next launch.
+
+**Mic when you're alone — the second (bot) account.** The headset only transmits your owner
+mic when there is **more than one participant** in the room (its own gate). The
+**Second account (bot)** card lets you log a second Bigscreen account into bsdrX and
+**Join my room** — that extra presence flips the gate so your mic streams even when no one
+else is around. It's a separate session (its own token, persisted like the main one; the
+password is never stored), independent of your host login.
+
+**Presence mode (audio-only vs full bot).** The bot has two modes, selectable in the card
+(and with `--bot-mode audio|full`, persisted):
+
+- **audio only** (default) — the bot just *joins* the room over REST so `participants > 1`
+  and your owner mic unlocks. It carries no media and shows **no avatar** (a userlist ghost).
+  This is the original behaviour and all you need for the mic-when-alone trick.
+- **full bot** — after joining, the bot also connects the room's **data plane** (raw
+  usrsctp over the join's `mediaPeer` dataPort — the same unencrypted mediasoup transport the
+  Quest uses, no DTLS/DCEP) and broadcasts a **UserState + periodic head-pose TickState** so the
+  bot appears as a real **avatar** in the room. The wire format is reversed byte-for-byte from the
+  live Quest APK and validated against a real `room.pcap`: each message is an ASCII string
+  `"<legacyUserId>*base64(<4-byte type><body>)"` on SCTP stream 1 (PPID `33 00 00 00`), where
+  UserState is a FlatBuffer with a **mandatory Avatar** table and TickState is a raw 176-byte pose
+  struct. The prefix is the bot's room **`legacyUserId`** (`userNNN`), the exact key the Quest keys
+  remote avatars by — bsdrX reads it from the room-join / `GET /room` JSON; without it the avatar
+  can't render (the bot stays joined audio-only and logs a warning). Needs the SCTP media build; on
+  a base build it falls back to audio-only.
+
+**Join my room** honors your room's privacy: an **open** room is joined directly; a
+**friends / verified / invite-only** room is joined via a proper **invite → accept → join**
+(the host account invites the bot, the bot accepts — which stages it — then joins), with **no
+privacy change**; only a **fully-closed** room is minimally raised to invite-only. An invite
+may require the two accounts to be **friends** first. The RoomId is sent both with and without
+its `room:` prefix (two reverse-engineerings disagree on the form) so whichever the live server
+honors is used.
+
+**Leave / Stop / Start.** Three controls sit next to Join, all keeping your host session
+untouched: **Leave room** exits the current room (`GET /room/{id}/leave`, the same call the Quest
+client makes) but stays logged in and online, so you can Join again; **Stop** disconnects the bot
+entirely (leaves the room, drops the avatar, closes its presence WebSocket) yet **remembers the
+login**, so the card then shows a one-click **Start bot** to reconnect with no password; **Log
+out** (or **Forget login**) clears the saved session completely. The bot's own socialId — needed to
+stage invites — is resolved the way the Quest client does it: `GET /auth/account` → `userSessionId`,
+then `GET main-shark-api/info/account/userSessionId/{id}` → `socialId` (the cloud-api
+`/social/profile` path is only for looking up *other* users and 403s for "me").
+
+**Follow me into rooms.** A **Follow me** checkbox (persisted) makes the bot track you: every ~15 s
+it polls your current room (`GET /rooms`) and, when you move to a different room, the bot **leaves
+the old room and re-joins the new one** automatically — same privacy-honoring join path as the
+manual button. Turn it off and the bot stays put. If you leave every room, the bot leaves too.
 
 ### Room mic (`BSDR_RoomMic`)
 
@@ -171,6 +290,18 @@ sniff/MITM/relay aren't available. It needs an active cloud session (**Internet 
 on** — that's the connection that carries the room). Linux exposes a dedicated device;
 Windows/macOS route it into VB-CABLE/BlackHole. Enable it with the **Room mic** toggle
 in the panel.
+
+**Cloud-mic loopback (via the bot).** The SFU never sends your own voice back to you, and a producer
+with no consumers can be dropped — so the room mic above carries **other** participants only and needs
+someone else present. The **bot**, being a separate participant, *is* sent everyone else's audio —
+**including yours**. Turn on **Cloud-mic loopback** (in the bot card, when the bot is logged in) and
+the bot opens its own room-audio port, pulls that mix and feeds it into the same **`BSDR_RoomMic`** —
+so your own voice reaches the computer and the room mic works **even when you're alone**, independent
+of Internet sharing. When the bot owns the device the host consume defers to it (no double audio).
+A **listen only to me** checkbox (on by default) solos the room owner's voice and mutes the other
+participants (and the owner's desktop audio) — the room-audio receiver gained an identity-solo keyed
+to `cloud_ssrc(ownerSessionId)`. Both toggles are persisted; toggling loopback starts/stops it live
+if the bot is already joined.
 
 Flags: `--sniff-mic`, `--sniff-mitm`, `--sniff-remote PORT`, `--sniff-iface`,
 `--sniff-gw`.
@@ -197,19 +328,49 @@ Flags: `--compctl`, `--compctl-vision`, `--listen-max`, `--confirm-timeout`.
   Linux/Windows, VAAPI on Linux iGPUs (`--vaapi`), VideoToolbox on macOS, and
   MediaCodec on Android. `--cpu` forces full software; `--kmsgrab` is a zero-copy
   capture path on Linux with `--vaapi`.
+- **Encoder mode** — **Quality** (default), **Balanced**, or **Performance**
+  (`--encoder-mode quality|balanced|performance` or the panel dropdown, persisted).
+  Higher levels use a lighter preset — Quality = NVENC `p7` + 2-pass; Balanced =
+  `p6` single-pass / x264 `faster`; Performance = `p4` single-pass / x264
+  `superfast` — for less CPU/GPU at a small quality cost on a constrained machine.
+- **Tuning a laggy/RAM-limited host** — the desktop capture+encode runs on one thread
+  that can peg a core at 1080p30; the biggest wins are usually **lower FPS** (panel
+  **Max FPS** or `--fps 24`), **lower resolution** (set it on the headset), and
+  **Balanced/Performance** encoder mode. Note the desktop encode is already GPU-offloaded when GPU
+  is selected (capture + upload are the residual CPU cost on X11, which NVFBC-less X11 can't
+  avoid — `--kmsgrab`+`--vaapi`, or the panel's **iGPU (Linux)** checkboxes, moves more of it off
+  the CPU; both apply live and are persisted, kmsgrab needs `CAP_SYS_ADMIN`). For a software (`--cpu`) host that
+  still can't keep up at high resolution, **x264 threads** (panel field or `--x264-threads N`)
+  spreads the software encode across N cores while keeping one NAL per frame — at the cost of
+  ~(N-1) frames of latency, so leave it at 1 unless you need it.
+- **Wi-Fi congestion** — the panel's **Wi-Fi** controls: *send video once* (`--lan-1x`,
+  halves the uplink by dropping the 2× redundancy) and **enable Wi-Fi network optimization**,
+  which **DSCP/WMM-marks** the video (CS4) and audio (EF) packets so the Wi-Fi stack
+  (802.11e/WMM) gives them priority airtime over background traffic — video → `AC_VI`, lifting
+  the stream above downloads and other devices sharing the AP. `--max-bitrate` additionally
+  caps a thin link. (DSCP marking is best-effort: honored by Linux `mac80211` and most APs;
+  stock Windows ignores `IP_TOS`.)
 
 ### Privacy screen-blank, pairing, and the web panel
 
 - **Screen-blank for privacy** — black out the *physical* monitor while the headset is
   connected (RandR brightness on Linux/X11); it restores the instant the headset
-  disconnects. Desktop-only.
+  disconnects. Desktop-only. The blank is a gamma-ramp change that outlives the process,
+  so bsdrX also restores it on **Ctrl-C, `kill`, and crashes** (SIGSEGV/SIGABRT/…), and
+  **self-heals on startup** — if a hard kill (SIGKILL / power loss) ever leaves the screen
+  black, just relaunch bsdrX (or run **`bsdr_agent --unblank`**) to bring it back.
+  (Wayland/wlroots auto-restores the moment bsdrX exits, so it never gets stuck there.)
 - **Automatic LAN pairing** — zero-config discovery; the pairing code is shown at
   startup.
 - **Local web control panel** — account login and status, headset picker, source
   selection, bitrate + encoder, 2D→3D, face swap, voice changer, owner-mic method,
   computer control, internet sharing, and the privacy blank — all live at
   `http://127.0.0.1:8088` (embedded WebView on Android). `--ui-port`, `--no-ui`,
-  `--no-browser`.
+  `--no-browser`. Every section except the account panel is a **collapsible panel**
+  (click the header to fold it away); the open/closed state **persists** per browser,
+  and each collapsed header still shows an **on/off badge** so you can see at a glance
+  what's enabled. The layout is **phone-friendly** (responsive rows, larger tap
+  targets) so you can drive it from a handset on the same network.
 
 ---
 
@@ -233,6 +394,7 @@ encoder paths, and the build targets).
 | 2D→3D built-in ONNX tiers | ✅ CUDA | ✅ DirectML | ✅ CoreML | ✅ NNAPI |
 | Face swap | ✅ | ✅ | ✅ | ✅ (all need ONNX Runtime + models) |
 | Voice changer (DSP) | ✅ | ✅ | ✅ | ✅ |
+| AI voice (RVC, ONNX) | ✅ CUDA | ✅ DirectML | ✅ CoreML | ✅ NNAPI (all fall back to CPU) |
 | Voice substitution — local (in-flight, no relay) | ✅ NFQUEUE (root) | ⚠️ WinDivert (Admin) | ⚠️ ARP-MITM+BPF (wired only, experimental) | ❌ (no local capture) |
 | Voice substitution — via relay | ✅ | ✅ | ✅ | ✅ (its only method) |
 | Owner-mic **Sniff** (passive) | ✅ (root helper) | ✅ bundled WinDivert (in-path) · ⚠️ Npcap (promisc/SPAN) | ✅ libpcap (built-in) · root | ❌ (no local capture) |
@@ -299,6 +461,14 @@ Desktop capture is autodetected per session (Xorg first, Wayland fallback; force
 
 Needs `libpipewire-0.3` + `libdbus-1` at build time (the native `./configure` and the
 Linux AppImage/`.deb` bundle enable it automatically; absent → x11grab/kmsgrab only).
+
+**`--pw-dmabuf` (experimental).** On a Wayland + Intel/AMD iGPU host, pair `--pw-dmabuf` with
+`--vaapi` to negotiate a **dmabuf** from PipeWire and import the compositor's GPU surface
+straight into VAAPI — zero CPU pixel movement (no map, no copy, no upload; compositor surface →
+VAAPI encoder). It falls back automatically to the normal CPU PipeWire path if the
+compositor/driver can't provide dmabuf or the VAAPI import fails, so it's safe to try. Off by
+default; NVENC/CPU hosts are unaffected, and the voice-command balloon overlay is skipped on the
+dmabuf path (no CPU surface to draw on, same as `--kmsgrab`). Needs on-hardware validation.
 
 ---
 
@@ -381,18 +551,24 @@ voice to the cloud instead. bsdrX does the codec/DSP; the relay just shuttles an
 
 ## Build & run
 
-Media (video + audio) is **on by default** and auto-detected; the build quietly drops
-any feature whose libraries are missing.
+Media (video + audio) is **on by default**. `./configure` is the **required readiness gate**:
+it detects the host OS + every needed library and runs a compile/link smoke test, failing loudly
+if anything is missing (no silent feature-dropping).
 
 ### Linux (native)
 
 ```bash
-./configure              # detects host OS, OpenSSL, media deps, and ONNX Runtime
-make                     # builds for the platform you're ON (macOS -> osx; else native) -> build/bsdr_agent
+./configure              # REQUIRED first: verify libs + write config.mk (re-run after distclean / dep changes)
+make                     # build from config.mk (does NOT run configure) -> build/bsdr_agent
 make check               # build + run the test suite
 sudo make install        # bin + man pages (DESTDIR honored)
 man bsdr_agent           # full option reference
 ```
+
+The build is autotools-style: **`./configure && make && make install`**. `make` never runs
+`./configure` itself — run configure first, and again **after `make distclean`** or whenever your
+**libraries / linking change** (it re-detects deps and rewrites `config.mk`; it's idempotent, so a
+no-op re-run won't force a rebuild). Bare `make` with no `config.mk` stops and tells you to configure.
 
 CMake is also supported:
 `cmake -S . -B build -DBSDR_ENABLE_VIDEO=ON -DBSDR_ENABLE_AUDIO=ON -DBSDR_ENABLE_SCTP=ON && cmake --build build -j`
@@ -433,7 +609,13 @@ The Android app lives in [`android/`](android/) and reuses the C core through th
 ```bash
 scripts/build-android-deps.sh arm64-v8a     # cross-build openssl/opus/srtp2/usrsctp
 cd android && ./gradlew assembleDebug        # -> app/build/outputs/apk/debug/app-debug.apk
+cd android && ./gradlew assembleRelease      # -> app/build/outputs/apk/release/app-release.apk
 ```
+
+Release builds are signed: supply your own keystore via `BSDR_KEYSTORE` /
+`BSDR_KEYSTORE_PASS` / `BSDR_KEY_ALIAS` / `BSDR_KEY_PASS` (or the matching `-P`
+gradle properties), otherwise the build falls back to the Android **debug**
+keystore so the APK is still installable (not Play-Store publishable).
 
 Needs the Android SDK/NDK, `minSdk 29`. Casts the device screen (MediaProjection +
 MediaCodec), injects input via AccessibilityService, and shows the same web UI in a
@@ -443,7 +625,9 @@ WebView. See [`ANDROID.md`](ANDROID.md) / [`docs/android.md`](docs/android.md).
 
 `./distribute.sh [linux windows osx android relay]` builds the release bundles
 (see the script header for env vars); prebuilt `bsdr_micrelay` binaries for common
-routers ship in `bsdrX_relay.zip`, and an OpenWRT recipe is in `openwrt/`.
+routers ship in `bsdrX_relay.zip`, and an OpenWRT recipe is in `openwrt/`. The
+Android APK is built **release** by default (signed as above); pass `--debug` for
+a debug APK.
 
 ### Common run examples
 
@@ -472,22 +656,28 @@ Without it the agent still runs — injection just falls back to logging.
 
 ---
 
-## Bigscreen cloud API key (required for cloud features)
+## Bigscreen cloud API keys (required for cloud features)
 
-Every Bigscreen cloud call is authenticated with Bigscreen's **client API key**
-(`Authorization: Bearer <key>`). That key is **Bigscreen's property**, so it has been
-**removed from this repository** and stays out **until — if ever — Bigscreen grants
-permission to publish it**.
+Bigscreen cloud calls are authenticated with a Bigscreen **app key**
+(`Authorization: Bearer <key>`). bsdrX uses **two**, per session role — both are
+**Bigscreen's property**, so both are **removed from this repository** and stay out
+**until — if ever — Bigscreen grants permission to publish them**:
+
+| Env var | Role | Used by |
+|---|---|---|
+| `BSDR_CLOUD_API_KEY` | **companion** key | the host account (the RDC companion — internet-share, room mic) |
+| `BSDR_CLOUD_CLIENT_KEY` | **client** key | the second/"bot" account (Friends-style client session that can join rooms) |
 
 - **LAN remote desktop, input, audio, 2D→3D, face swap, voice, and the owner-mic
   sniffer all work with no key** — nothing to set up.
-- **Cloud features** (account login, "share to internet") need you to supply the key:
+- **Cloud features** (account login, "share to internet", the second-account bot) need the key(s):
   ```bash
-  export BSDR_CLOUD_API_KEY="<the Bigscreen client key>"
+  export BSDR_CLOUD_API_KEY="<the Bigscreen companion key>"     # host account
+  export BSDR_CLOUD_CLIENT_KEY="<the Bigscreen client key>"     # second/bot account (optional)
   ```
-  `bsdr_cloud_api_key()` reads that variable (falling back to a compiled default, blank
-  in the public build). The key is discoverable in Bigscreen's own Remote Desktop
-  client config.
+  `bsdr_cloud_api_key()` / `bsdr_cloud_client_key()` read these (falling back to compiled
+  defaults, blank in the public build). Both keys are discoverable in Bigscreen's own
+  clients (the Remote Desktop client and the Bigscreen Friends app).
 
 ---
 

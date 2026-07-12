@@ -63,7 +63,7 @@ class BsdrService : Service() {
         }
 
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
-        val data = intent?.getParcelableExtra<Intent>(EXTRA_DATA)
+        val data = intent?.parcelableExtra<Intent>(EXTRA_DATA)
         if (resultCode == 0 || data == null) { stopSelf(); return START_NOT_STICKY }
 
         startForegroundCompat()
@@ -195,7 +195,7 @@ class BsdrService : Service() {
 
     /** Stream a local video file instead of the live screen (no MediaProjection). */
     private fun startFileCast(intent: Intent): Int {
-        val uri = intent.getParcelableExtra<android.net.Uri>(EXTRA_FILE_URI)
+        val uri = intent.parcelableExtra<android.net.Uri>(EXTRA_FILE_URI)
             ?: run { stopSelf(); return START_NOT_STICKY }
         startForegroundCompat(fileMode = true)
         val fs = FileSource(this, uri, 0, 0, FPS, BITRATE)
@@ -347,3 +347,10 @@ class BsdrService : Service() {
             ctx.startService(Intent(ctx, BsdrService::class.java).setAction(ACTION_SHOW_BUBBLE))
     }
 }
+
+/** Type-safe getParcelableExtra across API levels: the (name, Class) overload only exists on API 33+
+ *  (minSdk here is 29), so the pre-33 path must use the deprecated single-arg form. Isolating that one
+ *  deprecated call here keeps every call site warning-free. */
+private inline fun <reified T : android.os.Parcelable> Intent.parcelableExtra(name: String): T? =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) getParcelableExtra(name, T::class.java)
+    else @Suppress("DEPRECATION") (getParcelableExtra(name) as? T)

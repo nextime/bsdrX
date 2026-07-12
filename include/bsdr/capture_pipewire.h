@@ -38,11 +38,31 @@ int bsdr_pw_capture_available(void);
  * (no portal, user cancelled, no PipeWire, or not compiled in). */
 bsdr_pw_capture *bsdr_pw_capture_open(int want_window, int cursor, int *w, int *h, bsdr_pw_format *fmt);
 
-/* Copy the most recent frame into dst (packed 32-bit RGB, the format from _open), row by row into a
- * dst_stride-byte pitch for dst_rows rows (padding/cropping the stride difference safely). Waits up
- * to ~100 ms for a fresh frame. Returns 1 if a frame was copied, 0 if none arrived (retry), -1 on a
- * closed/fatal stream. */
-int bsdr_pw_capture_read(bsdr_pw_capture *c, uint8_t *dst, int dst_stride, int dst_rows);
+/* Same, but also request dmabuf negotiation (EXPERIMENTAL, --pw-dmabuf) for zero-copy import into
+ * VAAPI. Falls back to the CPU MAP_BUFFERS path if the compositor/driver can't provide dmabuf. Use
+ * bsdr_pw_capture_dmabuf_active() AFTER open to learn which path was actually negotiated. */
+bsdr_pw_capture *bsdr_pw_capture_open2(int want_window, int cursor, int want_dmabuf,
+                                       int *w, int *h, bsdr_pw_format *fmt);
+
+/* 1 if a dmabuf (zero-copy) stream was negotiated. When 0, use bsdr_pw_capture_read (CPU frames). */
+int bsdr_pw_capture_dmabuf_active(bsdr_pw_capture *c);
+
+/* The hw_frames_ctx (AVBufferRef*, DRM_PRIME) to install into the decoder ctx so ffmpeg's hwmap can
+ * import the borrowed dmabufs. Returns NULL unless dmabuf is active. Cast to AVBufferRef*. */
+void *bsdr_pw_capture_drm_frames_ctx(bsdr_pw_capture *c);
+
+/* Borrow the newest dmabuf frame as a DRM_PRIME AVFrame (cast the return to AVFrame*). Its buf[0]
+ * free callback releases the underlying PipeWire buffer, so feed it to a filtergraph / unref it
+ * promptly. Returns NULL if no new frame or dmabuf isn't active. Only valid when _dmabuf_active. */
+void *bsdr_pw_capture_read_drm(bsdr_pw_capture *c);
+
+/* Borrow the most recent frame (packed 32-bit RGB, the format from _open) — zero copy. On success
+ * *out_frame points at an internal buffer the caller may read (and draw on in place) until the NEXT
+ * bsdr_pw_capture_read call; *out_stride/out_w/out_h describe it. A triple-buffer handoff guarantees
+ * the capture thread never writes the borrowed slot in that window. Waits up to ~100 ms for a fresh
+ * frame. Returns 1 if a frame is ready, 0 if none arrived (retry), -1 on a closed/fatal stream. */
+int bsdr_pw_capture_read(bsdr_pw_capture *c, const uint8_t **out_frame,
+                         int *out_stride, int *out_w, int *out_h);
 
 void bsdr_pw_capture_close(bsdr_pw_capture *c);
 

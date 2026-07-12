@@ -87,13 +87,25 @@ void bsdr_micsniff_stop(bsdr_micsniff *s);
 /* True if the running sniffer is in MITM mode (so a mode change forces a restart). */
 bool bsdr_micsniff_is_mitm(const bsdr_micsniff *s);
 
+/* Best-effort: would a local (passive/MITM) sniff run over a Wi-Fi NIC? Resolves the default-route
+ * interface and checks whether it's wireless. Lets the UI warn — and offer cancel/continue — before an
+ * ARP-MITM, which is unreliable over Wi-Fi and can briefly drop the headset's LAN link. false when
+ * unknown, wired, or on a platform without local capture (Android). */
+bool bsdr_micsniff_default_wireless(void);
+
 /* Install (or clear, cb=NULL) a PCM tap for the voice-command pipeline. Safe to
  * call on a live sniffer; safe on NULL. */
 void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void *user);
 
 /* Realtime voice change applied to the decoded owner voice before it reaches the virtual mic / cloud
  * / command tap. gender -100..100 (pitch/formant), robot/echo/whisper 0..100. Safe on a live sniffer. */
-void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int gender, int robot, int echo, int whisper);
+void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int gender, int formant, int volume,
+                               int robot, int echo, int whisper);
+/* Select the AI (RVC) voice tier: convert the owner voice to `voice` (an .onnx) using the
+ * content/rmvpe base models on `tier` (1/2/3), pitch-shifted by `key` semitones. `voice_sr` = the
+ * voice model's native rate. on=0 or empty paths reverts to the DSP tier. Reloads only on change. */
+void bsdr_micsniff_set_voiceai(bsdr_micsniff *s, int on, int tier, const char *content,
+                               const char *rmvpe, const char *voice, int voice_sr, int key);
 
 /* Cloud voice SUBSTITUTION over the relay: when on (and running in router-companion mode), bsdrX
  * re-encodes the voice-changed owner audio and sends the modified RTP to the relay, which forwards it
@@ -108,8 +120,10 @@ static inline int  bsdr_micsniff_helper_main(int argc, char **argv) { (void)argc
 static inline bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) { (void)cfg; return (bsdr_micsniff *)0; }
 static inline void bsdr_micsniff_stop(bsdr_micsniff *s) { (void)s; }
 static inline bool bsdr_micsniff_is_mitm(const bsdr_micsniff *s) { (void)s; return false; }
+static inline bool bsdr_micsniff_default_wireless(void) { return false; }
 static inline void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void *user) { (void)s; (void)cb; (void)user; }
-static inline void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int g, int r, int e, int w) { (void)s;(void)g;(void)r;(void)e;(void)w; }
+static inline void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int g, int fm, int vo, int r, int e, int w) { (void)s;(void)g;(void)fm;(void)vo;(void)r;(void)e;(void)w; }
+static inline void bsdr_micsniff_set_voiceai(bsdr_micsniff *s, int on, int t, const char *c, const char *r, const char *v, int sr, int k) { (void)s;(void)on;(void)t;(void)c;(void)r;(void)v;(void)sr;(void)k; }
 static inline void bsdr_micsniff_set_substitute(bsdr_micsniff *s, int on) { (void)s; (void)on; }
 
 #endif /* BSDR_HAVE_AUDIO */

@@ -45,6 +45,9 @@ class BubbleOverlay(private val ctx: Context, private val onStop: () -> Unit) {
      *  form field in its WebView can take input focus and raise the soft keyboard — a NOT_FOCUSABLE
      *  overlay can never show the IME. The collapsed icon stays non-focusable so it doesn't grab the
      *  Back button / steal focus from the app underneath while it's just idling. */
+    // SOFT_INPUT_ADJUST_RESIZE is deprecated in favour of WindowInsets APIs that don't apply to
+    // WindowManager overlay windows, so it remains the only way to make the panel resize for the IME.
+    @Suppress("DEPRECATION")
     private fun params(w: Int, h: Int, focusable: Boolean = false,
                        alpha: Float = 1f): WindowManager.LayoutParams {
         var flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL

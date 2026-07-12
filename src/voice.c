@@ -26,7 +26,10 @@
 #include <string.h>
 
 #define VOICE_RATE  48000
-#define CAP_SECONDS 120                       /* capture-buffer ceiling (memory bound) */
+/* One dictated command is realistically < 20 s; 60 s is a generous ceiling that still ~halves the
+ * old 120 s buffer. When full, push_pcm stops appending (a command longer than this is truncated),
+ * so keep enough margin that a real command never hits it. */
+#define CAP_SECONDS 60                        /* capture-buffer ceiling (memory bound) */
 #define CAP_SAMPLES (VOICE_RATE * CAP_SECONDS) /* mono; the owner mic is mono */
 
 struct bsdr_voice {
@@ -66,7 +69,7 @@ bsdr_voice *bsdr_voice_new(const bsdr_voice_config *cfg, bsdr_injector *inj) {
     v->inj = inj;
     v->cc = bsdr_compcontrol_new(inj);
     v->lock = bsdr_mutex_new();
-    v->buf = malloc(CAP_SAMPLES * sizeof(int16_t));   /* ~11 MB */
+    v->buf = malloc(CAP_SAMPLES * sizeof(int16_t));   /* ~5.8 MB (60 s mono@48k) */
     if (!v->buf) { bsdr_voice_free(v); return NULL; }  /* else push_pcm/phase_* deref NULL */
     v->channels = 1;
     return v;

@@ -373,6 +373,23 @@ int bsdr_sctp_send(bsdr_sctp *s, const uint8_t *data, size_t len) {
                               SCTP_SENDV_SNDINFO, 0);
 }
 
+int bsdr_sctp_send_room(bsdr_sctp *s, const uint8_t *data, size_t len) {
+    if (!s || !s->sock) return -1;
+    /* BigSoup sends on stream 1, no DCEP channel setup (the relay accepts stream-1 data blindly and
+     * fans it out). The payload is an ASCII string ("<legacyId>*base64(code+body)"), so the channel is
+     * WebRTC-string — but the native lib emits the PPID BYTE-SWAPPED: the on-wire ppid field is exactly
+     * 33 00 00 00 (proven byte-for-byte across all 389 data messages in room.pcap). Reproduce that
+     * wire pattern verbatim, else the Quest's native BigSoup drops the frame before OnData(). Ordered
+     * delivery (no SCTP_UNORDERED), B+E bits (single unfragmented message). */
+    struct sctp_sndinfo si;
+    memset(&si, 0, sizeof(si));
+    si.snd_sid = 1;
+    si.snd_ppid = htonl(0x33000000u);   /* wire bytes 33 00 00 00 — matches BigSoupBroadcastData */
+    si.snd_flags = SCTP_EOR;
+    return (int)usrsctp_sendv(s->sock, data, len, NULL, 0, &si, sizeof(si),
+                              SCTP_SENDV_SNDINFO, 0);
+}
+
 void bsdr_sctp_free(bsdr_sctp *s) {
     if (!s) return;
     /* ABORT the association on close (SO_LINGER l_onoff=1, l_linger=0) instead of a graceful

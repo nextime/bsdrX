@@ -32,10 +32,28 @@
 
 /* Bigscreen client API key: the BSDR_CLOUD_API_KEY env var if set, else the compiled default
  * (blank in the public mirror). See cloud.h / the README. */
-const char *bsdr_cloud_api_key(void) {
+const char *bsdr_cloud_api_key(void) {          /* companion key — host account */
     const char *e = getenv("BSDR_CLOUD_API_KEY");
     return (e && *e) ? e : BSDR_CLOUD_API_KEY_DEFAULT;
 }
+
+/* The RTP/audio SSRC a Bigscreen peer sends under = djb2(userSessionId). Mirrors cloud_stream.c's
+ * cloud_ssrc(); exposed so the bot can solo a specific participant (e.g. the room owner) by SSRC. */
+uint32_t bsdr_cloud_user_ssrc(const char *user_session_id) {
+    uint32_t h = 5381;
+    if (user_session_id)
+        for (const char *p = user_session_id; *p; p++)
+            h = h * 33u + (uint32_t)(int32_t)(signed char)*p;
+    return h;
+}
+/* Client key — the bot account's Friends-style session (bearer on its login + all its calls). */
+const char *bsdr_cloud_client_key(void) {
+    const char *e = getenv("BSDR_CLOUD_CLIENT_KEY");
+    if (e && *e) return e;
+    e = getenv("BSDR_CLOUD_GAME_KEY");           /* back-compat env name */
+    return (e && *e) ? e : BSDR_CLOUD_CLIENT_KEY_DEFAULT;
+}
+const char *bsdr_cloud_game_key(void) { return bsdr_cloud_client_key(); }   /* back-compat alias */
 
 /* Do one HTTPS request to host:443; return the full response (headers+body) in
  * `resp` (size `cap`). Returns response length, or -1. */
@@ -101,7 +119,9 @@ static int status_code(const char *resp) {
     return sp ? atoi(sp + 1) : 0;
 }
 
-bool bsdr_cloud_login(const char *email, const char *password,
+static void make_system_info_b64(char *out, size_t cap, int client_mode);   /* defined below */
+
+bool bsdr_cloud_login(int client_mode, const char *email, const char *password,
                       bsdr_cloud_result *out) {
     memset(out, 0, sizeof(*out));
 
@@ -112,16 +132,26 @@ bool bsdr_cloud_login(const char *email, const char *password,
     int blen = snprintf(body, sizeof(body),
                         "{\"email\":\"%s\",\"password\":\"%s\"}", emE, pwE);
 
-    char req[1024];
+    /* COMPANION (host): companion key, NO system-info on login (its working behavior — unchanged).
+     * CLIENT (bot): client key + x-bigscreen-system-info on login, exactly like the Bigscreen Friends
+     * app, so the session is first-class. */
+    const char *key = client_mode ? bsdr_cloud_client_key() : bsdr_cloud_api_key();
+    char sysinfo_b64[1024]; sysinfo_b64[0] = 0;
+    if (client_mode) make_system_info_b64(sysinfo_b64, sizeof(sysinfo_b64), 1);
+
+    char req[2048];
     snprintf(req, sizeof(req),
         "POST /auth/login HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Authorization: Bearer %s\r\n"
+        "%s%s%s"
         "Content-Type: application/json\r\n"
         "Accept: application/json\r\n"
         "Content-Length: %d\r\n"
         "Connection: close\r\n\r\n%s",
-        BSDR_CLOUD_API_HOST, bsdr_cloud_api_key(), blen, body);
+        BSDR_CLOUD_API_HOST, key,
+        client_mode ? "x-bigscreen-system-info: " : "", client_mode ? sysinfo_b64 : "", client_mode ? "\r\n" : "",
+        blen, body);
 
     static char resp[16384];
     int n = https_request(BSDR_CLOUD_API_HOST, req, resp, sizeof(resp));
@@ -138,7 +168,7 @@ bool bsdr_cloud_login(const char *email, const char *password,
     return out->ok;
 }
 
-bool bsdr_cloud_account(const char *access_token, char *name, size_t name_len) {
+bool bsdr_cloud_account(const char *api_key, const char *access_token, char *name, size_t name_len) {
     char req[1024];
     snprintf(req, sizeof(req),
         "GET /auth/account HTTP/1.1\r\n"
@@ -147,13 +177,22 @@ bool bsdr_cloud_account(const char *access_token, char *name, size_t name_len) {
         "x-access-token: %s\r\n"
         "Accept: application/json\r\n"
         "Connection: close\r\n\r\n",
-        BSDR_CLOUD_API_HOST, bsdr_cloud_api_key(), access_token);
+        BSDR_CLOUD_API_HOST, api_key, access_token);
 
     static char resp[16384];
     int n = https_request(BSDR_CLOUD_API_HOST, req, resp, sizeof(resp));
     if (n < 0 || status_code(resp) / 100 != 2) return false;
     const char *body = strstr(resp, "\r\n\r\n");
     if (!body) return false;
+    body += 4;
+    /* Surface identity + verified flag so we can tell WHICH account this token is and whether it can
+     * join a VerifiedUsersOnly room (the room-join gate). isVerified/socialId come straight from
+     * /auth/account, same shape as the ownerSocialProfile in GET /rooms. */
+    { char sid[80] = "", ver[8] = "";
+      bsdr_json_get_str(body, "socialId", sid, sizeof sid);
+      bsdr_json_get_str(body, "isVerified", ver, sizeof ver);   /* "true"/"false" if present as a token */
+      BSDR_INFO("bsdr.cloud", "account: socialId=%s isVerified=%s  body: %.400s",
+                sid[0] ? sid : "?", ver[0] ? ver : "?", body); }
     /* best-effort: pull a display name / username field */
     if (bsdr_json_get_str(body, "displayName", name, name_len)) return true;
     if (bsdr_json_get_str(body, "username", name, name_len)) return true;
@@ -177,57 +216,58 @@ static void b64enc(const unsigned char *in, size_t n, char *out) {
     out[o] = '\0';
 }
 
-/* systemInfo JSON (matches app.js getSystemInfo) + base64 connectionString. */
-static void make_connection_string(const char *access_token, char *out, size_t cap) {
+/* Build the systemInfo JSON for the session role:
+ *  - COMPANION (host): the RDC client fingerprint (version 0.900.0, operatingSystem "Windows") so the
+ *    cloud lists us as an addable RDC host on the Quest. UNCHANGED — the host login works with this.
+ *  - CLIENT (bot): Bigscreen Friends' exact hard-coded desktop fingerprint incl. its app version, so
+ *    the session is first-class and (hopefully) passes the room-join version filter. */
+static void fill_system_info(char *info, size_t cap, int client_mode) {
     char host[128] = "bsdrX-host";
 #if !defined(_WIN32)
     extern int gethostname(char *, size_t);
     gethostname(host, sizeof(host));
 #endif
-    /* Must match the official Bigscreen Remote Desktop Client so the cloud lists
-     * us as an addable RDC host on the Quest: version = config.versionNumber
-     * (0.900.0), operatingSystem = "Windows" (RDC is Windows-only; the Quest's
-     * add-screen list filters on it). We present as that client (interop). */
-    char info[512];
-    snprintf(info, sizeof(info),
-        "{\"deviceUniqueIdentifier\":\"%s\",\"version\":\"0.900.0\","
-        "\"deviceName\":\"Bigscreen Remote Desktop Client\",\"deviceModel\":\"Electron\","
-        "\"operatingSystem\":\"Windows\",\"CPU\":\"Unknown\",\"memory\":\"Unknown\",\"GPU\":\"NVidia\"}",
-        host);
+    if (client_mode)
+        snprintf(info, cap,
+            "{\"deviceUniqueIdentifier\":\"%s\",\"drmSystem\":\"\","
+            "\"version\":\"0.950.2.03f010-beta-perma-rooms-beta\",\"deviceName\":\"Mobile Phone\","
+            "\"deviceModel\":\"To Be Filled By O.E.M.\",\"operatingSystem\":\"Windows 10  (10.0.19045) 64bit\","
+            "\"CPU\":\"Intel(R) Core(TM) i7-5820K CPU @ 3.30GHz\",\"memory\":32687,\"GPU\":\"NVIDIA GeForce RTX 1070\"}",
+            host);
+    else
+        snprintf(info, cap,
+            "{\"deviceUniqueIdentifier\":\"%s\",\"version\":\"0.900.0\","
+            "\"deviceName\":\"Bigscreen Remote Desktop Client\",\"deviceModel\":\"Electron\","
+            "\"operatingSystem\":\"Windows\",\"CPU\":\"Unknown\",\"memory\":\"Unknown\",\"GPU\":\"NVidia\"}",
+            host);
+}
+
+/* systemInfo JSON + base64 connectionString for the WS. client_mode selects companion vs client info. */
+static void make_connection_string(const char *access_token, char *out, size_t cap, int client_mode) {
+    char info[512]; fill_system_info(info, sizeof info, client_mode);
     char packet[4096];
     int pl = snprintf(packet, sizeof(packet),
         "{\"accessToken\":\"%s\",\"systemInfo\":%s}", access_token, info);
-    /* snprintf returns the would-have-written length; clamp so b64enc never reads past packet[]
-     * if the token ever overflows the buffer (it can't today, but the read length must be safe). */
     size_t plen = (pl < 0) ? 0 : ((size_t)pl < sizeof(packet) ? (size_t)pl : sizeof(packet) - 1);
     b64enc((const unsigned char *)packet, plen, out);
     (void)cap;
 }
 
-/* The systemInfo JSON on its own, base64'd — the x-bigscreen-system-info header for /auth/renew. */
-static void make_system_info_b64(char *out, size_t cap) {
-    char host[128] = "bsdrX-host";
-#if !defined(_WIN32)
-    extern int gethostname(char *, size_t);
-    gethostname(host, sizeof(host));
-#endif
-    char info[512];
-    snprintf(info, sizeof(info),
-        "{\"deviceUniqueIdentifier\":\"%s\",\"version\":\"0.900.0\","
-        "\"deviceName\":\"Bigscreen Remote Desktop Client\",\"deviceModel\":\"Electron\","
-        "\"operatingSystem\":\"Windows\",\"CPU\":\"Unknown\",\"memory\":\"Unknown\",\"GPU\":\"NVidia\"}",
-        host);
+/* systemInfo JSON on its own, base64'd — the x-bigscreen-system-info header (renew, and client login). */
+static void make_system_info_b64(char *out, size_t cap, int client_mode) {
+    char info[512]; fill_system_info(info, sizeof info, client_mode);
     b64enc((const unsigned char *)info, strlen(info), out);
     (void)cap;
 }
 
-bool bsdr_cloud_renew(const char *refresh_token, bsdr_cloud_result *out) {
+bool bsdr_cloud_renew(const char *api_key, const char *refresh_token, bsdr_cloud_result *out) {
     memset(out, 0, sizeof(*out));
     if (!refresh_token || !refresh_token[0]) {
         snprintf(out->message, sizeof(out->message), "no refresh token"); return false;
     }
+    int client_mode = (strcmp(api_key, bsdr_cloud_client_key()) == 0);   /* client vs companion sysinfo */
     char sysinfo_b64[1024];
-    make_system_info_b64(sysinfo_b64, sizeof(sysinfo_b64));
+    make_system_info_b64(sysinfo_b64, sizeof(sysinfo_b64), client_mode);
 
     /* Renewal is a two-step nonce flow (from the Electron client's checkAccessTokenStatus +
      * renewAccessToken):
@@ -244,7 +284,7 @@ bool bsdr_cloud_renew(const char *refresh_token, bsdr_cloud_result *out) {
         "x-access-token: renew\r\n"
         "Accept: application/json\r\n"
         "Connection: close\r\n\r\n",
-        BSDR_CLOUD_API_HOST, bsdr_cloud_api_key());
+        BSDR_CLOUD_API_HOST, api_key);
     if (https_request(BSDR_CLOUD_API_HOST, vreq, vresp, sizeof(vresp)) < 0) {
         snprintf(out->message, sizeof(out->message), "verify connection failed"); return false;
     }
@@ -263,10 +303,10 @@ bool bsdr_cloud_renew(const char *refresh_token, bsdr_cloud_result *out) {
         "Authorization: Bearer %s\r\n"
         "x-bigscreen-nonce: %s\r\n"
         "x-refresh-token: %s\r\n"
-        "x-bigscreen-system-info: %s\r\n"     /* required on renew (NOT on login) */
+        "x-bigscreen-system-info: %s\r\n"     /* required on renew */
         "Accept: application/json\r\n"
         "Connection: close\r\n\r\n",
-        BSDR_CLOUD_API_HOST, bsdr_cloud_api_key(), nonce, refresh_token, sysinfo_b64);
+        BSDR_CLOUD_API_HOST, api_key, nonce, refresh_token, sysinfo_b64);
 
     static char resp[16384];
     int n = https_request(BSDR_CLOUD_API_HOST, req, resp, sizeof(resp));
@@ -313,62 +353,350 @@ bool bsdr_cloud_get_rooms(const char *access_token, bsdr_cloud_screen *out) {
         if (bsdr_json_get_double(body, "micPort",   &v)) out->mic_port   = (int)v;   /* room voice (mono) */
         bsdr_json_get_str(body, "roomId", out->room_id, sizeof(out->room_id));       /* for the room-join mic peer */
         bsdr_json_get_str(body, "userSessionId", out->session_id, sizeof(out->session_id));
+        bsdr_json_get_str(body, "preferredUserType", out->user_type, sizeof(out->user_type));  /* bot-join policy */
         out->found = true;
         BSDR_INFO("bsdr.cloud", "rooms: relay %s video=%d audio=%d mic=%d data=%d session=%s",
                   out->media_ip, out->video_port, out->audio_port, out->mic_port,
                   out->data_port, out->session_id);
         return true;
     }
-    BSDR_INFO("bsdr.cloud", "rooms: no shareable screen yet (add one on the Quest)");
+    /* Only the Quest can put a screen in room.screens[] (Api.CreateScreen -> Api.AddScreenToRoom);
+     * the companion/bsdrX only push media to an existing one — an empty screens[] is expected until
+     * the operator shares the remote desktop INTO the room from the Quest. See the identity/screen
+     * ownership notes: RDC "can't function as a stand alone streamer". */
+    BSDR_INFO("bsdr.cloud", "rooms: room has no shared screen yet — on the Quest, share the remote "
+              "desktop INTO this room (only the Quest can add it; the PC just pushes video to it)");
     BSDR_DEBUG("bsdr.cloud", "GET /rooms body (%d B): %.1500s", (int)strlen(body), body);
-    return true;   /* connected OK, just no screen provisioned yet */
+    return true;   /* connected OK, just no Quest-added screen in the room yet */
 }
+
+static bool extract_my_legacy_id(const char *body, const char *my_sid, char *out, size_t cap);
 
 bool bsdr_cloud_join_room(const char *access_token, const char *room_id, bsdr_cloud_screen *out) {
     memset(out, 0, sizeof(*out));
     if (!room_id || !room_id[0]) return false;
-    /* the roomId carries a "room:" prefix; the REST path + body use the BARE id (a prefixed path 500s,
-     * matching the official client's String.Concat of the bare id). */
+    /* Two independent reverse-engineerings disagree on the RoomId form, so we try both and let the
+     * server decide:
+     *   - Quest il2cpp: JoinRoom => String.Concat("…/room/", RoomId, "/join") with the VERBATIM
+     *     "room:"-prefixed id in path AND body {"roomId":RoomId,...}.
+     *   - bsandroid PROTOCOL.md §3: the BARE id works, a prefixed path 500s, a wrong-bare 404s.
+     * We send the full (prefixed) id first, and retry the bare id on EITHER a 500 or a 404 — so
+     * whichever form the live server honors gets used. Only a clean 2xx is a real join. Bearer =
+     * client key + x-access-token. */
     const char *bare = strncmp(room_id, "room:", 5) == 0 ? room_id + 5 : room_id;
-    char jbody[256];
-    int bl = snprintf(jbody, sizeof jbody,
-                      "{\"roomId\":\"%s\",\"version\":\"0.950.2\"}", bare);
-    char req[4096];
-    snprintf(req, sizeof(req),
-        "POST /room/%s/join HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Authorization: Bearer %s\r\n"
-        "x-access-token: %s\r\n"
-        "Content-Type: application/json\r\n"
-        "Accept: application/json\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: close\r\n\r\n%s",
-        bare, BSDR_CLOUD_API2_HOST, bsdr_cloud_api_key(), access_token, bl, jbody);
+    const char *cand[2] = { room_id, bare };
     static char resp[65536];
-    int n = https_request(BSDR_CLOUD_API2_HOST, req, resp, sizeof(resp));
-    if (n < 0) { BSDR_WARN("bsdr.cloud", "POST /room/%s/join: connection failed", bare); return false; }
-    int code = status_code(resp);
+    int code = 0; const char *body = NULL;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        const char *rid = cand[attempt];
+        if (attempt == 1 && strcmp(cand[0], cand[1]) == 0) break;   /* no prefix -> nothing to retry */
+        char jbody[256];
+        int bl = snprintf(jbody, sizeof jbody, "{\"roomId\":\"%s\",\"version\":\"0.950.2\"}", rid);
+        char req[4096];
+        snprintf(req, sizeof(req),
+            "POST /room/%s/join HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Authorization: Bearer %s\r\n"
+            "x-access-token: %s\r\n"
+            "Content-Type: application/json\r\n"
+            "Accept: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s",
+            rid, BSDR_CLOUD_API2_HOST, bsdr_cloud_client_key(), access_token, bl, jbody);
+        int n = https_request(BSDR_CLOUD_API2_HOST, req, resp, sizeof(resp));
+        if (n < 0) { BSDR_WARN("bsdr.cloud", "POST /room/%s/join: connection failed", rid); return false; }
+        code = status_code(resp);
+        body = strstr(resp, "\r\n\r\n");
+        BSDR_INFO("bsdr.cloud", "room-join(%s id) -> HTTP %d", attempt ? "bare" : "full", code);
+        if (code / 100 == 2) break;                                 /* accepted -> done */
+        if (code != 500 && code != 404) break;                      /* 500/404 -> retry the bare id */
+    }
     out->http_status = code;
-    const char *body = strstr(resp, "\r\n\r\n");
-    if (code / 100 != 2 || !body) { BSDR_WARN("bsdr.cloud", "room-join -> HTTP %d", code); return false; }
+    if (code / 100 != 2 || !body) {
+        BSDR_WARN("bsdr.cloud", "room-join -> HTTP %d  body: %.400s", code, body ? body + 4 : "(none)");
+        return false;
+    }
     body += 4;
     BSDR_INFO("bsdr.cloud", "room-join body (%d B): %.4000s", (int)strlen(body), body);
-    /* Same flat-key mediaPeer shape as /rooms, but this peer DOES expose micPort (the room voice). */
+    /* The HTTP 2xx above IS the join success (the server returns a Room). Parsing the bot's own
+     * MediaPeer is a SEPARATE best-effort: on join the LocalUser gets a mediaPeer
+     * {ipAddress, dataPort, audioPort, videoPort[, micPort], userSessionId} (bsandroid PROTOCOL.md §4)
+     * — dataPort drives the avatar data channel (full-bot mode), micPort the room voice. Some
+     * responses carry only the room's MediaServerInfo; never fail the join for a missing peer. */
     double v;
-    if (bsdr_json_get_str(body, "ipAddress", out->media_ip, sizeof(out->media_ip)) &&
-        bsdr_json_get_double(body, "micPort", &v)) {
-        out->mic_port = (int)v;
+    if (bsdr_json_get_str(body, "ipAddress", out->media_ip, sizeof(out->media_ip))) {
+        if (bsdr_json_get_double(body, "micPort",   &v)) out->mic_port   = (int)v;
         if (bsdr_json_get_double(body, "audioPort", &v)) out->audio_port = (int)v;
         if (bsdr_json_get_double(body, "videoPort", &v)) out->video_port = (int)v;
         if (bsdr_json_get_double(body, "dataPort",  &v)) out->data_port  = (int)v;
         bsdr_json_get_str(body, "userSessionId", out->session_id, sizeof(out->session_id));
-        out->found = true;
-        BSDR_INFO("bsdr.cloud", "room-join: mic peer %s mic=%d (audio=%d)",
-                  out->media_ip, out->mic_port, out->audio_port);
-        return true;
+        /* The bot's own legacyUserId ("userNNN") — the data-channel/avatar prefix. Best-effort from the
+         * join body; app.c falls back to GET /room/{id} (full user list) if it isn't here. */
+        if (out->session_id[0]) extract_my_legacy_id(body, out->session_id, out->legacy_user_id, sizeof out->legacy_user_id);
+        if (out->mic_port || out->audio_port || out->video_port || out->data_port) out->found = true;
+        BSDR_INFO("bsdr.cloud", "room-join: media peer %s mic=%d audio=%d video=%d data=%d session=%s legacy=%s",
+                  out->media_ip, out->mic_port, out->audio_port, out->video_port,
+                  out->data_port, out->session_id, out->legacy_user_id[0] ? out->legacy_user_id : "(none)");
+    } else {
+        BSDR_INFO("bsdr.cloud", "room-join: joined (HTTP %d), no flat media peer in the response", code);
     }
-    BSDR_WARN("bsdr.cloud", "room-join: no micPort in the response");
-    return false;
+    return true;   /* joined */
+}
+
+int bsdr_cloud_leave_room(const char *access_token, const char *room_id) {
+    /* RE-confirmed (Api.LeaveRoom, Quest il2cpp): GET /room/{RoomId}/leave on the cloud-api host with
+     * the VERBATIM RoomId (the "room:" prefix is NOT stripped), no body, standard headers. A null Room
+     * falls back to the literal /room/current/leave. */
+    const char *rid = (room_id && room_id[0]) ? room_id : "current";
+    static char resp[8192];
+    char req[2048];
+    snprintf(req, sizeof(req),
+        "GET /room/%s/leave HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Authorization: Bearer %s\r\n"
+        "x-access-token: %s\r\n"
+        "Accept: application/json\r\n"
+        "Connection: close\r\n\r\n",
+        rid, BSDR_CLOUD_API2_HOST, bsdr_cloud_client_key(), access_token);
+    if (https_request(BSDR_CLOUD_API2_HOST, req, resp, sizeof(resp)) < 0) {
+        BSDR_WARN("bsdr.cloud", "room-leave: connection failed"); return -1;
+    }
+    int code = status_code(resp);
+    BSDR_INFO("bsdr.cloud", "room-leave %s -> HTTP %d", rid, code);
+    return code;
+}
+
+/* Quiet poll of the operator's CURRENT room id (for the bot's follow-me). Same GET /rooms as
+ * bsdr_cloud_get_rooms but logs only at DEBUG and returns just the roomId — safe to call on a timer
+ * without spamming the log with the full body. Returns true if a room id was found; out is set to ""
+ * when the operator isn't in a room. */
+bool bsdr_cloud_poll_room_id(const char *access_token, char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    char req[4096];
+    snprintf(req, sizeof(req),
+        "GET /rooms HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Authorization: Bearer %s\r\n"
+        "x-access-token: %s\r\n"
+        "Accept: application/json\r\n"
+        "Connection: close\r\n\r\n",
+        BSDR_CLOUD_API2_HOST, bsdr_cloud_api_key(), access_token);
+    static char resp[65536];
+    int n = https_request(BSDR_CLOUD_API2_HOST, req, resp, sizeof(resp));
+    if (n < 0) return false;
+    if (status_code(resp) / 100 != 2) return false;
+    const char *body = strstr(resp, "\r\n\r\n");
+    if (!body) return false;
+    body += 4;
+    char rid[128] = "";
+    bsdr_json_get_str(body, "roomId", rid, sizeof rid);
+    BSDR_DEBUG("bsdr.cloud", "follow poll: operator room=%s", rid[0] ? rid : "(none)");
+    if (out && cap) snprintf(out, cap, "%s", rid);
+    return rid[0] != '\0';
+}
+
+/* Find OUR OWN legacyUserId in a room/join JSON body. Each room-user object carries a `legacyUserId`
+ * ("userNNN") sibling of `userSessionId`; the Quest keys remote avatars by exactly this string
+ * (RemoteUsersManager dictionary), so the bot must send it as its data-channel prefix. We locate our
+ * user object by our userSessionId, then read the nearest `legacyUserId` within that object's window.
+ * Returns true and fills out (verbatim) on success; out set to "" otherwise. */
+static bool extract_my_legacy_id(const char *body, const char *my_sid, char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!body || !my_sid || !my_sid[0]) return false;
+    const char *sid = strstr(body, my_sid);          /* our userSessionId value inside its object */
+    if (!sid) return false;
+    /* A tight window around our session id stays inside our own room-user object (legacyUserId and
+     * userSessionId are adjacent siblings) so bsdr_json_get_str can't grab a neighbor's id. */
+    const char *lo = sid - 512 < body ? body : sid - 512;
+    size_t span = (size_t)(sid - lo) + strlen(my_sid) + 512;
+    if (span > 2000) span = 2000;
+    char win[2001];
+    size_t n = span < sizeof(win) ? span : sizeof(win) - 1;
+    memcpy(win, lo, n); win[n] = '\0';
+    char lid[64] = "";
+    if (!bsdr_json_get_str(win, "legacyUserId", lid, sizeof lid) || !lid[0]) return false;
+    if (out && cap) snprintf(out, cap, "%s", lid);
+    return true;
+}
+
+/* ---- second-account bot: invite -> accept -> join + room policy (see bsdrx-bot-join-room-policy) ---- */
+#define BSDR_BS_VERSION "0.950.2"
+
+/* Minimal percent-encoder for a path segment (username). Bigscreen usernames are effectively
+ * [A-Za-z0-9_], but encode anything outside the RFC3986 unreserved set so a stray char can't
+ * corrupt the request line. */
+static void url_encode_seg(const char *in, char *out, size_t cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 4 < cap; p++) {
+        unsigned char c = *p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 0xF];
+        }
+    }
+    out[o] = 0;
+}
+
+bool bsdr_cloud_my_socialid(const char *access_token, char *out, size_t cap) {
+    if (out && cap) out[0] = 0;
+    static char resp[16384];
+    char uname[128] = "";
+    /* PRIMARY (this is what worked before — restored): GET /social/profile on the cloud-api host with
+     * the client key. socialId omitted from the path => "me", identified by x-access-token; the body is
+     * a SocialProfile carrying socialId. The /auth/account + /info/account/userSessionId path tried in
+     * between returns a LocalAccount, which structurally has NO socialId (it's {UserSessionId, Username,
+     * Email, IsVerified, ...}) — a dead end, hence the "no socialId" failures. */
+    {
+        char req[1024];
+        snprintf(req, sizeof req,
+            "GET /social/profile HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\n"
+            "x-access-token: %s\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+            BSDR_CLOUD_API2_HOST, bsdr_cloud_client_key(), access_token);
+        if (https_request(BSDR_CLOUD_API2_HOST, req, resp, sizeof resp) < 0) return false;
+        int code = status_code(resp);
+        const char *body = strstr(resp, "\r\n\r\n");
+        if (code / 100 == 2 && body) {
+            body += 4;
+            if (bsdr_json_get_str(body, "socialId", out, cap) && out[0]) {
+                BSDR_INFO("bsdr.cloud", "my-socialid: %s (/social/profile)", out); return true;
+            }
+            bsdr_json_get_str(body, "username", uname, sizeof uname);
+        } else {
+            BSDR_WARN("bsdr.cloud", "my-socialid: /social/profile HTTP %d: %.200s",
+                      code, body ? body + 4 : "(none)");
+        }
+    }
+    /* FALLBACK: resolve our own username -> SocialProfile via /info/username/{username}
+     * (Accounts.FetchAccountWithUsername). Only used if /social/profile didn't yield socialId. */
+    if (!uname[0]) {
+        /* learn our username from /auth/account (a LocalAccount — Username is there even if socialId isn't) */
+        char req[1024];
+        snprintf(req, sizeof req,
+            "GET /auth/account HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\n"
+            "x-access-token: %s\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+            BSDR_CLOUD_API_HOST, bsdr_cloud_client_key(), access_token);
+        if (https_request(BSDR_CLOUD_API_HOST, req, resp, sizeof resp) >= 0 &&
+            status_code(resp) / 100 == 2) {
+            const char *b = strstr(resp, "\r\n\r\n");
+            if (b) { b += 4;
+                if (bsdr_json_get_str(b, "socialId", out, cap) && out[0]) {
+                    BSDR_INFO("bsdr.cloud", "my-socialid: %s (/auth/account)", out); return true; }
+                bsdr_json_get_str(b, "username", uname, sizeof uname);
+            }
+        }
+    }
+    if (!uname[0]) { BSDR_WARN("bsdr.cloud", "my-socialid: could not determine our username"); return false; }
+    {
+        char enc[192]; url_encode_seg(uname, enc, sizeof enc);
+        char req[1024];
+        snprintf(req, sizeof req,
+            "GET /info/username/%s HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\n"
+            "x-access-token: %s\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+            enc, BSDR_CLOUD_API_HOST, bsdr_cloud_client_key(), access_token);
+        if (https_request(BSDR_CLOUD_API_HOST, req, resp, sizeof resp) < 0) return false;
+        int code = status_code(resp);
+        const char *body = strstr(resp, "\r\n\r\n");
+        if (code / 100 != 2 || !body) {
+            BSDR_WARN("bsdr.cloud", "my-socialid: /info/username/%s HTTP %d: %.200s",
+                      uname, code, body ? body + 4 : "(none)");
+            return false;
+        }
+        body += 4;
+        bool ok = bsdr_json_get_str(body, "socialId", out, cap) && out[0];
+        if (ok) BSDR_INFO("bsdr.cloud", "my-socialid: %s (/info/username)", out);
+        else    BSDR_WARN("bsdr.cloud", "my-socialid: no socialId in /info/username body: %.200s", body);
+        return ok;
+    }
+}
+
+int bsdr_cloud_create_notification(const char *access_token, const char *recipient_social_id,
+                                   const char *type) {
+    char jbody[256];
+    int bl = snprintf(jbody, sizeof jbody,
+        "{\"recipientSocialId\":\"%s\",\"notificationType\":\"%s\",\"version\":\"%s\"}",
+        recipient_social_id, type, BSDR_BS_VERSION);
+    char req[1024];
+    snprintf(req, sizeof req,
+        "POST /social/notification HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\n"
+        "x-access-token: %s\r\nContent-Type: application/json\r\nAccept: application/json\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+        BSDR_CLOUD_API2_HOST, bsdr_cloud_api_key(), access_token, bl, jbody);
+    static char resp[16384];
+    if (https_request(BSDR_CLOUD_API2_HOST, req, resp, sizeof resp) < 0) return -1;
+    int code = status_code(resp);
+    const char *b = strstr(resp, "\r\n\r\n");
+    BSDR_INFO("bsdr.cloud", "create-notification %s -> HTTP %d: %.300s", type, code, b ? b + 4 : "");
+    return code;
+}
+
+/* Copy a JSON string value starting at `v` (which points just after the opening quote) into out. */
+static void copy_jstr(const char *v, char *out, size_t cap) {
+    size_t i = 0; if (!out || !cap) return;
+    while (*v && *v != '"' && i + 1 < cap) { if (*v == '\\' && v[1]) v++; out[i++] = *v++; }
+    out[i] = 0;
+}
+bool bsdr_cloud_find_room_invite(const char *access_token, char *notif_id, size_t nsz,
+                                 char *room_id, size_t rsz) {
+    if (notif_id && nsz) notif_id[0] = 0;
+    if (room_id && rsz) room_id[0] = 0;
+    char req[1024];
+    snprintf(req, sizeof req,
+        "GET /social/notifications HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\n"
+        "x-access-token: %s\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        BSDR_CLOUD_API2_HOST, bsdr_cloud_client_key(), access_token);
+    static char resp[65536];
+    if (https_request(BSDR_CLOUD_API2_HOST, req, resp, sizeof resp) < 0) return false;
+    if (status_code(resp) / 100 != 2) return false;
+    const char *body = strstr(resp, "\r\n\r\n"); if (!body) return false; body += 4;
+    /* No JSON-array parser: find a RoomInvite, then the notificationId that precedes it (each object
+     * emits notificationId before notificationType) and the roomId in the metaData that follows. */
+    const char *inv = strstr(body, "\"notificationType\":\"RoomInvite\"");
+    if (!inv) return false;
+    const char *idk = NULL, *s = body;
+    for (;;) { const char *n = strstr(s, "\"notificationId\""); if (!n || n >= inv) break; idk = n; s = n + 1; }
+    if (!idk) return false;
+    const char *q = strchr(idk, ':'); if (q) q = strchr(q, '"'); if (!q) return false;
+    copy_jstr(q + 1, notif_id, nsz);
+    const char *rk = strstr(inv, "\"roomId\"");
+    if (rk) { const char *r = strchr(rk, ':'); if (r) r = strchr(r, '"'); if (r) copy_jstr(r + 1, room_id, rsz); }
+    return notif_id[0] != 0;
+}
+
+int bsdr_cloud_notification_action(const char *access_token, const char *notif_id, const char *verb) {
+    char jbody[64]; int bl = snprintf(jbody, sizeof jbody, "{\"version\":\"%s\"}", BSDR_BS_VERSION);
+    char req[1024];
+    snprintf(req, sizeof req,
+        "PUT /social/notification/%s/%s HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\n"
+        "x-access-token: %s\r\nContent-Type: application/json\r\nAccept: application/json\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+        notif_id, verb, BSDR_CLOUD_API2_HOST, bsdr_cloud_client_key(), access_token, bl, jbody);
+    static char resp[16384];
+    if (https_request(BSDR_CLOUD_API2_HOST, req, resp, sizeof resp) < 0) return -1;
+    int code = status_code(resp);
+    const char *b = strstr(resp, "\r\n\r\n");
+    BSDR_INFO("bsdr.cloud", "notification %s/%s -> HTTP %d: %.200s", notif_id, verb, code, b ? b + 4 : "");
+    return code;
+}
+
+int bsdr_cloud_set_room_usertype(const char *access_token, const char *room_id, const char *usertype) {
+    const char *bare = strncmp(room_id, "room:", 5) == 0 ? room_id + 5 : room_id;
+    char jbody[160]; int bl = snprintf(jbody, sizeof jbody,
+        "{\"adminSettings\":{\"preferredUserType\":\"%s\"}}", usertype);
+    char req[1024];
+    snprintf(req, sizeof req,
+        "PUT /room/%s HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\n"
+        "x-access-token: %s\r\nContent-Type: application/json\r\nAccept: application/json\r\n"
+        "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+        bare, BSDR_CLOUD_API2_HOST, bsdr_cloud_api_key(), access_token, bl, jbody);
+    static char resp[16384];
+    if (https_request(BSDR_CLOUD_API2_HOST, req, resp, sizeof resp) < 0) return -1;
+    int code = status_code(resp);
+    const char *b = strstr(resp, "\r\n\r\n");
+    BSDR_INFO("bsdr.cloud", "set-room preferredUserType=%s -> HTTP %d: %.300s", usertype, code, b ? b + 4 : "");
+    return code;
 }
 
 bool bsdr_cloud_get_room(const char *access_token, const char *room_id, bsdr_cloud_screen *out) {
@@ -411,8 +739,11 @@ bool bsdr_cloud_get_room(const char *access_token, const char *room_id, bsdr_clo
         if (bsdr_json_get_double(scan, "audioPort", &v)) out->audio_port = (int)v;
         if (bsdr_json_get_double(scan, "dataPort",  &v)) out->data_port  = (int)v;
         bsdr_json_get_str(scan, "userSessionId", out->session_id, sizeof(out->session_id));
+        /* localUser scope => the first legacyUserId here is ours (the data-channel/avatar prefix). */
+        bsdr_json_get_str(scan, "legacyUserId", out->legacy_user_id, sizeof(out->legacy_user_id));
         out->found = true;
-        BSDR_INFO("bsdr.cloud", "GET /room: mic peer %s mic=%d", out->media_ip, out->mic_port);
+        BSDR_INFO("bsdr.cloud", "GET /room: mic peer %s mic=%d legacy=%s", out->media_ip, out->mic_port,
+                  out->legacy_user_id[0] ? out->legacy_user_id : "(none)");
         return true;
     }
     BSDR_WARN("bsdr.cloud", "GET /room: no localUser micPort");
@@ -484,6 +815,21 @@ static void ws_dump_frame(const char *dir, int op, const unsigned char *pl, size
     for (size_t i = 0; i < hl; i++) hn += snprintf(hex + hn, sizeof(hex) - (size_t)hn, "%02x", pl[i]);
     BSDR_INFO("bsdr.ws", "%s op=%d %zuB: %s | hex[%zu]: %s%s", dir, op, len,
               txt[0] ? txt : "(non-text)", hl, hex, len > 256 ? "..." : "");
+
+    /* DIAGNOSTIC: the Quest owner-mic gate transmits only when Room.participants > 1 — a server scalar
+     * carried in the 'room-data-updated' WS push (proven in libil2cpp Room..ctor(JSONNode), key
+     * "participants"). Surface it plainly so ONE capture reveals whether a 2nd presence / 2nd session /
+     * 2nd account bumps the count on the owner's account (this WS is the same account as the headset). */
+    if (txt[0]) {
+        const char *pp = strstr(txt, "participants");
+        if (pp) {
+            const char *q = pp + (int)sizeof("participants") - 1;
+            while (*q && (*q < '0' || *q > '9') && *q != '-') q++;
+            long val = *q ? strtol(q, NULL, 10) : -1;
+            BSDR_INFO("bsdr.ws", ">>> ROOM participants=%ld%s (owner-mic transmits when >1)",
+                      val, strstr(txt, "room-data-updated") ? " [room-data-updated]" : "");
+        }
+    }
 }
 
 /* Reassemble the TLS byte stream into WS frames and dump every one — full room protocol. */
@@ -517,9 +863,9 @@ static void ws_keepalive(void *arg) {
     }
     free(buf);
 }
-bsdr_cloud_ws *bsdr_cloud_ws_open(const char *access_token) {
+bsdr_cloud_ws *bsdr_cloud_ws_open(const char *access_token, int client_mode) {
     char cs[8192];
-    make_connection_string(access_token, cs, sizeof(cs));
+    make_connection_string(access_token, cs, sizeof(cs), client_mode);
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) return NULL;
     bsdr_tls_configure_client(ctx, BSDR_CLOUD_WS_HOST);

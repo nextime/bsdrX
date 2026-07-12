@@ -52,6 +52,8 @@
 #include "bsdr/model_store.h"
 #include "bsdr/faceswap.h"
 #include "bsdr/micsub.h"
+#include "bsdr/voicestore.h"
+#include "bsdr/voiceai.h"
 #include "bsdr/voice.h"
 #if defined(BSDR_PLATFORM_ANDROID)
 #include "bsdr_android.h"          /* device-mic voice bridge (no sniffer on Android) */
@@ -115,6 +117,16 @@ static void on_sigint(int sig) {
         _exit(130);
     }
     g_running = 0;
+}
+/* Fatal-crash handler (SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL/SIGQUIT/SIGHUP): the screen-blank is an
+ * X11/gamma-ramp change that OUTLIVES the process, so a crash while blanked leaves the monitor black.
+ * Restore it as the very first thing, then re-raise with the default disposition so we still crash
+ * normally (core dump, correct exit status). Best-effort: screen_set_blank isn't async-signal-safe, but
+ * this only runs once, on the way to dying, and an already-black screen is the worse outcome. */
+static void on_fatal(int sig) {
+    if (g_screen_blanked) { screen_set_blank(0); g_screen_blanked = 0; }
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 void bsdr_agent_stop(void) { g_running = 0; }
 
@@ -233,6 +245,11 @@ static void replay_main(void *arg) {
 static int g_lan_video_reps = 2;
 static int g_lan_sendmmsg = 0;
 
+/* EXPERIMENTAL (P4.6, --ort-arena-off): disable ORT's CPU memory arena on the depth + faceswap
+ * sessions — lowers steady RSS for those intermittently-used models. Defined in depth_onnx.c (a core
+ * lib file, so tests/Android link it); set here from the CLI, read at session-option setup. */
+extern int bsdr_ort_arena_off;
+
 /* Build one LAN wire packet for fragment `fi` into pkt[] ([fragment][16B trailer], XOR-0x14 on
  * bytes[1..flen)). Returns the packet length. */
 static size_t lan_build_frag(uint8_t *pkt, const uint8_t *nal, size_t nlen, uint16_t fi, uint16_t total,
@@ -246,7 +263,14 @@ static size_t lan_build_frag(uint8_t *pkt, const uint8_t *nal, size_t nlen, uint
     tr[4]=w; tr[5]=w>>8;  tr[6]=h; tr[7]=h>>8;
     uint64_t comp = ((((uint64_t)frame_num<<16 | fi)<<16 | total)<<8) | ts_delta;
     for (int b=0;b<8;b++) tr[8+b] = (uint8_t)(comp>>(8*b));
-    for (size_t i=1;i<flen;i++) pkt[i] ^= 0x14;     /* skip byte0 (NAL hdr) + trailer */
+    /* XOR bytes [1, flen) with 0x14 (skip byte0 = NAL hdr; trailer stays plaintext). Word-at-a-time
+     * over the middle (memcpy = no alignment/aliasing UB, folds to one load/xor/store), scalar tail.
+     * Byte-exact with the old per-byte loop — the mask is uniform so endianness is irrelevant. */
+    size_t i = 1;
+    for (; i + 8 <= flen; i += 8) {
+        uint64_t v; memcpy(&v, pkt + i, 8); v ^= 0x1414141414141414ULL; memcpy(pkt + i, &v, 8);
+    }
+    for (; i < flen; i++) pkt[i] ^= 0x14;
     return flen + LAN_TRAILER;
 }
 
@@ -318,7 +342,11 @@ static void lan_audio_main(void *arg) {
         uint8_t *tr = pkt + n;
         tr[0]=ssrc; tr[1]=ssrc>>8; tr[2]=ssrc>>16; tr[3]=ssrc>>24;
         tr[4]=seq;  tr[5]=seq>>8;  tr[6]=seq>>16;  tr[7]=seq>>24;
-        for (int i = 0; i < n; i++) pkt[i] ^= 0x14;
+        int i = 0;                                  /* XOR the whole Opus payload (byte0 included; word-at-a-time) */
+        for (; i + 8 <= n; i += 8) {
+            uint64_t v; memcpy(&v, pkt + i, 8); v ^= 0x1414141414141414ULL; memcpy(pkt + i, &v, 8);
+        }
+        for (; i < n; i++) pkt[i] ^= 0x14;
         bsdr_udp_send(ctx->udp, pkt, (size_t)n + 8);
         seq++;
     }
@@ -371,7 +399,11 @@ static void lan_file_audio_main(void *arg) {
         uint8_t *tr = pkt + n;
         tr[0]=ssrc; tr[1]=ssrc>>8; tr[2]=ssrc>>16; tr[3]=ssrc>>24;
         tr[4]=seq;  tr[5]=seq>>8;  tr[6]=seq>>16;  tr[7]=seq>>24;
-        for (int i = 0; i < n; i++) pkt[i] ^= 0x14;
+        int i = 0;                                  /* XOR the whole Opus payload (byte0 included; word-at-a-time) */
+        for (; i + 8 <= n; i += 8) {
+            uint64_t v; memcpy(&v, pkt + i, 8); v ^= 0x1414141414141414ULL; memcpy(pkt + i, &v, 8);
+        }
+        for (; i < n; i++) pkt[i] ^= 0x14;
         bsdr_udp_send(ctx->udp, pkt, (size_t)n + 8);
         seq++;
     }
@@ -571,6 +603,7 @@ static bsdr_faceswap *faceswap_reconcile(agent_t *a, bsdr_faceswap *cur) {
     snprintf(fsdir, sizeof fsdir, "%s/faceswap", dir);
     bsdr_faceswap *fs = bsdr_faceswap_open(fsdir, tier >= 2);
     if (!fs) { bsdr_app_set_faceswap_status(a->app, "models missing — put det_10g/w600k_r50/inswapper_128 in the faceswap dir"); return NULL; }
+    bsdr_faceswap_set_detect_every(fs, a->app->faceswap_detect_every);   /* opt-in P4.5 cadence */
     if (!src[0]) { bsdr_app_set_faceswap_status(a->app, "set a source image"); return fs; }
     uint8_t *rgb=NULL; int w=0,h=0;
     if (bsdr_capture_decode_image_rgb(src, &rgb, &w, &h) != 0) { bsdr_app_set_faceswap_status(a->app, "cannot read source image"); return fs; }
@@ -586,15 +619,19 @@ static void lan_live_main(agent_t *a) {
     if (!bsdr_udp_open(&udp, BSDR_REMOTE_DESKTOP_PORT, a->remote_ip, BSDR_REMOTE_DESKTOP_PORT)) {
         BSDR_ERROR("bsdr.agent", "LAN: udp 45002 -> %s failed", a->remote_ip); return;
     }
+    if (a->app && a->app->wifi_opt) bsdr_udp_set_dscp(&udp, 32);   /* CS4 video -> WMM AC_VI */
     bsdr_capture_config cfg = {0};
-    cfg.fps = a->fps > 0 ? a->fps : 30;
+    cfg.fps = (a->app && a->app->fps_cap > 0) ? a->app->fps_cap : (a->fps > 0 ? a->fps : 30);
     cfg.bitrate = a->bitrate > 0 ? a->bitrate : 8000000;
     int user_cpu = a->app && a->app->cpu_only;   /* the operator's --cpu (best-quality software x264) */
     cfg.cpu_only = user_cpu;
     cfg.use_vaapi = a->app && a->app->use_vaapi;
     cfg.use_kmsgrab = a->app && a->app->use_kmsgrab;
+    cfg.enc_level = a->app ? a->app->enc_level : 0;   /* encoder effort 0/1/2 (web/--encoder-mode) */
+    cfg.enc_x264_threads = a->app ? a->app->enc_x264_threads : 0;   /* opt-in x264 frame threads (P6.9) */
     cfg.force_x11 = a->app && a->app->force_x11;              /* Wayland backend autodetect override */
     cfg.force_pipewire = a->app && a->app->force_pipewire;
+    cfg.pw_dmabuf = a->app && a->app->pw_dmabuf;             /* --pw-dmabuf: experimental zero-copy dmabuf->VAAPI */
     /* 2D->3D SBS runs on the CPU NV12 frame, so it needs the CPU-scale path (no VAAPI/CUDA scale
      * and no zero-copy kmsgrab). Force CPU *scale* whenever 3D is enabled — but keep NVENC for the
      * ENCODE (it accepts a software NV12 frame and, unlike x264, the Quest decodes its stream without
@@ -682,6 +719,7 @@ static void lan_live_main(agent_t *a) {
     bool audio_ok = a->audio && (filemode || adev_ok) &&
         bsdr_udp_open(&audio_udp, BSDR_REMOTE_AUDIO_PORT, a->remote_ip, BSDR_REMOTE_AUDIO_PORT);
     if (a->audio && (filemode || adev_ok) && !audio_ok) BSDR_WARN("bsdr.agent", "LAN: audio udp 45003 open failed; audio off");
+    if (audio_ok && a->app && a->app->wifi_opt) bsdr_udp_set_dscp(&audio_udp, 46);   /* EF audio -> WMM AC_VI/VO */
     struct lan_audio_ctx actx = { a, &audio_udp, adev_ok ? &adev : NULL, 0 };
     bsdr_thread *athr = audio_ok ? bsdr_thread_start(filemode ? lan_file_audio_main : lan_audio_main, &actx)
                                  : NULL;   /* -> Quest:45003 */
@@ -1040,6 +1078,12 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
         snprintf(app.cloud_data_mode, sizeof(app.cloud_data_mode), "%s", opt->cloud_data);
     if (opt->cloud_dtls_role)
         snprintf(app.cloud_dtls_role, sizeof(app.cloud_dtls_role), "%s", opt->cloud_dtls_role);
+    if (opt->bot_mode)   /* CLI overrides the saved bot presence mode */
+        snprintf(app.bot_mode, sizeof(app.bot_mode),
+                 "%s", strcmp(opt->bot_mode, "full") == 0 ? "full" : "audio");
+    if (opt->encoder_mode)   /* CLI overrides the saved encoder mode: quality|balanced|performance */
+        app.enc_level = strcmp(opt->encoder_mode, "performance") == 0 ? 2 :
+                        strcmp(opt->encoder_mode, "balanced")    == 0 ? 1 : 0;
     app.cloud_latch_burst = opt->cloud_latch_burst;
     app.cloud_src_port = opt->cloud_src_port;
     app.cloud_sticky_ports = opt->cloud_sticky_ports;
@@ -1057,9 +1101,19 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     if (opt->use_kmsgrab) app.use_kmsgrab = true;         /* --kmsgrab: DRM/KMS capture */
     if (opt->force_x11) app.force_x11 = true;             /* --x11: force x11grab */
     if (opt->force_pipewire) app.force_pipewire = true;   /* --wayland/--pipewire: force the portal */
+    if (opt->pw_dmabuf) app.pw_dmabuf = true;             /* --pw-dmabuf: experimental zero-copy dmabuf->VAAPI */
+    if (opt->lan_1x) app.lan_1x = true;                   /* --lan-1x forces on; absence keeps the saved value */
+    if (opt->fps > 0) app.fps_cap = opt->fps;             /* --fps caps the capture fps (persisted) */
+    if (opt->faceswap_detect_every > 0) app.faceswap_detect_every = opt->faceswap_detect_every;  /* opt-in P4.5 */
+    if (opt->x264_threads > 0) app.enc_x264_threads = opt->x264_threads;   /* opt-in P6.9 */
 #ifdef BSDR_HAVE_CAPTURE
-    g_lan_video_reps = opt->lan_1x ? 1 : 2;               /* --lan-1x: halve the LAN uplink */
-    g_lan_sendmmsg = opt->use_sendmmsg ? 1 : 0;           /* --sendmmsg: batch LAN fragment sends */
+    g_lan_video_reps = app.lan_1x ? 1 : 2;                /* saved/CLI lan-1x; the main loop keeps it live */
+#if defined(__linux__) && !defined(BSDR_PLATFORM_ANDROID)
+    g_lan_sendmmsg = opt->no_sendmmsg ? 0 : 1;            /* default ON: sendmmsg batches the burst into one syscall */
+#else
+    g_lan_sendmmsg = opt->use_sendmmsg ? 1 : 0;           /* elsewhere the batch path is a sendto loop -> opt-in only */
+#endif
+    bsdr_ort_arena_off = opt->ort_arena_off ? 1 : 0;      /* --ort-arena-off (experimental): lower ORT RSS */
 #endif
     if (opt->no_cloud_audio) app.cloud_no_audio = true;  /* default: audio ON (Opus + 8B trailer) */
     a.app = &app;
@@ -1076,6 +1130,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
      * come up already logged in + online; internet sharing then auto-follows the Quest's screen. */
     if (bsdr_app_restore_session(&app))
         BSDR_INFO("bsdr.agent", "Bigscreen: already logged in (auto internet-share armed)");
+    bsdr_app_bot_restore(&app);   /* second "bot" account, if one was saved (its own session/WS) */
 
     /* identity (advertised via discovery) */
     bsdr_discovery_info info;
@@ -1178,6 +1233,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
 #endif
 
     int tick = 0;
+    int follow_ctr = 0;               /* follow-me poll cadence (200ms/iter -> ~15 s) */
     int screen_blanked = 0;
     unsigned my_source_gen = app.source_gen;
     unsigned my_select_gen = bsdr_app_select_gen(&app);
@@ -1321,9 +1377,12 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
             }
             /* realtime voice change on the Quest mic (gender + effects from the web UI) */
             {
-                int vg=0, vr=0, ve=0, vw=0; bool vsub=false;
-                bsdr_app_get_voicefx(&app, &vg, &vr, &ve, &vw, &vsub);
-                if (sniffer) bsdr_micsniff_set_voicefx(sniffer, vg, vr, ve, vw);
+#ifdef BSDR_HAVE_CAPTURE
+                g_lan_video_reps = app.lan_1x ? 1 : 2;   /* live: web toggle halves the LAN uplink */
+#endif
+                int vg=0, vfm=0, vvol=0, vr=0, ve=0, vw=0; bool vsub=false;
+                bsdr_app_get_voicefx(&app, &vg, &vfm, &vvol, &vr, &ve, &vw, &vsub);
+                if (sniffer) bsdr_micsniff_set_voicefx(sniffer, vg, vfm, vvol, vr, ve, vw);
                 /* Cloud SUBSTITUTION via the RELAY (all platforms incl. Android): bsdrX re-encodes the
                  * changed voice and the router companion forwards it to the cloud in place of the
                  * original. No-op unless the sniffer runs in router-companion mode. */
@@ -1343,7 +1402,34 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                 } else if (!can_sub && micsub) {
                     bsdr_micsub_stop(micsub); micsub = NULL;
                 }
-                if (micsub) bsdr_micsub_set_voicefx(micsub, vg, vr, ve, vw);
+                if (micsub) bsdr_micsub_set_voicefx(micsub, vg, vfm, vvol, vr, ve, vw);
+#endif
+                /* AI (RVC) voice tier: resolve the base + voice model paths from the voice store and
+                 * push them to both mic paths. Effective only when the models are actually present
+                 * (otherwise kick a background base-model download and stay on the DSP tier). */
+                bool vai_on; int vai_tier, vai_key; char vai_voice[64];
+                bsdr_app_get_voiceai(&app, &vai_on, &vai_tier, vai_voice, sizeof vai_voice, &vai_key);
+                char vcontent[1024] = "", vrmvpe[1024] = "", vpath[1200] = "";
+                int voice_sr = 40000, eff_on = 0;
+                if (vai_on && vai_voice[0]) {
+                    int have_c = bsdr_voice_base_present(BSDR_VBASE_CONTENT);
+                    int have_v = (bsdr_voice_path(vai_voice, vpath, sizeof vpath) == 0);
+                    if (have_c && have_v) {
+                        bsdr_voice_base_path(BSDR_VBASE_CONTENT, vcontent, sizeof vcontent);
+                        if (bsdr_voice_base_present(BSDR_VBASE_RMVPE)) bsdr_voice_base_path(BSDR_VBASE_RMVPE, vrmvpe, sizeof vrmvpe);
+                        bsdr_voice_entry ve; if (bsdr_voice_get(vai_voice, &ve) == 0 && ve.sample_rate > 0) voice_sr = ve.sample_rate;
+                        eff_on = 1;
+                        bsdr_app_set_voiceai_status(&app, bsdr_voiceai_available() ? "converting" : "no ONNX in this build");
+                    } else {
+                        if (!have_c) bsdr_voice_base_download_start();
+                        bsdr_app_set_voiceai_status(&app, !have_c ? "downloading base models…" : "voice model not found");
+                    }
+                } else {
+                    bsdr_app_set_voiceai_status(&app, "off");
+                }
+                if (sniffer) bsdr_micsniff_set_voiceai(sniffer, eff_on, vai_tier, vcontent, vrmvpe, vpath, voice_sr, vai_key);
+#if !defined(BSDR_PLATFORM_ANDROID)
+                if (micsub) bsdr_micsub_set_voiceai(micsub, eff_on, vai_tier, vcontent, vrmvpe, vpath, voice_sr, vai_key);
 #endif
             }
         }
@@ -1469,6 +1555,10 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
         }
         if (tick % 5 == 0)                        /* ~1 s: reconcile internet sharing promptly */
             bsdr_app_cloud_tick(&app);            /* start/stop the relay stream to match desired */
+        if (++follow_ctr >= 75) {                 /* ~15 s: follow the operator between rooms */
+            follow_ctr = 0;
+            bsdr_app_bot_follow_tick(&app);
+        }
         if (++tick >= 25) {                       /* ~5 s heartbeat-expiry check */
             tick = 0;
             if (bsdr_control_expire_stale(ctl)) {
@@ -1520,6 +1610,12 @@ int main(int argc, char **argv) {
             printf("bsdr_agent (bsdrX) %s\n", BSDR_VERSION);
             return 0;
         }
+        else if (strcmp(argv[i], "--unblank") == 0) {
+            /* One-shot recovery: a prior crash left the monitor gamma-blanked. Restore and exit. */
+            bsdr_screen_blank(0); bsdr_screen_blank_reset();
+            printf("bsdrX: restored monitor gamma (unblanked)\n");
+            return 0;
+        }
         else if (strcmp(argv[i], "--debug") == 0) bsdr_log_set_level(BSDR_LOG_DEBUG);
         else if (strcmp(argv[i], "--insecure-tls") == 0) bsdr_tls_set_insecure(true);
         else if (strcmp(argv[i], "--control-only") == 0) opt.control_only = true;
@@ -1534,6 +1630,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--threed-full") == 0) opt.threed_full = 1;
         else if (strcmp(argv[i], "--threed-ai") == 0 && i + 1 < argc) { opt.threed_ai_cmd = argv[++i]; if (!opt.threed_mode) opt.threed_mode = BSDR_3D_AI; }
         else if (strcmp(argv[i], "--threed-tier") == 0 && i + 1 < argc) { opt.threed_tier = (int)bsdr_depth_tier_parse(argv[++i]); if (!opt.threed_mode) opt.threed_mode = BSDR_3D_AI; }
+        else if (strcmp(argv[i], "--faceswap-detect-every") == 0 && i + 1 < argc) { opt.faceswap_detect_every = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--x264-threads") == 0 && i + 1 < argc) { opt.x264_threads = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--ort-arena-off") == 0) { opt.ort_arena_off = true; }
         else if (strcmp(argv[i], "--threed-model-dir") == 0 && i + 1 < argc) {
 #ifdef _WIN32
             _putenv_s("BSDR_MODEL_DIR", argv[++i]);   /* mingw has no setenv */
@@ -1556,7 +1655,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--kmsgrab") == 0) opt.use_kmsgrab = true;
         else if (strcmp(argv[i], "--x11") == 0) opt.force_x11 = true;
         else if (strcmp(argv[i], "--wayland") == 0 || strcmp(argv[i], "--pipewire") == 0) opt.force_pipewire = true;
+        else if (strcmp(argv[i], "--pw-dmabuf") == 0) opt.pw_dmabuf = true;
         else if (strcmp(argv[i], "--sendmmsg") == 0) opt.use_sendmmsg = true;
+        else if (strcmp(argv[i], "--no-sendmmsg") == 0) opt.no_sendmmsg = true;
         else if (strcmp(argv[i], "--no-cloud-audio") == 0) opt.no_cloud_audio = true;
         else if (strcmp(argv[i], "--sniff-mic") == 0) opt.sniff_mic = true;
         else if (strcmp(argv[i], "--sniff-mitm") == 0) { opt.sniff_mic = true; opt.sniff_mitm = true; }
@@ -1570,6 +1671,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--max-bitrate") == 0 && i + 1 < argc) opt.max_bitrate = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cloud-data") == 0 && i + 1 < argc) opt.cloud_data = argv[++i];
         else if (strcmp(argv[i], "--cloud-dtls-role") == 0 && i + 1 < argc) opt.cloud_dtls_role = argv[++i];
+        else if (strcmp(argv[i], "--bot-mode") == 0 && i + 1 < argc) opt.bot_mode = argv[++i];
+        else if (strcmp(argv[i], "--encoder-mode") == 0 && i + 1 < argc) opt.encoder_mode = argv[++i];
         else if (strcmp(argv[i], "--cloud-latch-burst") == 0 && i + 1 < argc) opt.cloud_latch_burst = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cloud-src-port") == 0 && i + 1 < argc) opt.cloud_src_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--cloud-sticky-ports") == 0) opt.cloud_sticky_ports = true;
@@ -1609,6 +1712,12 @@ int main(int argc, char **argv) {
 "                       model is fetched on first use (or import it, below). Implies ai mode.\n"
 "  --threed-model-dir D Directory to cache/read depth models (default: per-OS cache dir).\n"
 "  --threed-model-import ZIP  Import depth model(s) from a distributed zip into the cache, then exit-safe.\n"
+"  --faceswap-detect-every N  Run face DETECTION only every N frames (swap still every frame);\n"
+"                       ~halves faceswap CPU at a small tracking-lag cost. Default 1 (every frame).\n"
+"  --x264-threads N     Software (--cpu) encode: use N x264 FRAME threads (still one NAL/frame) to\n"
+"                       spread encode across cores. Adds ~(N-1) frames latency; default 1 (off).\n"
+"  --ort-arena-off      EXPERIMENTAL: disable ORT's CPU memory arena on the depth/faceswap models\n"
+"                       (lowers steady RSS while they're idle; output unchanged).\n"
 "  --no-video           Don't stream video (input/control only).\n"
 "  --no-audio           Don't stream desktop audio or expose the headset mic.\n"
 "\n"
@@ -1662,9 +1771,21 @@ int main(int argc, char **argv) {
 "  --cloud-src-port N       Hard-pin local UDP source ports for cloud media (video=N,\n"
 "                           audio=N+1, data=N+2). Overrides sticky ports (0=off).\n"
 "  --cloud-no-sticky-ports  Disable sticky source ports. By default bsdrX keeps its\n"
-"                           ephemeral source ports per relay IP across share toggles\n"
-"                           (like the official client) so the relay's comedia latch\n"
-"                           stays valid; this flag reverts to fresh ephemeral each time.\n"
+"                           ephemeral source ports per relay IP across share toggles AND\n"
+"                           across a process restart (persisted in the config dir), like\n"
+"                           the official client, so the relay's comedia latch stays valid;\n"
+"                           this flag reverts to fresh ephemeral each time.\n"
+"  --encoder-mode MODE      'quality' (default), 'balanced', or 'performance'. Higher levels use\n"
+"                           a lighter encoder preset (quality NVENC p7 + 2-pass; balanced p6\n"
+"                           single-pass / x264 faster; performance p4 single-pass / x264\n"
+"                           superfast) for less CPU/GPU cost at a small quality drop.\n"
+"                           Persisted; the web UI has the same toggle. Applies on\n"
+"                           the next stream (re)start.\n"
+"  --bot-mode MODE          Second-account bot presence: 'audio' (default — REST-join the\n"
+"                           host room to unlock the owner mic when alone; no avatar) or\n"
+"                           'full' (also connect the room data channel and broadcast an\n"
+"                           avatar/pose so the bot is visible). Persisted; the web UI has\n"
+"                           the same toggle.\n"
 "\n"
 "PERFORMANCE\n"
 "  --cpu                    Force CPU scale + libx264 encode. This is the DEFAULT on\n"
@@ -1680,7 +1801,11 @@ int main(int argc, char **argv) {
 "                           dGPU; AMD needs mesa radeonsi). Falls back to CPU on failure.\n"
 "  --kmsgrab                Capture via DRM/KMS instead of x11grab (zero-copy with\n"
 "                           --vaapi). Needs CAP_SYS_ADMIN: setcap cap_sys_admin+ep build/bsdr_agent.\n"
-"  --sendmmsg               Batch each NAL's UDP fragments into one syscall (less overhead).\n"
+"  --pw-dmabuf              EXPERIMENTAL: negotiate dmabuf from PipeWire (Wayland) and import it\n"
+"                           zero-copy into VAAPI. Needs --vaapi + a Wayland session; falls back to\n"
+"                           the CPU path if dmabuf negotiation or the VAAPI import fails.\n"
+"  --sendmmsg               Batch each NAL's UDP fragments into one syscall (Linux; ON by default).\n"
+"  --no-sendmmsg            Disable the batched send; one sendto per datagram (wire output identical).\n"
 "  --max-bitrate BPS        Hard cap the encode bitrate, overriding the headset.\n"
 "\n"
 "DIAGNOSTICS\n"
@@ -1705,6 +1830,37 @@ int main(int argc, char **argv) {
 #ifdef SIGTERM
     signal(SIGTERM, on_sigint);   /* `kill` should also clean up the virtual devices */
 #endif
+    /* Restore the monitor on a CRASH too (not just Ctrl-C): these terminate the process, but the blank
+     * is persistent gamma state, so without this a segfault would leave the screen black. */
+    { int fatal[] = {
+#ifdef SIGSEGV
+        SIGSEGV,
+#endif
+#ifdef SIGABRT
+        SIGABRT,
+#endif
+#ifdef SIGBUS
+        SIGBUS,
+#endif
+#ifdef SIGFPE
+        SIGFPE,
+#endif
+#ifdef SIGILL
+        SIGILL,
+#endif
+#ifdef SIGQUIT
+        SIGQUIT,
+#endif
+#ifdef SIGHUP
+        SIGHUP,
+#endif
+        0 };
+      for (int i = 0; fatal[i]; i++) signal(fatal[i], on_fatal);
+    }
+    /* Self-heal: an uncatchable death in a PRIOR run (SIGKILL / power loss) can leave the monitor
+     * gamma-blanked with no chance to restore. Clear any stuck blank once at startup so simply
+     * relaunching bsdrX brings the screen back (X11/Win/macOS only; Wayland already self-heals). */
+    bsdr_screen_blank_reset();
     atexit(bsdr_audio_cleanup_stale_devices);   /* backstop for any normal exit() path */
     int rc = bsdr_agent_run(&opt);
     bsdr_audio_cleanup_stale_devices();         /* belt-and-suspenders on clean shutdown */

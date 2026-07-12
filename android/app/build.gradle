@@ -12,8 +12,8 @@ android {
         applicationId 'net.nexlab.bsdrandroid'
         minSdk 29                 // AudioPlaybackCapture (system audio)
         targetSdk 34
-        versionCode 1
-        versionName '0.950.2'
+        versionCode 2
+        versionName '0.0.2'       // bsdrX release version (the Bigscreen protocol version is separate)
 
         ndk { abiFilters 'arm64-v8a' }   // add 'x86_64' for the emulator
         externalNativeBuild { cmake { arguments '-DANDROID_STL=c++_shared' } }
@@ -32,11 +32,41 @@ android {
     }
     kotlinOptions { jvmTarget = '17' }
 
+    signingConfigs {
+        // Release signing. Supply a real keystore via env (BSDR_KEYSTORE / _PASS / BSDR_KEY_ALIAS /
+        // BSDR_KEY_PASS) or -P gradle props for a distributable build; otherwise fall back to the
+        // Android debug keystore so `assembleRelease` still yields an INSTALLABLE, correctly-named
+        // app-release.apk instead of an uninstallable app-release-unsigned.apk. distribute.sh ensures
+        // ~/.android/debug.keystore exists before a fallback-signed release build.
+        release {
+            def ksPath = System.getenv('BSDR_KEYSTORE') ?: project.findProperty('bsdr.keystore')
+            if (ksPath) {
+                storeFile file(ksPath)
+                storePassword System.getenv('BSDR_KEYSTORE_PASS') ?: project.findProperty('bsdr.keystore.pass')
+                keyAlias     System.getenv('BSDR_KEY_ALIAS')     ?: project.findProperty('bsdr.key.alias')
+                keyPassword  System.getenv('BSDR_KEY_PASS')      ?: project.findProperty('bsdr.key.pass')
+            } else {
+                storeFile file(new File(System.getProperty('user.home'), '.android/debug.keystore'))
+                storePassword 'android'
+                keyAlias 'androiddebugkey'
+                keyPassword 'android'
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
         }
+    }
+
+    // Don't gate the distributable APK on lint. assembleRelease otherwise runs lintVitalRelease, which
+    // (a) wasn't run for the old debug default so it's a behaviour change, and (b) pulls lint-gradle from
+    // the network, breaking hermetic/offline builds. Run `./gradlew lint` manually for a report.
+    lint {
+        checkReleaseBuilds false
     }
 }
 

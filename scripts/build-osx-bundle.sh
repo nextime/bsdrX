@@ -49,6 +49,46 @@ if [ -f "$ORT_X" ] && [ -f "$ORT_A" ]; then
   mkdir -p "$APP/Contents/Frameworks"
   lipo -create "$ORT_X" "$ORT_A" -output "$APP/Contents/Frameworks/libonnxruntime.1.20.1.dylib"
   echo ">> bundled onnxruntime (universal) in Frameworks"
+  # ORT's prebuilt dylib targets macOS 13.3, so the linker warns it's newer than our 11.0 floor.
+  # That's expected and benign: on <13.3 dyld just declines to load it and the agent falls back to
+  # the heuristic/external-helper depth path; on >=13.3 it loads. We keep the app's floor at 11.0.
+fi
+
+# ---- 3b. ad-hoc code-sign (REQUIRED for arm64 to run) ------------------------
+# strip (step 1) invalidates the linker's ad-hoc signature on each arm64 slice, and Apple Silicon
+# refuses to exec an arm64 Mach-O with an invalid/absent signature. Re-sign the shipped binary (and the
+# bundled dylib) ad-hoc. Prefer a cross-platform signer available in the container; degrade to a clear
+# warning (a real Mac can `codesign -s - --deep bsdrX.app` before distribution) rather than failing.
+adhoc_sign() {  # $1 = file to sign
+  if command -v rcodesign >/dev/null 2>&1;   then rcodesign sign "$1" >/dev/null 2>&1
+  elif command -v ldid >/dev/null 2>&1;      then ldid -S "$1"
+  elif command -v codesign >/dev/null 2>&1;  then codesign -f -s - "$1" >/dev/null 2>&1
+  else return 2; fi
+}
+SIGN_TOOL="$(command -v rcodesign || command -v ldid || command -v codesign || true)"
+# Self-provision rcodesign if the image predates it being baked into osx-bundle.Dockerfile, so a REUSED
+# image still signs (rcodesign is a static musl binary; needs network, which the bundle run already uses).
+if [ -z "$SIGN_TOOL" ] && command -v curl >/dev/null 2>&1; then
+  RCV="${RCODESIGN_VER:-0.27.0}"
+  echo ">> no signer in image — fetching rcodesign $RCV…"
+  if curl -fsSL "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${RCV}/apple-codesign-${RCV}-x86_64-unknown-linux-musl.tar.gz" \
+        | tar xz -C "$WORK" 2>/dev/null \
+     && [ -x "$WORK/apple-codesign-${RCV}-x86_64-unknown-linux-musl/rcodesign" ]; then
+    install -m0755 "$WORK/apple-codesign-${RCV}-x86_64-unknown-linux-musl/rcodesign" "$WORK/rcodesign"
+    export PATH="$WORK:$PATH"; SIGN_TOOL="$WORK/rcodesign"
+    echo ">> fetched rcodesign -> $SIGN_TOOL"
+  else
+    echo ">> WARN: could not fetch rcodesign (offline or release moved)"
+  fi
+fi
+if [ -n "$SIGN_TOOL" ]; then
+  [ -f "$APP/Contents/Frameworks/libonnxruntime.1.20.1.dylib" ] && adhoc_sign "$APP/Contents/Frameworks/libonnxruntime.1.20.1.dylib" || true
+  adhoc_sign "$APP/Contents/MacOS/bsdr_agent" \
+    && echo ">> ad-hoc signed bsdr_agent via $(basename "$SIGN_TOOL") (arm64 will exec on Apple Silicon)" \
+    || echo ">> WARN: ad-hoc signing failed; run 'codesign -f -s - --deep bsdrX.app' on a Mac before use"
+else
+  echo ">> WARN: no ad-hoc signer (rcodesign/ldid/codesign) in image — the arm64 slice is UNSIGNED and"
+  echo ">>       will be killed on Apple Silicon. Run 'codesign -f -s - --deep bsdrX.app' on a Mac first."
 fi
 # icon: build .icns from the PNG set if png2icns is available (optional polish)
 if command -v png2icns >/dev/null 2>&1; then

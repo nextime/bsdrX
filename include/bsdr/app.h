@@ -40,6 +40,31 @@ typedef struct bsdr_app {
     char cloud_msg[160];
     char access_token[2048];
     char refresh_token[2048];     /* for re-login at startup without a password */
+    /* Second "bot" account — its own login + presence WS + room-join, independent of the host session
+     * (no media). Used to satisfy the Quest owner-mic gate (Room.participants > 1) by sitting in the
+     * host's room, and as the base for future in-room moderation. */
+    bool bot_logged_in;
+    char bot_email[128];
+    char bot_name[128];
+    char bot_msg[160];
+    char bot_access_token[2048];
+    char bot_refresh_token[2048];
+    char bot_room_id[128];        /* the room the bot last joined (status only) */
+    char bot_social_id[80];       /* the bot account's socialId (for the host to invite it) */
+    bool bot_joined;
+    bool bot_stopped;             /* user hit "Stop": WS/room presence down but the login is remembered */
+    void *bot_ws;                 /* bsdr_cloud_ws* presence handle for the bot account */
+    char bot_mode[8];             /* "audio" (REST join only, owner-mic unlock) | "full" (avatar) */
+    void *bot_room;               /* bsdr_botroom* avatar presence handle (full mode); NULL otherwise */
+    bool bot_follow;              /* follow-me: re-join whatever room the operator moves into */
+    bool bot_loopback;            /* cloud-mic loopback: route the bot's room audio -> BSDR_RoomMic
+                                   * (carries the operator's OWN voice; works solo) */
+    bool bot_solo_owner;          /* "listen only to me": solo the room owner's SSRC in the loopback */
+    volatile int bot_roommic_active; /* set while the bot owns BSDR_RoomMic (cloud_mic_main defers) */
+    void *bot_audio;              /* bsdr_botaudio* loopback handle; NULL otherwise */
+    char bot_audio_ip[64];        /* bot's room-audio relay + port + the room owner's session id, */
+    int  bot_audio_port;          /* captured at join so the loopback toggle can (re)start without a */
+    char bot_owner_sid[200];      /* re-join (owner sid drives the "listen only to me" solo) */
     /* cloud internet sharing (Mediasoup relay) */
     void *cloud_ws;               /* bsdr_cloud_ws* presence handle (host online) */
     void *cloud_stream;           /* bsdr_cloud_stream* active relay streaming */
@@ -55,8 +80,14 @@ typedef struct bsdr_app {
     bool cpu_only;                /* --cpu: force CPU scale/convert (default: try CUDA GPU pipeline) */
     bool use_vaapi;               /* --vaapi: encode on the iGPU via VAAPI */
     bool use_kmsgrab;             /* --kmsgrab: DRM/KMS capture (zero-copy with --vaapi) */
+    int  enc_level;               /* encoder effort: 0 quality (default) / 1 balanced / 2 performance */
+    int  enc_x264_threads;        /* opt-in (P6.9): >1 = N x264 frame threads on the live --cpu path */
+    bool lan_1x;                  /* send LAN video once instead of 2x — halves the WiFi uplink */
+    int  fps_cap;                 /* cap the desktop capture/encode fps (0 = default/30) */
+    bool wifi_opt;                /* Wi-Fi network optimization: DSCP/WMM-mark the LAN media sockets */
     bool force_x11;               /* --x11: force x11grab; never the Wayland portal */
     bool force_pipewire;          /* --wayland/--pipewire: force the portal + PipeWire capture */
+    bool pw_dmabuf;               /* --pw-dmabuf (experimental): zero-copy PipeWire dmabuf -> VAAPI */
     bool cloud_no_audio;          /* relay audio: plain Opus RTP (pt 100, djb2 SSRC, ts+=480, no
                                    * trailer); default ON (false) -> --no-cloud-audio disables */
     /* discovered Quests + selection */
@@ -140,15 +171,34 @@ typedef struct bsdr_app {
     bool sniff_active;            /* status: sniffer currently running */
     char sniff_msg[128];          /* status/error line for the web UI */
     int  sniff_remote_port;       /* router-companion relay port (used when method == relay) */
+    int  sniff_wifi;              /* cached: is the default capture NIC Wi-Fi? -1 unknown, 0 no, 1 yes
+                                   * (drives the UI's MITM-over-Wi-Fi cancel/continue prompt) */
     bool room_mic_want;           /* expose the cloud room's voice mix as a virtual mic "BSDR_RoomMic" */
     /* realtime voice change on the Quest mic: master on/off, gender -100..100 (0 = off); and, in
      * MITM/relay mode, substitute = stop the Quest->cloud voice and inject the changed audio. */
     bool voice_fx_on;             /* master enable for the voice changer (sliders ignored when off) */
-    int  voice_gender;
+    int  voice_gender;    /* pitch/character (granular shift) */
+    int  voice_formant;   /* tone/brightness tilt */
+    int  voice_volume;    /* output gain */
     int  voice_robot;
     int  voice_echo;
     int  voice_whisper;
     bool voice_substitute;
+    /* AI (RVC) voice-conversion tier — sits behind the same voice changer. When on, the mic is
+     * converted to voiceai_voice; the DSP knobs above are bypassed (except volume). */
+    bool voiceai_on;              /* use the AI tier instead of the DSP tier */
+    int  voiceai_tier;            /* 1=cpu 2=small-gpu 3=big-gpu */
+    char voiceai_voice[64];       /* target voice id (voicestore library) */
+    int  voiceai_key;             /* pitch shift, semitones (-24..24; +12 = up an octave) */
+    char voiceai_status[128];     /* engine status text for the web UI */
+    volatile unsigned voiceai_gen; /* bumped on any voiceai config change (reconcile trigger) */
+    /* up to 5 named custom voice presets (snapshot of the whole changer state) */
+    struct bsdr_voice_preset {
+        char name[40];            /* empty = unused slot */
+        int  ai_on, tier, key;
+        char voice[64];
+        int  gender, formant, volume, robot, echo, whisper;
+    } voice_presets[5];
     /* realtime face swap: enable + tier (0 auto/cpu,2 gpu,3 hi) + source image path; gen bumps on
      * change so the live session reopens the capture (face swap forces the CPU encode path). */
     bool faceswap_on;
@@ -156,6 +206,16 @@ typedef struct bsdr_app {
     char faceswap_source[512];
     volatile unsigned faceswap_gen;
     char faceswap_status[128];
+    int  faceswap_detect_every;   /* opt-in (P4.5): detect every N frames (>=2), swap every frame; 0/1 = every frame */
+    /* Status-poll cache for faceswap model presence — avoids a stat/mkdir storm on every /api/status
+     * (1 s while a tab is open). Refreshed on faceswap_gen bump, while a download is active, or ~2 s max. */
+    char     fs_dir_cache[930];
+    int      fs_dir_cached;
+    int      fs_present_cache[4]; /* >= BSDR_FACESWAP_NFILES */
+    int      fs_ready_cache;
+    unsigned fs_present_gen;
+    uint64_t fs_present_ms;
+    int      fs_present_valid;
 } bsdr_app;
 
 void bsdr_app_init(bsdr_app *a);
@@ -201,8 +261,20 @@ void bsdr_app_get_access_token(bsdr_app *a, char *out, size_t cap);
 void bsdr_app_set_sniff_method(bsdr_app *a, int method);
 int  bsdr_app_get_sniff_method(bsdr_app *a);
 /* Quest-mic voice change: master on, gender (-100..100), robot/echo/whisper (0..100) + substitute */
-void bsdr_app_set_voicefx(bsdr_app *a, bool on, int gender, int robot, int echo, int whisper, bool substitute);
-void bsdr_app_get_voicefx(bsdr_app *a, int *gender, int *robot, int *echo, int *whisper, bool *substitute);
+void bsdr_app_set_voicefx(bsdr_app *a, bool on, int gender, int formant, int volume,
+                          int robot, int echo, int whisper, bool substitute);
+void bsdr_app_get_voicefx(bsdr_app *a, int *gender, int *formant, int *volume,
+                          int *robot, int *echo, int *whisper, bool *substitute);
+
+/* AI voice tier: enable + tier + target voice id + pitch key. Persisted; bumps voiceai_gen. */
+void bsdr_app_set_voiceai(bsdr_app *a, bool on, int tier, const char *voice, int key);
+void bsdr_app_get_voiceai(bsdr_app *a, bool *on, int *tier, char *voice, size_t vl, int *key);
+void bsdr_app_set_voiceai_status(bsdr_app *a, const char *status);
+/* Named voice presets (slots 0..4). save = snapshot the CURRENT changer state under `name`; apply =
+ * load slot into the live state; delete = clear the slot. All persisted. */
+void bsdr_app_voice_preset_save(bsdr_app *a, int slot, const char *name);
+void bsdr_app_voice_preset_apply(bsdr_app *a, int slot);
+void bsdr_app_voice_preset_delete(bsdr_app *a, int slot);
 /* face swap: enable + tier + source-image path (bumps faceswap_gen for a live capture reopen) */
 void bsdr_app_set_faceswap(bsdr_app *a, bool on, int tier, const char *source);
 void bsdr_app_get_faceswap(bsdr_app *a, bool *on, int *tier, char *source, size_t sl);
@@ -217,6 +289,46 @@ bool bsdr_app_restore_session(bsdr_app *a);
 
 /* clear cloud login state (token, name, email) */
 void bsdr_app_logout(bsdr_app *a);
+
+/* Second "bot" account (its own session/WS, no media). login/restore/logout mirror the host ones;
+ * join_room makes the bot join the HOST's current room (so Room.participants > 1 unlocks the owner
+ * mic). All blocking HTTPS, safe to call from the web-UI handler thread. */
+void bsdr_app_bot_login(bsdr_app *a, const char *email, const char *password);
+void bsdr_app_bot_restore(bsdr_app *a);
+void bsdr_app_bot_logout(bsdr_app *a);
+bool bsdr_app_bot_join_room(bsdr_app *a);
+/* Leave the current room but stay logged in (WS presence up) — undo a Join. */
+bool bsdr_app_bot_leave_room(bsdr_app *a);
+/* Stop the bot: leave the room + drop the WS presence, but remember the login (one-click Start). */
+void bsdr_app_bot_stop(bsdr_app *a);
+/* Start (reconnect) a stopped bot from the remembered session — no password. */
+void bsdr_app_bot_start(bsdr_app *a);
+/* Set the bot presence mode: "audio" (REST join only) or "full" (avatar). Persisted. */
+void bsdr_app_bot_set_mode(bsdr_app *a, const char *mode);
+/* Follow-me: when on, the bot re-joins whatever room the operator moves into. Persisted. */
+void bsdr_app_set_bot_follow(bsdr_app *a, bool on);
+/* Cloud-mic loopback: route the bot's room audio (incl. your own voice) into BSDR_RoomMic. Persisted;
+ * starts/stops the loopback immediately if the bot is joined. */
+void bsdr_app_set_bot_loopback(bsdr_app *a, bool on);
+/* "Listen only to me": solo the room owner's voice in the loopback (mute other participants). Persisted;
+ * applied live. */
+void bsdr_app_set_bot_solo_owner(bsdr_app *a, bool on);
+/* Periodic follow-me reconcile (call ~every 15 s from the main loop). No-op unless follow is on and
+ * the bot is logged in and not stopped. */
+void bsdr_app_bot_follow_tick(bsdr_app *a);
+/* Toggle the performance encoder preset (lighter CPU/GPU vs the default quality preset). Persisted;
+ * takes effect on the next stream (re)start. */
+void bsdr_app_set_enc_level(bsdr_app *a, int level);   /* 0 quality / 1 balanced / 2 performance */
+void bsdr_app_set_x264_threads(bsdr_app *a, int n);    /* 0/1 single (default), >1 = N frame threads */
+void bsdr_app_set_vaapi(bsdr_app *a, bool on);         /* --vaapi: iGPU VAAPI encode (Linux) */
+void bsdr_app_set_kmsgrab(bsdr_app *a, bool on);       /* --kmsgrab: DRM/KMS capture (Linux) */
+/* Send LAN video once (true) or twice (false, default). Persisted; takes effect live. */
+void bsdr_app_set_lan_1x(bsdr_app *a, bool on);
+/* Cap the desktop capture/encode fps (0 = default 30). Persisted; applies on the next stream start. */
+void bsdr_app_set_fps_cap(bsdr_app *a, int fps);
+/* Enable Wi-Fi network optimization (DSCP/WMM priority marking on the LAN media). Persisted; applies
+ * on the next stream start. */
+void bsdr_app_set_wifi_opt(bsdr_app *a, bool on);
 
 /* internet sharing (Mediasoup relay) toggle. On enable: ensure WS presence is up,
  * GET /rooms for a relay assignment, and (if found) begin relay streaming.
@@ -265,6 +377,9 @@ bool bsdr_app_get_gpu_encode(bsdr_app *a);
 /* Load persisted user prefs (encoder, bitrate override) at startup — call after bsdr_app_init and
  * before applying CLI flags so an explicit flag still wins. */
 void bsdr_app_load_settings(bsdr_app *a);
+/* Per-user config directory ($XDG_CONFIG_HOME/bsdr_agent or ~/.config/bsdr_agent), created if needed.
+ * Exposed so cloud_stream can persist sticky source ports next to the other settings. */
+bool bsdr_config_dir(char *dir, size_t cap);
 void bsdr_app_set_region(bsdr_app *a, int x, int y, int w, int h);
 void bsdr_app_get_region(bsdr_app *a, int *x, int *y, int *w, int *h);
 /* voice config: each field may be "" to leave unchanged on set. get copies all. */

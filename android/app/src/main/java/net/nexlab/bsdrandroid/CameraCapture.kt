@@ -197,7 +197,10 @@ class CameraCapture(
         sbs = null; codec = null; surface = null; camTarget = null
     }
 
-    /** Live bitrate via setParameters; a 3D on/off or resolution change recreates the whole chain. */
+    /** Live bitrate via setParameters; a 3D on/off or resolution change recreates the whole chain.
+     *  w/h are unused here (they mirror the native want[] 4-int contract; resolution changes come in
+     *  via the 3D path -> recreate()), but kept so the signature matches nativePollVideoWant's layout. */
+    @Suppress("UNUSED_PARAMETER")
     private fun applyWant(w: Int, h: Int, f: Int, br: Int) {
         if (br > 0 && br != bitrate) {
             bitrate = br

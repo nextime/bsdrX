@@ -23,9 +23,15 @@ int bsdr_pw_capture_available(void) { return 0; }
 bsdr_pw_capture *bsdr_pw_capture_open(int w, int c, int *ow, int *oh, bsdr_pw_format *f) {
     (void)w; (void)c; (void)ow; (void)oh; (void)f; return (bsdr_pw_capture *)0;
 }
-int bsdr_pw_capture_read(bsdr_pw_capture *c, uint8_t *d, int stride, int rows) {
-    (void)c; (void)d; (void)stride; (void)rows; return -1;
+int bsdr_pw_capture_read(bsdr_pw_capture *c, const uint8_t **f, int *stride, int *w, int *h) {
+    (void)c; (void)f; (void)stride; (void)w; (void)h; return -1;
 }
+bsdr_pw_capture *bsdr_pw_capture_open2(int ww, int cur, int wd, int *ow, int *oh, bsdr_pw_format *f) {
+    (void)ww; (void)cur; (void)wd; (void)ow; (void)oh; (void)f; return (bsdr_pw_capture *)0;
+}
+int bsdr_pw_capture_dmabuf_active(bsdr_pw_capture *c) { (void)c; return 0; }
+void *bsdr_pw_capture_drm_frames_ctx(bsdr_pw_capture *c) { (void)c; return (void *)0; }
+void *bsdr_pw_capture_read_drm(bsdr_pw_capture *c) { (void)c; return (void *)0; }
 void bsdr_pw_capture_close(bsdr_pw_capture *c) { (void)c; }
 
 #else /* BSDR_HAVE_PIPEWIRE ==================================================================== */
@@ -40,6 +46,28 @@ void bsdr_pw_capture_close(bsdr_pw_capture *c) { (void)c; }
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 #include <spa/param/props.h>
+#include <spa/param/buffers.h>
+#include <spa/pod/builder.h>
+
+/* EXPERIMENTAL dmabuf zero-copy path (--pw-dmabuf): negotiate a DRM dmabuf from PipeWire and hand
+ * capture.c a DRM_PRIME AVFrame it can hwmap straight into VAAPI. Needs the libav hwcontext headers;
+ * gated so a build without them still gets the CPU MAP_BUFFERS path. */
+#if defined(BSDR_HAVE_CAPTURE)
+#  include <libavutil/frame.h>
+#  include <libavutil/buffer.h>
+#  include <libavutil/hwcontext.h>
+#  include <libavutil/hwcontext_drm.h>
+#  include <libavutil/pixfmt.h>
+#  define BSDR_PW_DMABUF 1
+/* DRM fourcc / modifier constants (defined inline to avoid a libdrm-dev build dependency; these are
+ * stable ABI values). fourcc('X','R','2','4') etc. */
+#  define BSDR_DRM_FOURCC(a,b,c,d) ((uint32_t)(a)|((uint32_t)(b)<<8)|((uint32_t)(c)<<16)|((uint32_t)(d)<<24))
+#  define BSDR_DRM_FORMAT_XRGB8888 BSDR_DRM_FOURCC('X','R','2','4')
+#  define BSDR_DRM_FORMAT_ARGB8888 BSDR_DRM_FOURCC('A','R','2','4')
+#  define BSDR_DRM_FORMAT_XBGR8888 BSDR_DRM_FOURCC('X','B','2','4')
+#  define BSDR_DRM_FORMAT_ABGR8888 BSDR_DRM_FOURCC('A','B','2','4')
+#  define BSDR_DRM_MOD_INVALID     0x00ffffffffffffffULL
+#endif
 
 int bsdr_pw_capture_available(void) { return 1; }
 
@@ -57,14 +85,29 @@ struct bsdr_pw_capture {
     bsdr_pw_format fmt;
     int            have_format;
 
-    /* latest-frame slot (guarded) */
+    /* Triple-buffer frame handoff. The producer (on_process) owns slots[widx] and writes it WITHOUT
+     * the lock; the consumer (read) owns slots[ridx] and reads it WITHOUT the lock. {widx,rdyidx,ridx}
+     * is always a permutation of {0,1,2}, so producer and consumer slots are always distinct — the
+     * lock is taken only for the O(1) index swaps (publish / take), never during the ~8MB memcpy or
+     * the downstream scale. This removes the second full-frame copy the puller used to do. */
+    struct pw_slot { uint8_t *buf; size_t cap; int stride, w, h; } slots[3];
+    int             widx, rdyidx, ridx;
     pthread_mutex_t lock;
     pthread_cond_t  cond;
-    uint8_t        *frame;      /* packed 32-bit RGB, height*stride */
-    int             stride;
-    size_t          frame_cap;
-    int             have_new;
+    int             have_new;   /* a fresh frame is published in slots[rdyidx] */
     int             fatal;
+
+#ifdef BSDR_PW_DMABUF
+    /* --pw-dmabuf: negotiated dmabuf state. dmabuf_active flips on once on_param_changed sees a
+     * modifier; until then (and on any failure) the CPU MAP_BUFFERS path above stays in use. */
+    int             want_dmabuf;
+    int             dmabuf_active;
+    uint64_t        modifier;
+    uint32_t        spa_fmt;        /* negotiated SPA_VIDEO_FORMAT_* */
+    AVBufferRef    *drm_dev;        /* AV_HWDEVICE_TYPE_DRM (render node) */
+    AVBufferRef    *drm_frames;     /* hw_frames_ctx wrapping the imported dmabufs (DRM_PRIME) */
+    struct pw_buffer *db_pending;   /* newest un-taken dmabuf buffer (latest-wins; NULL if none) */
+#endif
 };
 
 /* ============================================================================
@@ -315,6 +358,13 @@ static bsdr_pw_format spa_to_fmt(enum spa_video_format f) {
     }
 }
 
+#ifdef BSDR_PW_DMABUF
+static const struct spa_pod *build_format_dmabuf(struct spa_pod_builder *, int, int,
+                                                 const uint64_t *, int, int);
+static uint32_t spa_fmt_to_drm(uint32_t, enum AVPixelFormat *);
+static int pw_dmabuf_make_frames(bsdr_pw_capture *, int, int, enum AVPixelFormat);
+#endif
+
 static void on_param_changed(void *data, uint32_t id, const struct spa_pod *param) {
     bsdr_pw_capture *c = (bsdr_pw_capture *)data;
     if (id != SPA_PARAM_Format || !param) return;
@@ -323,6 +373,53 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
     if (spa_format_parse(param, &mtype, &msub) < 0 ||
         mtype != SPA_MEDIA_TYPE_video || msub != SPA_MEDIA_SUBTYPE_raw) return;
     if (spa_format_video_raw_parse(param, &info.info.raw) < 0) return;
+
+#ifdef BSDR_PW_DMABUF
+    if (c->want_dmabuf) {
+        const struct spa_pod_prop *mp = spa_pod_find_prop(param, NULL, SPA_FORMAT_VIDEO_modifier);
+        if (mp) {
+            /* dmabuf variant was chosen. If the modifier is still a choice (DONT_FIXATE), re-send a
+             * fixed EnumFormat to collapse it, then wait for the fixed param_changed. */
+            if (SPA_POD_CHOICE_TYPE(&mp->value) != SPA_CHOICE_None) {
+                uint64_t chosen = info.info.raw.modifier;
+                uint8_t bf[1024]; struct spa_pod_builder b = SPA_POD_BUILDER_INIT(bf, sizeof bf);
+                const struct spa_pod *p[1] = { build_format_dmabuf(&b,
+                    info.info.raw.size.width, info.info.raw.size.height, &chosen, 1, 1) };
+                pw_stream_update_params(c->stream, p, 1);
+                return;   /* fixed format arrives as a second param_changed */
+            }
+            /* fixed modifier: set up the DRM_PRIME frames ctx + advertise dmabuf buffers */
+            enum AVPixelFormat sw = AV_PIX_FMT_BGR0;
+            uint32_t fourcc = spa_fmt_to_drm(info.info.raw.format, &sw);
+            if (fourcc && pw_dmabuf_make_frames(c, info.info.raw.size.width,
+                                                info.info.raw.size.height, sw) == 0) {
+                c->modifier = info.info.raw.modifier;
+                c->spa_fmt  = info.info.raw.format;
+                c->dmabuf_active = 1;
+                int32_t stride = (int)info.info.raw.size.width * 4;
+                uint8_t bb[512]; struct spa_pod_builder b2 = SPA_POD_BUILDER_INIT(bb, sizeof bb);
+                const struct spa_pod *bp[1] = { spa_pod_builder_add_object(&b2,
+                    SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+                    SPA_PARAM_BUFFERS_buffers,  SPA_POD_CHOICE_RANGE_Int(6, 3, 8),
+                    SPA_PARAM_BUFFERS_blocks,   SPA_POD_Int(1),
+                    SPA_PARAM_BUFFERS_size,     SPA_POD_Int(stride * (int)info.info.raw.size.height),
+                    SPA_PARAM_BUFFERS_stride,   SPA_POD_Int(stride),
+                    SPA_PARAM_BUFFERS_align,    SPA_POD_Int(16),
+                    SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(1u << SPA_DATA_DmaBuf)) };
+                pw_stream_update_params(c->stream, bp, 1);
+                BSDR_INFO("bsdr.pw", "dmabuf negotiated: %ux%u fmt=%u mod=0x%llx",
+                          info.info.raw.size.width, info.info.raw.size.height,
+                          c->spa_fmt, (unsigned long long)c->modifier);
+            } else {
+                BSDR_WARN("bsdr.pw", "dmabuf import setup failed -> CPU path");
+                c->dmabuf_active = 0;
+            }
+        } else {
+            c->dmabuf_active = 0;   /* server picked the SHM fallback variant */
+        }
+    }
+#endif
+
     pthread_mutex_lock(&c->lock);
     c->width  = info.info.raw.size.width;
     c->height = info.info.raw.size.height;
@@ -330,7 +427,12 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
     c->have_format = 1;
     pthread_cond_broadcast(&c->cond);
     pthread_mutex_unlock(&c->lock);
-    BSDR_INFO("bsdr.pw", "stream format: %dx%d fmt=%d", c->width, c->height, (int)c->fmt);
+    int db = 0;
+#ifdef BSDR_PW_DMABUF
+    db = c->dmabuf_active;
+#endif
+    BSDR_INFO("bsdr.pw", "stream format: %dx%d fmt=%d%s", c->width, c->height, (int)c->fmt,
+              db ? " (dmabuf)" : "");
 }
 
 static void on_process(void *data) {
@@ -338,23 +440,46 @@ static void on_process(void *data) {
     struct pw_buffer *b = pw_stream_dequeue_buffer(c->stream);
     if (!b) return;
     struct spa_buffer *buf = b->buffer;
+
+#ifdef BSDR_PW_DMABUF
+    if (buf->n_datas > 0 && buf->datas[0].type == SPA_DATA_DmaBuf) {
+        if (!c->dmabuf_active) { pw_stream_queue_buffer(c->stream, b); return; }  /* not ready yet */
+        /* Hold this buffer (latest-wins): stash it as the pending frame and requeue any previous
+         * un-taken pending. The buffer handed to the consumer is only requeued from the AVFrame's
+         * free callback (read_drm), never here — the compositor mustn't reuse a surface VAAPI is
+         * still reading. */
+        pthread_mutex_lock(&c->lock);
+        struct pw_buffer *old = c->db_pending;
+        c->db_pending = b;
+        c->have_new = 1;
+        pthread_cond_broadcast(&c->cond);
+        pthread_mutex_unlock(&c->lock);
+        if (old) pw_stream_queue_buffer(c->stream, old);
+        return;
+    }
+#endif
+
     if (buf->n_datas > 0 && buf->datas[0].data && c->width > 0 && c->height > 0) {
         struct spa_data *d0 = &buf->datas[0];
         int src_stride = d0->chunk->stride > 0 ? d0->chunk->stride : c->width * 4;
         int rows = c->height;
         size_t need = (size_t)src_stride * rows;
-        pthread_mutex_lock(&c->lock);
-        if (c->frame_cap < need) {
-            uint8_t *nb = realloc(c->frame, need);
-            if (nb) { c->frame = nb; c->frame_cap = need; }
+        /* We exclusively own slots[widx] — resize + fill it WITHOUT the lock (the consumer can never
+         * be on this slot), then take the lock only to publish it. */
+        struct pw_slot *s = &c->slots[c->widx];
+        if (s->cap < need) {
+            uint8_t *nb = realloc(s->buf, need);
+            if (nb) { s->buf = nb; s->cap = need; }
         }
-        if (c->frame && c->frame_cap >= need) {
-            memcpy(c->frame, d0->data, need);
-            c->stride = src_stride;
+        if (s->buf && s->cap >= need) {
+            memcpy(s->buf, d0->data, need);
+            s->stride = src_stride; s->w = c->width; s->h = rows;
+            pthread_mutex_lock(&c->lock);
+            int t = c->widx; c->widx = c->rdyidx; c->rdyidx = t;   /* publish: widx <-> rdyidx */
             c->have_new = 1;
             pthread_cond_broadcast(&c->cond);
+            pthread_mutex_unlock(&c->lock);
         }
-        pthread_mutex_unlock(&c->lock);
     }
     pw_stream_queue_buffer(c->stream, b);
 }
@@ -381,7 +506,148 @@ static const struct spa_pod *build_format(struct spa_pod_builder *b, int w, int 
             &SPA_FRACTION(60, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(240, 1)));
 }
 
+#ifdef BSDR_PW_DMABUF
+/* Build a dmabuf-capable EnumFormat: same as build_format but with a hand-built modifier property
+ * (MANDATORY | DONT_FIXATE) so the server re-fixates onto one modifier. `mods`/`n_mod` is the list we
+ * accept; we always include DRM_FORMAT_MOD_INVALID (implicit modifier — the widest-compatible option,
+ * what most compositors offer). If `fixate` we emit a single fixed modifier instead of the choice
+ * (used from on_param_changed to collapse the negotiation). */
+static const struct spa_pod *build_format_dmabuf(struct spa_pod_builder *b, int w, int h,
+                                                 const uint64_t *mods, int n_mod, int fixate) {
+    struct spa_pod_frame f0;
+    spa_pod_builder_push_object(b, &f0, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+    spa_pod_builder_add(b, SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video), 0);
+    spa_pod_builder_add(b, SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), 0);
+    spa_pod_builder_add(b, SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(5,
+        SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_RGBx,
+        SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBA), 0);
+    /* the modifier property, with the flags the convenience macros can't express */
+    if (fixate) {
+        spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+        spa_pod_builder_long(b, mods[0]);
+    } else {
+        spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier,
+                             SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE);
+        struct spa_pod_frame fc;
+        spa_pod_builder_push_choice(b, &fc, SPA_CHOICE_Enum, 0);
+        spa_pod_builder_long(b, mods[0]);           /* default (repeated as first alternative) */
+        for (int i = 0; i < n_mod; i++) spa_pod_builder_long(b, mods[i]);
+        spa_pod_builder_pop(b, &fc);
+    }
+    spa_pod_builder_add(b, SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(
+        &SPA_RECTANGLE((uint32_t)(w > 0 ? w : 1920), (uint32_t)(h > 0 ? h : 1080)),
+        &SPA_RECTANGLE(1, 1), &SPA_RECTANGLE(8192, 8192)), 0);
+    spa_pod_builder_add(b, SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
+        &SPA_FRACTION(60, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(240, 1)), 0);
+    return spa_pod_builder_pop(b, &f0);
+}
+
+/* SPA format -> DRM fourcc (SPA names bytes, DRM names LE packed words: BGRx->xRGB, etc.) plus the
+ * matching ffmpeg sw pixel format. Returns 0 on an unhandled format. */
+static uint32_t spa_fmt_to_drm(uint32_t spa_fmt, enum AVPixelFormat *sw) {
+    switch (spa_fmt) {
+        case SPA_VIDEO_FORMAT_BGRx: if (sw) *sw = AV_PIX_FMT_BGR0; return BSDR_DRM_FORMAT_XRGB8888;
+        case SPA_VIDEO_FORMAT_BGRA: if (sw) *sw = AV_PIX_FMT_BGRA; return BSDR_DRM_FORMAT_ARGB8888;
+        case SPA_VIDEO_FORMAT_RGBx: if (sw) *sw = AV_PIX_FMT_RGB0; return BSDR_DRM_FORMAT_XBGR8888;
+        case SPA_VIDEO_FORMAT_RGBA: if (sw) *sw = AV_PIX_FMT_RGBA; return BSDR_DRM_FORMAT_ABGR8888;
+        default: return 0;
+    }
+}
+
+/* (Re)build the DRM_PRIME hw_frames_ctx for the negotiated geometry/format. 0 ok, -1 fail. */
+static int pw_dmabuf_make_frames(bsdr_pw_capture *c, int w, int h, enum AVPixelFormat sw) {
+    if (!c->drm_dev) return -1;
+    if (c->drm_frames) av_buffer_unref(&c->drm_frames);
+    c->drm_frames = av_hwframe_ctx_alloc(c->drm_dev);
+    if (!c->drm_frames) return -1;
+    AVHWFramesContext *fc = (AVHWFramesContext *)c->drm_frames->data;
+    fc->format    = AV_PIX_FMT_DRM_PRIME;
+    fc->sw_format = sw;
+    fc->width     = w;
+    fc->height    = h;
+    if (av_hwframe_ctx_init(c->drm_frames) < 0) { av_buffer_unref(&c->drm_frames); return -1; }
+    return 0;
+}
+
+/* AVFrame free callback: release the held PipeWire buffer back to the pool. Runs on the consumer
+ * thread once the filtergraph is done with the surface; takes the pw loop lock (pw_stream_* is not
+ * thread-safe). `data` is the embedded descriptor, freed with the holder. */
+struct db_hold { bsdr_pw_capture *c; struct pw_buffer *b; AVDRMFrameDescriptor desc; };
+static void db_frame_free(void *opaque, uint8_t *data) {
+    struct db_hold *h = (struct db_hold *)opaque; (void)data;
+    if (h->c->loop && h->c->stream) {
+        pw_thread_loop_lock(h->c->loop);
+        pw_stream_queue_buffer(h->c->stream, h->b);
+        pw_thread_loop_unlock(h->c->loop);
+    }
+    free(h);
+}
+
+static void db_requeue(bsdr_pw_capture *c, struct pw_buffer *b) {
+    pw_thread_loop_lock(c->loop);
+    pw_stream_queue_buffer(c->stream, b);
+    pw_thread_loop_unlock(c->loop);
+}
+
+int bsdr_pw_capture_dmabuf_active(bsdr_pw_capture *c) { return c ? c->dmabuf_active : 0; }
+void *bsdr_pw_capture_drm_frames_ctx(bsdr_pw_capture *c) {
+    return (c && c->dmabuf_active) ? (void *)c->drm_frames : NULL;
+}
+
+void *bsdr_pw_capture_read_drm(bsdr_pw_capture *c) {
+    if (!c || !c->dmabuf_active) return NULL;
+    pthread_mutex_lock(&c->lock);
+    if (c->fatal) { pthread_mutex_unlock(&c->lock); return NULL; }
+    if (!c->have_new) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 100 * 1000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&c->cond, &c->lock, &ts);
+    }
+    struct pw_buffer *b = NULL;
+    if (c->have_new && c->db_pending) { b = c->db_pending; c->db_pending = NULL; c->have_new = 0; }
+    uint32_t fw = c->width, fh = c->height, sfmt = c->spa_fmt; uint64_t mod = c->modifier;
+    AVBufferRef *frames = c->drm_frames;
+    pthread_mutex_unlock(&c->lock);
+    if (!b) return NULL;
+
+    struct spa_buffer *buf = b->buffer;
+    struct spa_data *d = buf->datas;
+    enum AVPixelFormat sw;
+    uint32_t fourcc = spa_fmt_to_drm(sfmt, &sw);
+    int n = buf->n_datas; if (n > AV_DRM_MAX_PLANES) n = AV_DRM_MAX_PLANES;
+    struct db_hold *h = calloc(1, sizeof *h);
+    AVFrame *f = av_frame_alloc();
+    if (!fourcc || !h || !f) { if (f) av_frame_free(&f); free(h); db_requeue(c, b); return NULL; }
+    h->c = c; h->b = b;
+    h->desc.nb_objects = n;
+    h->desc.nb_layers  = 1;
+    h->desc.layers[0].format    = fourcc;
+    h->desc.layers[0].nb_planes = n;
+    for (int i = 0; i < n; i++) {
+        h->desc.objects[i].fd              = (int)d[i].fd;
+        h->desc.objects[i].size            = 0;
+        h->desc.objects[i].format_modifier = mod;
+        h->desc.layers[0].planes[i].object_index = i;
+        h->desc.layers[0].planes[i].offset = d[i].chunk ? (ptrdiff_t)d[i].chunk->offset : 0;
+        h->desc.layers[0].planes[i].pitch  = d[i].chunk ? (ptrdiff_t)d[i].chunk->stride : 0;
+    }
+    f->format = AV_PIX_FMT_DRM_PRIME;
+    f->width  = (int)fw; f->height = (int)fh;
+    f->data[0] = (uint8_t *)&h->desc;
+    f->buf[0]  = av_buffer_create((uint8_t *)&h->desc, sizeof h->desc,
+                                  db_frame_free, h, AV_BUFFER_FLAG_READONLY);
+    if (!f->buf[0]) { av_frame_free(&f); free(h); db_requeue(c, b); return NULL; }
+    if (frames) f->hw_frames_ctx = av_buffer_ref(frames);
+    return f;
+}
+#endif /* BSDR_PW_DMABUF */
+
 bsdr_pw_capture *bsdr_pw_capture_open(int want_window, int cursor, int *ow, int *oh, bsdr_pw_format *ofmt) {
+    return bsdr_pw_capture_open2(want_window, cursor, 0, ow, oh, ofmt);
+}
+
+bsdr_pw_capture *bsdr_pw_capture_open2(int want_window, int cursor, int want_dmabuf,
+                                       int *ow, int *oh, bsdr_pw_format *ofmt) {
     /* portal handshake first (blocking dialog) — this establishes the fd + node id */
     DBusError err; dbus_error_init(&err);
     DBusConnection *conn = dbus_bus_get(DBUS_BUS_SESSION, &err);
@@ -395,8 +661,22 @@ bsdr_pw_capture *bsdr_pw_capture_open(int want_window, int cursor, int *ow, int 
     bsdr_pw_capture *c = calloc(1, sizeof *c);
     if (!c) { return NULL; }
     c->pw_fd = fd; c->width = w; c->height = h; c->fmt = BSDR_PW_FMT_BGR0;
+    c->widx = 0; c->rdyidx = 1; c->ridx = 2;   /* distinct slots (calloc would alias them at 0) */
     pthread_mutex_init(&c->lock, NULL);
     pthread_cond_init(&c->cond, NULL);
+
+#ifdef BSDR_PW_DMABUF
+    /* Only offer dmabuf if we can actually create the DRM import device — otherwise we'd negotiate
+     * dmabuf buffers we can't map. Failure here silently keeps the CPU MAP_BUFFERS path. */
+    if (want_dmabuf) {
+        if (av_hwdevice_ctx_create(&c->drm_dev, AV_HWDEVICE_TYPE_DRM, "/dev/dri/renderD128", NULL, 0) == 0)
+            c->want_dmabuf = 1;
+        else
+            BSDR_WARN("bsdr.pw", "--pw-dmabuf: no DRM device on /dev/dri/renderD128 -> CPU path");
+    }
+#else
+    (void)want_dmabuf;
+#endif
 
     pw_init(NULL, NULL);
     c->loop = pw_thread_loop_new("bsdr-pw", NULL);
@@ -413,12 +693,21 @@ bsdr_pw_capture *bsdr_pw_capture_open(int want_window, int cursor, int *ow, int 
     if (!c->stream) { pw_thread_loop_unlock(c->loop); BSDR_WARN("bsdr.pw", "stream_new failed"); goto fail; }
     pw_stream_add_listener(c->stream, &c->stream_listener, &STREAM_EVENTS, c);
 
-    uint8_t podbuf[1024];
+    uint8_t podbuf[2048];
     struct spa_pod_builder pb = SPA_POD_BUILDER_INIT(podbuf, sizeof podbuf);
-    const struct spa_pod *params[1] = { build_format(&pb, w, h) };
+    const struct spa_pod *params[2]; int nparams = 0;
+#ifdef BSDR_PW_DMABUF
+    /* dmabuf variant first (preferred); the plain SHM format stays as the fallback the server picks
+     * if it can't do dmabuf. DRM_FORMAT_MOD_INVALID = implicit modifier (widest compatibility). */
+    if (c->want_dmabuf) {
+        static const uint64_t mods[1] = { BSDR_DRM_MOD_INVALID };
+        params[nparams++] = build_format_dmabuf(&pb, w, h, mods, 1, 0);
+    }
+#endif
+    params[nparams++] = build_format(&pb, w, h);
     int rc = pw_stream_connect(c->stream, PW_DIRECTION_INPUT, node_id,
                                PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS,
-                               params, 1);
+                               params, nparams);
     pw_thread_loop_unlock(c->loop);
     if (rc != 0) { BSDR_WARN("bsdr.pw", "stream_connect failed (%d)", rc); goto fail; }
 
@@ -439,8 +728,9 @@ fail:
     return NULL;
 }
 
-int bsdr_pw_capture_read(bsdr_pw_capture *c, uint8_t *dst, int dst_stride, int dst_rows) {
-    if (!c || !dst || dst_stride <= 0 || dst_rows <= 0) return -1;
+int bsdr_pw_capture_read(bsdr_pw_capture *c, const uint8_t **out_frame,
+                         int *out_stride, int *out_w, int *out_h) {
+    if (!c || !out_frame) return -1;
     pthread_mutex_lock(&c->lock);
     if (c->fatal) { pthread_mutex_unlock(&c->lock); return -1; }
     if (!c->have_new) {                       /* wait up to ~100 ms for the next frame */
@@ -449,21 +739,32 @@ int bsdr_pw_capture_read(bsdr_pw_capture *c, uint8_t *dst, int dst_stride, int d
         pthread_cond_timedwait(&c->cond, &c->lock, &ts);
     }
     int ret = 0;
-    if (c->have_new && c->frame) {
-        int rows = c->height < dst_rows ? c->height : dst_rows;   /* clamp to both heights */
-        int copy = c->stride < dst_stride ? c->stride : dst_stride;
-        for (int y = 0; y < rows; y++)
-            memcpy(dst + (size_t)y * dst_stride, c->frame + (size_t)y * c->stride, (size_t)copy);
+    if (c->have_new) {
+        int t = c->ridx; c->ridx = c->rdyidx; c->rdyidx = t;   /* take: ridx <-> rdyidx */
         c->have_new = 0;
         ret = 1;
     }
+    struct pw_slot *s = &c->slots[c->ridx];
     pthread_mutex_unlock(&c->lock);
-    return ret;
+    if (ret && s->buf) {
+        *out_frame = s->buf;                  /* borrowed until the next read() call */
+        if (out_stride) *out_stride = s->stride;
+        if (out_w) *out_w = s->w;
+        if (out_h) *out_h = s->h;
+        return 1;
+    }
+    return 0;
 }
 
 void bsdr_pw_capture_close(bsdr_pw_capture *c) {
     if (!c) return;
+    /* NOTE: any AVFrame handed out by bsdr_pw_capture_read_drm MUST be released before close — its
+     * free callback touches c->stream. bsdr_capture_frame unrefs each frame within the same call, so
+     * none is outstanding here. */
     if (c->loop) pw_thread_loop_lock(c->loop);
+#ifdef BSDR_PW_DMABUF
+    if (c->db_pending && c->stream) { pw_stream_queue_buffer(c->stream, c->db_pending); c->db_pending = NULL; }
+#endif
     if (c->stream) { pw_stream_destroy(c->stream); c->stream = NULL; }
     if (c->core)   { pw_core_disconnect(c->core); c->core = NULL; }
     if (c->context){ pw_context_destroy(c->context); c->context = NULL; }
@@ -471,7 +772,11 @@ void bsdr_pw_capture_close(bsdr_pw_capture *c) {
                      pw_thread_loop_destroy(c->loop); c->loop = NULL; }
     pthread_mutex_destroy(&c->lock);
     pthread_cond_destroy(&c->cond);
-    free(c->frame);
+    for (int i = 0; i < 3; i++) free(c->slots[i].buf);
+#ifdef BSDR_PW_DMABUF
+    if (c->drm_frames) av_buffer_unref(&c->drm_frames);
+    if (c->drm_dev)    av_buffer_unref(&c->drm_dev);
+#endif
     free(c);
 }
 

@@ -58,6 +58,8 @@ struct bsdr_micsub {
     OpusEncoder *enc;
     bsdr_voicefx *fx;
     bsdr_voicefx_params fxp;
+    struct { int on, tier, voice_sr, key; char content[1024], rmvpe[1024], voice[1024]; } ai;
+    int ai_dirty;
     bsdr_thread *thr;
     volatile int stop;
     /* owner-mic flow lock (mono Opus, like micsniff) — rewrite only this flow */
@@ -154,10 +156,19 @@ static int rewrite(struct bsdr_micsub *s, uint8_t *pkt, int len, uint8_t *out, i
     int fr = opus_decode(s->dec, pl, olen, pcm, 5760, 0);
     if (fr <= 0) return 0;
 
-    /* voice change (lazy engine) */
-    if (s->fxp.gender || s->fxp.robot || s->fxp.echo || s->fxp.whisper) {
+    /* voice change (lazy engine): DSP knobs and/or the AI (RVC) tier */
+    int dsp = s->fxp.gender || s->fxp.formant || s->fxp.volume || s->fxp.robot || s->fxp.echo || s->fxp.whisper;
+    if (dsp || s->ai.on) {
         if (!s->fx) s->fx = bsdr_voicefx_new(48000);
-        if (s->fx) { bsdr_voicefx_set_params(s->fx, &s->fxp); bsdr_voicefx_process(s->fx, pcm, fr); }
+        if (s->fx) {
+            bsdr_voicefx_set_params(s->fx, &s->fxp);
+            if (s->ai_dirty) {
+                bsdr_voicefx_set_ai(s->fx, s->ai.on, s->ai.tier, s->ai.content, s->ai.rmvpe,
+                                    s->ai.voice, s->ai.voice_sr, (float)s->ai.key);
+                s->ai_dirty = 0;
+            }
+            bsdr_voicefx_process(s->fx, pcm, fr);
+        }
     }
 
     uint8_t neu[1500];
@@ -311,10 +322,27 @@ fail:
     return NULL;
 }
 
-void bsdr_micsub_set_voicefx(bsdr_micsub *s, int gender, int robot, int echo, int whisper) {
+void bsdr_micsub_set_voicefx(bsdr_micsub *s, int gender, int formant, int volume,
+                             int robot, int echo, int whisper) {
     if (!s) return;
     if (gender < -100) gender = -100; else if (gender > 100) gender = 100;
-    s->fxp.gender = gender; s->fxp.robot = robot; s->fxp.echo = echo; s->fxp.whisper = whisper;
+    s->fxp.gender = gender; s->fxp.formant = formant; s->fxp.volume = volume;
+    s->fxp.robot = robot; s->fxp.echo = echo; s->fxp.whisper = whisper;
+}
+
+void bsdr_micsub_set_voiceai(bsdr_micsub *s, int on, int tier, const char *content,
+                             const char *rmvpe, const char *voice, int voice_sr, int key) {
+    if (!s) return;
+    content = content ? content : ""; rmvpe = rmvpe ? rmvpe : ""; voice = voice ? voice : "";
+    int changed = (s->ai.on != on) || (s->ai.tier != tier) || (s->ai.voice_sr != voice_sr) ||
+                  (s->ai.key != key) || strcmp(s->ai.content, content) || strcmp(s->ai.rmvpe, rmvpe) ||
+                  strcmp(s->ai.voice, voice);
+    if (!changed) return;
+    s->ai.on = on; s->ai.tier = tier; s->ai.voice_sr = voice_sr; s->ai.key = key;
+    snprintf(s->ai.content, sizeof s->ai.content, "%s", content);
+    snprintf(s->ai.rmvpe,   sizeof s->ai.rmvpe,   "%s", rmvpe);
+    snprintf(s->ai.voice,   sizeof s->ai.voice,   "%s", voice);
+    s->ai_dirty = 1;
 }
 
 void bsdr_micsub_stop(bsdr_micsub *s) {
@@ -344,7 +372,8 @@ bsdr_micsub *bsdr_micsub_start(const char *quest_ip, int queue_num) {
     BSDR_WARN("bsdr.micsub", "owner-mic substitution needs Linux+libnetfilter_queue or Windows+WinDivert");
     return NULL;
 }
-void bsdr_micsub_set_voicefx(bsdr_micsub *s, int g, int r, int e, int w) { (void)s;(void)g;(void)r;(void)e;(void)w; }
+void bsdr_micsub_set_voicefx(bsdr_micsub *s, int g, int fm, int vo, int r, int e, int w) { (void)s;(void)g;(void)fm;(void)vo;(void)r;(void)e;(void)w; }
+void bsdr_micsub_set_voiceai(bsdr_micsub *s, int on, int t, const char *c, const char *r, const char *v, int sr, int k) { (void)s;(void)on;(void)t;(void)c;(void)r;(void)v;(void)sr;(void)k; }
 void bsdr_micsub_stop(bsdr_micsub *s) { (void)s; }
 
 #endif

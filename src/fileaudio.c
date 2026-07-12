@@ -42,9 +42,10 @@ struct bsdr_fileaudio {
     double duration_s;
     int64_t first_pts;      /* pts of the first presented sample block (AV_NOPTS_VALUE) */
     uint64_t start_ms;
-    int16_t *buf;           /* interleaved S16 accumulator */
+    int16_t *buf;           /* interleaved S16 accumulator (ring: [buf_head, buf_len) are live) */
     int buf_cap;            /* capacity in samples (all channels) */
-    int buf_len;            /* valid samples in buf */
+    int buf_len;            /* write tail: samples produced into buf */
+    int buf_head;           /* read head: next sample to hand out (avoids a memmove per read) */
     volatile int paused;
     volatile int seek_pending;
     double seek_frac;
@@ -109,6 +110,15 @@ fail:
 /* grow the accumulator to hold at least `need` more samples */
 static int fa_reserve(bsdr_fileaudio *fa, int need) {
     if (fa->buf_len + need <= fa->buf_cap) return 1;
+    /* Reclaim already-consumed head space before growing (bounds the buffer). This memmove runs only
+     * when the tail reaches cap with a non-zero head — rare, since a fully-drained read resets both to
+     * 0; it replaces the old per-read whole-buffer memmove. */
+    if (fa->buf_head > 0) {
+        int live = fa->buf_len - fa->buf_head;
+        if (live > 0) memmove(fa->buf, fa->buf + fa->buf_head, (size_t)live * sizeof(int16_t));
+        fa->buf_len = live; fa->buf_head = 0;
+        if (fa->buf_len + need <= fa->buf_cap) return 1;
+    }
     int cap = fa->buf_cap ? fa->buf_cap : 8192;
     while (cap < fa->buf_len + need) cap *= 2;
     int16_t *nb = realloc(fa->buf, (size_t)cap * sizeof(int16_t));
@@ -135,7 +145,7 @@ static void fa_do_seek(bsdr_fileaudio *fa) {
     if (av_seek_frame(fa->fmt, fa->astream, ts, AVSEEK_FLAG_BACKWARD) >= 0) {
         avcodec_flush_buffers(fa->dec);
         fa->first_pts = AV_NOPTS_VALUE;
-        fa->buf_len = 0;   /* drop stale samples so audio jumps cleanly */
+        fa->buf_len = 0; fa->buf_head = 0;   /* drop stale samples so audio jumps cleanly */
     }
 }
 
@@ -181,12 +191,12 @@ int bsdr_fileaudio_read(bsdr_fileaudio *fa, int16_t *pcm, int frames) {
     if (fa->paused) { bsdr_sleep_ms(10); return 0; }
     if (fa->seek_pending) fa_do_seek(fa);
     int want = frames * fa->out_channels;
-    while (fa->buf_len < want) {
+    while (fa->buf_len - fa->buf_head < want) {
         if (!fa_fill(fa)) return -1;   /* EOF (non-loop) */
     }
-    memcpy(pcm, fa->buf, (size_t)want * sizeof(int16_t));
-    memmove(fa->buf, fa->buf + want, (size_t)(fa->buf_len - want) * sizeof(int16_t));
-    fa->buf_len -= want;
+    memcpy(pcm, fa->buf + fa->buf_head, (size_t)want * sizeof(int16_t));
+    fa->buf_head += want;
+    if (fa->buf_head >= fa->buf_len) { fa->buf_head = 0; fa->buf_len = 0; }   /* drained -> cheap reset */
     return frames;
 }
 

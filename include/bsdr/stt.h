@@ -30,8 +30,12 @@
  * It takes the raw audio body (not OpenAI multipart) — bsdr_stt_transcribe
  * auto-detects a huggingface host and posts the WAV bytes directly. A free HF
  * token (pasted in the STT token field) lifts the anonymous rate limit. */
+/* HuggingFace's old anonymous serverless inference (api-inference.huggingface.co) is DEAD (DNS gone).
+ * The current inference API is router.huggingface.co and REQUIRES a token — so this fallback only works
+ * if you set an STT token in the panel. There is no more free NO-KEY cloud STT; configure an endpoint
+ * (a free-tier Groq/OpenAI-compatible service, or a self-hosted whisper) — see the STT card / README. */
 #define BSDR_STT_FREE_ENDPOINT \
-    "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
+    "https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3-turbo"
 
 typedef struct {
     char endpoint[256];   /* full URL, e.g. https://.../v1/audio/transcriptions

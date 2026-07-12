@@ -44,6 +44,11 @@ int bsdr_udp_send_batch(bsdr_udp *u, const struct iovec *iov, int count);
 /* Blocking recv with timeout (ms). Returns #bytes, 0 on timeout, <0 on error. */
 int bsdr_udp_recv(bsdr_udp *u, void *buf, size_t len, int timeout_ms);
 
+/* Set the IPv4 DSCP class on outgoing packets (Wi-Fi WMM/802.11e prioritisation). `dscp` is the
+ * 6-bit DSCP value (e.g. 32=CS4 video, 46=EF voice); written to IP_TOS as dscp<<2. Best-effort — a
+ * failure (or a platform that ignores IP_TOS, e.g. stock Windows) is silently tolerated. */
+void bsdr_udp_set_dscp(bsdr_udp *u, int dscp);
+
 void bsdr_udp_close(bsdr_udp *u);
 
 /* Actual local port the socket is bound to (host order), e.g. to read back an

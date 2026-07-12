@@ -44,8 +44,8 @@
 /* Balloon geometry: an ellipse in normalized space so the drawn shape and the
  * hit-test always agree regardless of frame aspect. rx/ry chosen to read round
  * on 16:9. */
-#define BALLOON_RX 0.05
-#define BALLOON_RY 0.07
+#define BALLOON_RX 0.025
+#define BALLOON_RY 0.035
 
 #define HIST_N     16          /* retained feedback lines */
 #define HIST_LEN   192         /* per line */
@@ -202,16 +202,16 @@ bsdr_overlay_action bsdr_overlay_hit(bsdr_overlay *o, double nx, double ny,
 /* ---- Voice-command balloon ------------------------------------------------ */
 /* Button/handle geometry, normalized, relative to the balloon center. Kept in one
  * place so drawing and hit-testing agree. */
-#define HANDLE_DY   (BALLOON_RY + 0.045)   /* log handle, below the balloon */
-#define HANDLE_HX   0.035
-#define HANDLE_HY   0.022
-#define BTN_DY      (BALLOON_RY + 0.075)   /* Send / Cancel row */
-#define BTN_OFF     0.095                  /* x offset of each button center */
-#define BTN_HX      0.08
-#define BTN_HY      0.032
-#define STOP_DX     0.12                   /* stop balloon offset from the main balloon */
-#define STOP_RX     0.04
-#define STOP_RY     0.055
+#define HANDLE_DY   (BALLOON_RY + 0.0225)  /* log handle, below the balloon */
+#define HANDLE_HX   0.0175
+#define HANDLE_HY   0.011
+#define BTN_DY      (BALLOON_RY + 0.0375)  /* Send / Cancel row */
+#define BTN_OFF     0.0475                 /* x offset of each button center */
+#define BTN_HX      0.04
+#define BTN_HY      0.016
+#define STOP_DX     0.06                   /* stop balloon offset from the main balloon */
+#define STOP_RX     0.02
+#define STOP_RY     0.0275
 
 /* Stop-balloon center x: to whichever side has room, so it stays on-screen. */
 static double stop_nx(const bsdr_overlay *o) {

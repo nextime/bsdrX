@@ -95,6 +95,7 @@
 #endif
 #define OWNER_SOURCE "bsdr_quest_owner_mic"
 #define OWNER_DESC   "BSDR_QuestMic"   /* the single Quest mic device apps see (was -OwnerMic) */
+#define BSDR_OWNER_MIC_PT 100          /* Quest owner-mic RTP payload type (libBigSoup: 0x64) */
 
 struct bsdr_micsniff {
     char        quest_ip[64];
@@ -129,6 +130,9 @@ struct bsdr_micsniff {
      * virtual mic / the cloud / the command tap. 0 = off. */
     bsdr_voicefx *fx;
     bsdr_voicefx_params fxp;
+    /* AI (RVC) voice tier config, pushed by the agent; applied to fx on change. */
+    struct { int on, tier, voice_sr, key; char content[1024], rmvpe[1024], voice[1024]; } ai;
+    int ai_dirty;
 
     /* optional voice-command tap (set by the agent while computer-control is on) */
     bsdr_micsniff_pcm_cb pcm_cb;
@@ -182,9 +186,16 @@ static void build_arp(uint8_t f[42], int op, const uint8_t smac[6], uint32_t sip
 /* Realtime voice change on the decoded owner voice (in place), lazily creating/reconfiguring the DSP
  * when the gender knob changes. A gender of 0 is a no-op. 48 kHz mono, as decoded from the Opus. */
 static void micsniff_apply_fx(struct bsdr_micsniff *s, int16_t *pcm, int frames) {
-    if (!s->fxp.gender && !s->fxp.robot && !s->fxp.echo && !s->fxp.whisper) return;
+    int dsp = s->fxp.gender || s->fxp.formant || s->fxp.volume ||
+              s->fxp.robot || s->fxp.echo || s->fxp.whisper;
+    if (!dsp && !s->ai.on) return;
     if (!s->fx) { s->fx = bsdr_voicefx_new(48000); if (!s->fx) return; }
     bsdr_voicefx_set_params(s->fx, &s->fxp);
+    if (s->ai_dirty) {   /* (re)load the RVC engine only when the config actually changed */
+        bsdr_voicefx_set_ai(s->fx, s->ai.on, s->ai.tier, s->ai.content, s->ai.rmvpe,
+                            s->ai.voice, s->ai.voice_sr, (float)s->ai.key);
+        s->ai_dirty = 0;
+    }
     bsdr_voicefx_process(s->fx, pcm, frames);
 }
 
@@ -210,21 +221,13 @@ static void relay_send_control(struct bsdr_micsniff *s, int mode) {
     sendto(s->data_fd, (const char *)m, 12, 0, (struct sockaddr *)&s->relay_peer, sizeof s->relay_peer);
 }
 
-/* Send a modified RTP packet (RTP header + re-encoded Opus + original 8-byte trailer) to the relay,
- * which forwards it to the cloud in place of the Quest's original. */
-static void relay_send_audio(struct bsdr_micsniff *s, const uint8_t *rtp_pkt, int rlen) {
-    if (s->data_fd < 0 || !s->have_relay_peer || rlen <= 0 || rlen > 1600) return;
-    uint8_t m[1610];
-    m[0]=RELAY_MAGIC0; m[1]=RELAY_MAGIC1; m[2]=RELAY_MAGIC2; m[3]=RELAY_MAGIC3; m[4]='A';
-    memcpy(m + 5, rtp_pkt, (size_t)rlen);
-    sendto(s->data_fd, (const char *)m, (size_t)(5 + rlen), 0, (struct sockaddr *)&s->relay_peer, sizeof s->relay_peer);
-}
+/* The FULL-datagram relay send (magic "bsdF") is built in place at its one call site (the substitute
+ * path) — src=Quest, dst=cloud, so the companion RAW-injects it on the Quest's own NAT/conntrack flow,
+ * the ONLY source mediasoup's comedia latch keeps accepting. */
 
-#if defined(__APPLE__)
-/* ---- macOS LOCAL substitution (wired only): the parent builds the modified full IPv4 datagram and
- * hands it to the privileged helper, which prepends L2 and BPF-injects it toward the gateway while a
- * pf rule drops the Quest's original. No divert socket on macOS, so this capture-drop-reinject is the
- * only local option; it needs source=quest to survive (works on a wired switched LAN, not Wi-Fi). */
+/* IPv4 + UDP checksum fix-up for a modified datagram. Used by BOTH the macOS BPF-inject path and the
+ * router-relay substitution (which now hands the companion a FULL datagram with source=Quest so the
+ * modified audio reuses the Quest's NAT/conntrack flow and mediasoup's comedia latch still accepts it). */
 static uint16_t csum16(const uint8_t *p, int len, uint32_t sum) {
     while (len > 1) { sum += (uint16_t)((p[0] << 8) | p[1]); p += 2; len -= 2; }
     if (len) sum += (uint16_t)(p[0] << 8);
@@ -242,7 +245,6 @@ static void fix_ip_udp_csum(uint8_t *ip, int ihl, int ulen) {
     uint16_t u = csum16(udp, ulen, sum); if (u == 0) u = 0xffff;
     udp[6] = (uint8_t)(u >> 8); udp[7] = (uint8_t)(u & 0xff);
 }
-#endif
 
 static void handle_ip(struct bsdr_micsniff *s, const uint8_t *ip, int len) {
     if (len < 20) return;
@@ -265,6 +267,11 @@ static void handle_ip(struct bsdr_micsniff *s, const uint8_t *ip, int len) {
     if (rlen < 12) return;
 
     if ((rtp[0] >> 6) != 2) return;                 /* RTP v2 */
+    /* Owner mic = RTP payload type 100 (Quest libBigSoup BigMicStream: SetDefaultPayloadType(0x64),
+     * 48 kHz mono Opus, no DTX). REQUIRE it: without this we'd lock the first RTP-v2 flow whose bytes
+     * happen to opus_decode — e.g. RTCP (PT 200-family -> &0x7f = 72-76) or the desktop-audio/video
+     * streams — then pin a bogus ssrc/port and drop the real mic. The marker bit is rtp[1]&0x80. */
+    if ((rtp[1] & 0x7f) != BSDR_OWNER_MIC_PT) return;
     int hlen = 12 + 4 * (rtp[0] & 0x0f);
     if (rtp[0] & 0x10) {
         if (rlen < hlen + 4) return;
@@ -323,12 +330,27 @@ static void handle_ip(struct bsdr_micsniff *s, const uint8_t *ip, int len) {
         int nolen = s->enc ? opus_encode(s->enc, pcm, fr, nopus, (int)sizeof nopus) : 0;
         if (nolen > 0) {
             uint64_t now = bsdr_now_ms();
-            if (s->remote_port > 0 && s->have_relay_peer && hlen + nolen + 8 <= 1600) {
-                uint8_t out[1600];
-                memcpy(out, rtp, (size_t)hlen);
-                memcpy(out + hlen, nopus, (size_t)nolen);
-                memcpy(out + hlen + nolen, tr, 8);
-                relay_send_audio(s, out, hlen + nolen + 8);
+            if (s->remote_port > 0 && s->have_relay_peer &&
+                ihl + 8 + hlen + nolen + 8 <= 1600 && ihl + 8 + hlen <= len) {
+                /* Build the FULL modified IPv4 datagram (src=Quest, dst=cloud) so the companion can
+                 * RAW-inject it on the Quest's own NAT flow — the ONLY source mediasoup's comedia
+                 * latch accepts. Headers verbatim, payload swapped, lengths + checksums fixed. */
+                int new_ulen = 8 + hlen + nolen + 8;
+                int new_iplen = ihl + new_ulen;
+                /* Build the datagram straight into a 5-byte-prefixed buffer ("bsdF" magic) and send
+                 * once — no second copy through relay_send_full (matches the 'A' path below). */
+                uint8_t out[5 + 1600];
+                out[0]=RELAY_MAGIC0; out[1]=RELAY_MAGIC1; out[2]=RELAY_MAGIC2; out[3]=RELAY_MAGIC3; out[4]='F';
+                uint8_t *d = out + 5;
+                memcpy(d, ip, (size_t)(ihl + 8 + hlen));            /* IP + UDP + RTP headers */
+                memcpy(d + ihl + 8 + hlen, nopus, (size_t)nolen);   /* new opus */
+                memcpy(d + ihl + 8 + hlen + nolen, tr, 8);          /* [ssrc][frame_id] trailer */
+                d[2] = (uint8_t)(new_iplen >> 8); d[3] = (uint8_t)(new_iplen & 0xff);
+                d[ihl + 4] = (uint8_t)(new_ulen >> 8); d[ihl + 5] = (uint8_t)(new_ulen & 0xff);
+                fix_ip_udp_csum(d, ihl, new_ulen);
+                if (s->data_fd >= 0)
+                    sendto(s->data_fd, (const char *)out, (size_t)(5 + new_iplen), 0,
+                           (struct sockaddr *)&s->relay_peer, sizeof s->relay_peer);
                 if (now - s->last_ctrl_ms > 250) { s->last_ctrl_ms = now; relay_send_control(s, 1); }
             }
 #if defined(__APPLE__)
@@ -563,6 +585,7 @@ int bsdr_micsniff_helper_main(int argc, char **argv) {
     int ifidx = -1, ip_fwd_was = -1, redir_was = -1;
 #if defined(__linux__)
     int rp_all_was = -1, rp_if_was = -1;   /* rp_filter sysctls are Linux-only (/proc) */
+    int redir_if_was = -1;                 /* per-iface send_redirects (all-knob alone doesn't disable it) */
 #endif
     uint8_t our_mac[6], quest_mac[6], gw_mac[6]; uint32_t our_ip = 0, gw_be = 0;
     int have_qmac = 0, have_gmac = 0, have_mine = 0;
@@ -582,6 +605,11 @@ int bsdr_micsniff_helper_main(int argc, char **argv) {
         proc_write("/proc/sys/net/ipv4/conf/all/rp_filter", 0);
         if (iface && iface[0]) { char p[160]; snprintf(p, sizeof p, "/proc/sys/net/ipv4/conf/%s/rp_filter", iface);
                                  rp_if_was = proc_read(p); proc_write(p, 0); }
+        /* send_redirects is send-if-(all||iface): the all=0 above isn't enough. Zero the iface knob too,
+         * else the kernel ICMP-redirects the Quest on every forwarded (hairpin) uplink packet, churning
+         * its route/ARP for the gateway and adding loss on the shared Wi-Fi link. */
+        if (iface && iface[0]) { char p[160]; snprintf(p, sizeof p, "/proc/sys/net/ipv4/conf/%s/send_redirects", iface);
+                                 redir_if_was = proc_read(p); proc_write(p, 0); }
 #endif
         if (!have_mine || !have_qmac || !have_gmac)
             fprintf(stderr, "micsniff-helper: MITM degraded (mine=%d qmac=%d gmac=%d)\n", have_mine, have_qmac, have_gmac);
@@ -650,6 +678,10 @@ int bsdr_micsniff_helper_main(int argc, char **argv) {
         if (rp_if_was >= 0 && iface && iface[0]) {
             char p[160]; snprintf(p, sizeof p, "/proc/sys/net/ipv4/conf/%s/rp_filter", iface);
             proc_write(p, rp_if_was);
+        }
+        if (redir_if_was >= 0 && iface && iface[0]) {
+            char p[160]; snprintf(p, sizeof p, "/proc/sys/net/ipv4/conf/%s/send_redirects", iface);
+            proc_write(p, redir_if_was);
         }
 #endif
     }
@@ -1021,6 +1053,62 @@ static void android_relay_main(void *arg) {
 }
 #endif
 
+/* Best-effort: is `iface` a wireless (Wi-Fi) NIC? Used ONLY to warn before an ARP-MITM — spoofing +
+ * hairpin forwarding over Wi-Fi is unreliable and can briefly drop a peer's LAN link. Never blocks;
+ * an unknown answer (0) just means "no warning". (Android has no local-capture MITM path -> not built.) */
+#if !defined(__ANDROID__)
+static int iface_is_wireless(const char *iface) {
+    if (!iface || !iface[0]) return 0;
+#if defined(__linux__)
+    char p[192];
+    snprintf(p, sizeof p, "/sys/class/net/%s/wireless", iface);   /* wext */
+    if (access(p, F_OK) == 0) return 1;
+    snprintf(p, sizeof p, "/sys/class/net/%s/phy80211", iface);   /* cfg80211/mac80211 */
+    return access(p, F_OK) == 0;
+#elif defined(__APPLE__)
+    char cmd[256];
+    snprintf(cmd, sizeof cmd,
+             "networksetup -listallhardwareports 2>/dev/null | "
+             "awk '/^Hardware Port:/{w=($0 ~ /Wi-Fi|AirPort/)} "
+             "$0==\"Device: %s\"{exit w?0:1} END{exit 1}'", iface);
+    return system(cmd) == 0;
+#else
+    (void)iface; return 0;
+#endif
+}
+
+/* Public: resolve the default-route interface and report whether it's Wi-Fi (see header). Kept minimal
+ * and standalone so it works from the common region (the fuller default_route() lives inside the
+ * POSIX_HELPER capture block and also fetches the gateway, which we don't need here). */
+bool bsdr_micsniff_default_wireless(void) {
+    char ifn[64] = "";
+#if defined(__linux__)
+    FILE *f = fopen("/proc/net/route", "r");
+    if (f) { char line[256];
+        if (fgets(line, sizeof line, f))                 /* skip header */
+            while (fgets(line, sizeof line, f)) {
+                char n[64]; unsigned long dest = 1, gw = 0;
+                if (sscanf(line, "%63s %lx %lx", n, &dest, &gw) >= 2 && dest == 0) {
+                    snprintf(ifn, sizeof ifn, "%s", n); break;
+                }
+            }
+        fclose(f);
+    }
+#elif defined(__APPLE__)
+    FILE *f = popen("route -n get default 2>/dev/null", "r");
+    if (f) { char line[256];
+        while (fgets(line, sizeof line, f)) {
+            char v[64]; if (sscanf(line, " interface: %63s", v) == 1) { snprintf(ifn, sizeof ifn, "%s", v); break; }
+        }
+        pclose(f);
+    }
+#endif
+    return ifn[0] ? (iface_is_wireless(ifn) != 0) : false;
+}
+#else  /* __ANDROID__: no local capture, so never Wi-Fi-MITM */
+bool bsdr_micsniff_default_wireless(void) { return false; }
+#endif /* !__ANDROID__ */
+
 bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) {
     if (!cfg || !cfg->quest_ip || !cfg->quest_ip[0]) {
         BSDR_WARN("bsdr.micsniff", "no quest_ip given; owner-mic sniffer disabled");
@@ -1061,6 +1149,15 @@ bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) {
     if (s->remote_port <= 0 && !s->iface[0]) {
         BSDR_ERROR("bsdr.micsniff", "no capture interface (pass --sniff-iface)"); free(s); return NULL; }
 
+    /* Non-blocking guardrail: MITM was requested (already confirmed by the operator) but the capture
+     * NIC is Wi-Fi, where ARP-spoof + hairpin forwarding is flaky and can time out the Quest's LAN
+     * session. Warn loudly and keep going — the operator asked for it; point them at the reliable path. */
+    if (s->mitm && iface_is_wireless(s->iface))
+        BSDR_WARN("bsdr.micsniff", "%s is a Wi-Fi interface — ARP-MITM over Wi-Fi is unreliable and may "
+                  "briefly drop the Quest's LAN link (heartbeat timeout -> the headset loses connection). "
+                  "Trying anyway as requested; if it keeps disconnecting, capture on the gateway instead "
+                  "(bsdr_micrelay / --sniff-gw) rather than MITM.", s->iface);
+
 #if defined(__APPLE__) || defined(_WIN32)
     /* mac/win: the installed loopback (BlackHole / VB-CABLE) IS the mic apps record from. */
     if (!bsdr_virtual_mic_create(OWNER_SINK, OWNER_SOURCE, OWNER_DESC, &s->sink_mod, &s->src_mod)) goto fail;
@@ -1094,10 +1191,27 @@ void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void 
     s->pcm_cb = cb;   /* set user before cb so the sniffer thread never sees a stale pair */
 }
 
-void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int gender, int robot, int echo, int whisper) {
+void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int gender, int formant, int volume,
+                               int robot, int echo, int whisper) {
     if (!s) return;
     if (gender < -100) gender = -100; else if (gender > 100) gender = 100;
-    s->fxp.gender = gender; s->fxp.robot = robot; s->fxp.echo = echo; s->fxp.whisper = whisper;
+    s->fxp.gender = gender; s->fxp.formant = formant; s->fxp.volume = volume;
+    s->fxp.robot = robot; s->fxp.echo = echo; s->fxp.whisper = whisper;
+}
+
+void bsdr_micsniff_set_voiceai(bsdr_micsniff *s, int on, int tier, const char *content,
+                               const char *rmvpe, const char *voice, int voice_sr, int key) {
+    if (!s) return;
+    content = content ? content : ""; rmvpe = rmvpe ? rmvpe : ""; voice = voice ? voice : "";
+    int changed = (s->ai.on != on) || (s->ai.tier != tier) || (s->ai.voice_sr != voice_sr) ||
+                  (s->ai.key != key) || strcmp(s->ai.content, content) || strcmp(s->ai.rmvpe, rmvpe) ||
+                  strcmp(s->ai.voice, voice);
+    if (!changed) return;
+    s->ai.on = on; s->ai.tier = tier; s->ai.voice_sr = voice_sr; s->ai.key = key;
+    snprintf(s->ai.content, sizeof s->ai.content, "%s", content);
+    snprintf(s->ai.rmvpe,   sizeof s->ai.rmvpe,   "%s", rmvpe);
+    snprintf(s->ai.voice,   sizeof s->ai.voice,   "%s", voice);
+    s->ai_dirty = 1;
 }
 
 void bsdr_micsniff_set_substitute(bsdr_micsniff *s, int on) {
@@ -1133,7 +1247,7 @@ bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) { (void)cfg; re
 void bsdr_micsniff_stop(bsdr_micsniff *s) { (void)s; }
 bool bsdr_micsniff_is_mitm(const bsdr_micsniff *s) { (void)s; return false; }
 void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pcm_cb cb, void *user) { (void)s; (void)cb; (void)user; }
-void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int g, int r, int e, int w) { (void)s; (void)g; (void)r; (void)e; (void)w; }
+void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int g, int fm, int vo, int r, int e, int w) { (void)s; (void)g; (void)fm; (void)vo; (void)r; (void)e; (void)w; }
 int bsdr_micsniff_helper_main(int argc, char **argv) { (void)argc; (void)argv; return 1; }
 
 #endif

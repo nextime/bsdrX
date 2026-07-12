@@ -37,7 +37,16 @@ set(CORE_SRC
   ${CORE}/webcam.c                      # camera enumeration (Android returns none; Kotlin enumerates)
   ${CORE}/voicefx.c                     # realtime voice changer (gender shift) DSP
   ${CORE}/faceswap.c                    # realtime face swap (SCRFD + ArcFace + inswapper, ONNX)
+  ${CORE}/roomstate.c                   # room/avatar FlatBuffers state codec (bot Plane-2)
+  ${CORE}/botroom.c                     # full-bot avatar presence (room data channel)
+  ${CORE}/botaudio.c                    # cloud-mic loopback (bot room-audio -> BSDR_RoomMic)
+  ${CORE}/voicestore.c                  # AI voice-changer model store + voice library
+  ${CORE}/voiceai.c                     # RVC voice conversion (ONNX Runtime)
   ${REPO}/third_party/miniz/miniz.c     # model-zip import
+  # flatcc runtime (vendored) backs roomstate.c's FlatBuffers codec
+  ${REPO}/third_party/flatcc/runtime/builder.c
+  ${REPO}/third_party/flatcc/runtime/emitter.c
+  ${REPO}/third_party/flatcc/runtime/refmap.c
   ${CORE}/audio.c                       # Opus RTP/SRTP half (Pulse half #ifdef'd out)
   ${CORE}/micsniff.c                    # owner-mic RELAY path only (router companion) + voice FX
   ${CORE}/micsub.c                      # owner-mic cloud substitution (NFQUEUE) — stub on Android
@@ -51,14 +60,25 @@ set(CORE_SRC
 
 add_library(bsdr_agent SHARED ${CORE_SRC})
 
-# Vendored miniz: define _LARGEFILE64_SOURCE so it takes the fopen64/ftello64
-# large-file I/O path (miniz.h documents this) instead of the fallback branch
-# that emits a "may not support large files" #pragma message. Scoped to miniz.c.
+# Vendored miniz: _LARGEFILE64_SOURCE selects miniz's fopen64/ftello64 branch on glibc (it defines
+# __USE_LARGEFILE64), but Bionic doesn't honour that macro, so on Android miniz falls to its plain
+# fopen/ftello/fseeko branch and emits a "may not support large files" #pragma message. That branch is
+# actually correct here — the NDK compiles with _FILE_OFFSET_BITS=64 at API 29, so ftello/fseeko are
+# already 64-bit — making the message a false positive. Silence just that pragma for the miniz TU.
 set_source_files_properties(${REPO}/third_party/miniz/miniz.c PROPERTIES
-  COMPILE_DEFINITIONS "_LARGEFILE64_SOURCE=1")
+  COMPILE_DEFINITIONS "_LARGEFILE64_SOURCE=1"
+  COMPILE_OPTIONS "-Wno-#pragma-messages")
+
+# Vendored flatcc runtime: compile warning-free like the Makefile does (-w).
+set_source_files_properties(
+  ${REPO}/third_party/flatcc/runtime/builder.c
+  ${REPO}/third_party/flatcc/runtime/emitter.c
+  ${REPO}/third_party/flatcc/runtime/refmap.c
+  PROPERTIES COMPILE_OPTIONS "-w")
 
 target_include_directories(bsdr_agent PRIVATE
-  ${REPO}/include ${CORE} ${DEPS}/include ${REPO}/third_party/miniz)
+  ${REPO}/include ${CORE} ${DEPS}/include ${REPO}/third_party/miniz
+  ${REPO}/third_party/flatcc/include ${REPO}/src/generated)
 
 target_compile_definitions(bsdr_agent PRIVATE
   BSDR_PLATFORM_ANDROID=1

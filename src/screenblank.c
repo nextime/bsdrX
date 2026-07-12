@@ -36,6 +36,15 @@ void bsdr_screen_blank(int on) {
     }
     ReleaseDC(NULL, dc);
 }
+void bsdr_screen_blank_reset(void) {
+    /* A fresh process has no saved ramp from the crashed one, so force a LINEAR (identity) ramp. */
+    HDC dc = GetDC(NULL);
+    if (!dc) return;
+    WORD lin[3][256];
+    for (int c = 0; c < 3; c++) for (int i = 0; i < 256; i++) lin[c][i] = (WORD)(i * 257);  /* 255*257=65535 */
+    SetDeviceGammaRamp(dc, lin);
+    ReleaseDC(NULL, dc);
+}
 
 #elif defined(__APPLE__)
 /* ---------------------------------------------------------------- macOS: CoreGraphics gamma */
@@ -51,6 +60,9 @@ void bsdr_screen_blank(int on) {
     } else {
         CGDisplayRestoreColorSyncSettings();
     }
+}
+void bsdr_screen_blank_reset(void) {
+    CGDisplayRestoreColorSyncSettings();   /* standalone: restores every display to its ColorSync profile */
 }
 
 #elif defined(__linux__) && !defined(__ANDROID__)
@@ -76,8 +88,20 @@ void bsdr_screen_blank(int on) {
         on ? "0" : "1");
     if (system(cmd) != 0) { /* best-effort */ }
 }
+void bsdr_screen_blank_reset(void) {
+#if defined(BSDR_HAVE_WAYLAND_GAMMA)
+    if (getenv("WAYLAND_DISPLAY")) return;   /* wlr-gamma-control auto-restores on client disconnect */
+#endif
+    if (!getenv("DISPLAY")) return;
+    /* X11 gamma ramps are server-side state that survives a crashed client — force outputs back to a
+     * neutral 1:1:1 / full brightness so a relaunch clears a monitor left black by a prior crash. */
+    if (system(
+        "for o in $(xrandr -q 2>/dev/null | grep ' connected' | cut -d' ' -f1); do "
+        "xrandr --output \"$o\" --brightness 1 --gamma 1:1:1 2>/dev/null; done") != 0) { /* best-effort */ }
+}
 
 #else
 /* ---------------------------------------------------------------- other (Android): no-op */
 void bsdr_screen_blank(int on) { (void)on; }
+void bsdr_screen_blank_reset(void) { }
 #endif

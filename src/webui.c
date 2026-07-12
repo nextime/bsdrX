@@ -22,6 +22,7 @@
 #include "bsdr/log.h"
 #include "bsdr/winlist.h"
 #include "bsdr/model_store.h"
+#include "bsdr/voicestore.h"
 #include "bsdr/webcam.h"
 #include "bsdr/deps.h"
 #include "bsdr/tls.h"
@@ -120,6 +121,27 @@ static const char PAGE[] =
 ".q{display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid var(--edge)}"
 ".q:first-of-type{border-top:0}.q .nm{flex:1}"
 "a{color:var(--accent)}"
+/* collapsible panels */
+".card h2.clp{cursor:pointer;user-select:none;-webkit-user-select:none}"
+".card h2 .hdrr{margin-left:auto;display:flex;align-items:center;gap:8px}"
+".card h2 .chev{font-size:10px;opacity:.55;transition:transform .18s}"
+".card.col h2 .chev{transform:rotate(-90deg)}"
+".card.col>:not(h2){display:none!important}"   /* !important beats JS-set inline display on rows */
+".card h2 .en{font-size:10.5px;font-weight:700;letter-spacing:.02em;text-transform:none;"
+"border-radius:999px;padding:2px 9px;border:1px solid var(--edge);color:var(--muted);white-space:nowrap}"
+".card h2 .en.y{color:var(--on);border-color:rgba(46,204,113,.45);background:rgba(46,204,113,.12)}"
+".card h2 .en.n{opacity:.65}"
+".card h2 .en:empty{display:none}"
+/* phone layout */
+"@media(max-width:560px){"
+"body{padding:16px 11px 44px}"
+".card{padding:13px 13px;margin:11px 0;border-radius:12px}"
+".card h2{margin-bottom:10px;flex-wrap:wrap;row-gap:5px}"
+"h1{font-size:19px}header{flex-wrap:wrap;gap:6px 10px}"
+".row{gap:8px;margin:7px 0}.grow{flex:1 1 140px}"
+"label{font-size:12.5px}button{padding:10px 15px}"
+"select,input{max-width:100%}"
+".card h2 .en{font-size:10px;padding:2px 7px}}"
 "</style></head><body>"
 "<header><h1>bsdrX <small style='font-size:.5em;opacity:.55;font-weight:400'>v" BSDR_VERSION "</small></h1><span class=sub>Bigscreen Remote Desktop</span>"
 "<a href='https://bigscreen.nexlab.net' target=_blank rel=noopener style=margin-left:auto>bigscreen.nexlab.net</a>"
@@ -140,6 +162,45 @@ static const char PAGE[] =
 "Blank my physical screen while the headset is connected (privacy)</label></div>"
 "<div class=row><label style=width:auto><input id=ptouch type=checkbox style=width:auto onchange=pointerModeToggle()> "
 "Use the headset pointer as a <b>touchpad</b> (real tap/drag touch events) instead of a mouse</label></div></div>"
+
+/* Second (bot) account — its own login + room-join. Joining your room as a 2nd participant makes the
+ * headset send your owner mic even when you're otherwise alone (Room.participants > 1). */
+"<div class=card><h2>Second account (bot) <span class=badge>experimental</span></h2>"
+"<div class=hint>Log a <b>second, different</b> Bigscreen account in here and hit <b>Join my room</b> — "
+"the headset then sees <b>more than one participant</b> and sends your owner mic even when you're alone. "
+"<b>Join my room</b> is smart: if the room is open it joins directly; if it's friends/verified/invite-only "
+"it makes your host account <b>invite</b> the bot, the bot <b>accepts</b>, then joins — <b>without</b> changing "
+"your room's privacy (only a fully-closed room is minimally opened to invite-only). Its session is separate "
+"from your main account (own token; password never stored). Note: an invite may require the two accounts to be <b>friends</b> first.</div>"
+"<div id=bot class=status style=margin-top:8px>...</div>"
+"<div id=botlogin class=row style=margin-top:10px>"
+"<input id=botemail class=grow placeholder='bot Bigscreen email'> "
+"<input id=botpw class=grow type=password placeholder=password> "
+"<button class=p onclick=botLogin()>Log in</button></div>"
+"<div id=botstart class=row style='margin-top:10px;display:none'>"
+"<button class=p onclick=botStart()>Start bot</button>"
+"<button class=danger style=margin-left:auto onclick=botLogout()>Forget login</button></div>"
+"<div id=botactions class=row style='margin-top:8px;display:none'>"
+"<button id=botjoinbtn class=p onclick=botJoin()>Join my room</button>"
+"<button id=botleavebtn onclick=botLeave()>Leave room</button>"
+"<label class=hint style='margin-left:12px'>Presence "
+"<select id=botmode onchange=botMode()>"
+"<option value=audio>audio only (unlock mic)</option>"
+"<option value=full>full bot (avatar)</option></select></label>"
+"<button onclick=botStop()>Stop</button>"
+"<button class=danger style=margin-left:8px onclick=botLogout()>Log out</button></div>"
+"<div id=botfollowrow class=row style='margin-top:8px;display:none'>"
+"<label class=hint><input type=checkbox id=botfollow onchange=botFollowSet()> "
+"<b>Follow me into rooms</b> — the bot re-joins whenever you move to another room</label></div>"
+"<div id=botlooprow class=row style='margin-top:6px;display:none'>"
+"<label class=hint><input type=checkbox id=botloop onchange=botLoopSet()> "
+"<b>Cloud-mic loopback</b> — route the bot's room audio into BSDR_RoomMic (adds your OWN voice; works "
+"solo)</label>"
+"<label class=hint style='margin-left:16px'><input type=checkbox id=botsolo onchange=botSoloSet()> "
+"listen only to me</label></div>"
+"<div class=hint style=margin-top:6px><b>audio only</b> just sits in the room so your mic works when "
+"you're alone — no avatar. <b>full bot</b> also shows an avatar in the room (needed for in-room "
+"moderation).</div></div>"
 
 "<div class=card><h2>Headset (Quest)</h2>"
 "<div id=quest class=status>...</div>"
@@ -193,11 +254,30 @@ static const char PAGE[] =
 "are in <b>bsdrX_relay.zip</b>; see bsdr_micrelay(1).</div>"
 #endif
 /* realtime voice changer on the Quest mic */
-"<div class=sub2><div class=t>Voice changer <span class=badge>realtime</span>"
+"<div class=sub2><div class=t>Voice changer &#8212; effects <span class=badge>realtime</span>"
 "<label style='margin-left:auto;width:auto;font-weight:400'><input id=vfxon type=checkbox style=width:auto onchange=voicefx()> enable</label></div>"
-"<div class=row><label style=width:120px;color:var(--muted)>Gender</label>"
+"<div class=hint style=margin-bottom:6px>Your mic runs through <b>one</b> changer with two engines: these <b>DSP effects</b>, "
+"or the <b>AI voice (RVC)</b> below &#8212; turning on <b>use AI</b> overrides these effects (only <b>Volume</b> carries over). "
+"<b>Substitute</b> (bottom) then decides whether the room/Quest hears the changed voice or just your local virtual mic; it "
+"applies to whichever engine is on.</div>"
+"<div class=row style='flex-wrap:wrap;gap:4px'><label style=width:120px;color:var(--muted)>Presets</label>"
+"<button onclick=\"vpreset('feminize')\">Feminize</button>"
+"<button onclick=\"vpreset('masculinize')\">Masculinize</button>"
+"<button onclick=\"vpreset('younger')\">Younger</button>"
+"<button onclick=\"vpreset('older')\">Older</button>"
+"<button onclick=\"vpreset('chipmunk')\">Chipmunk</button>"
+"<button onclick=\"vpreset('deep')\">Deep</button>"
+"<button onclick=\"vpreset('robot')\">Robot</button>"
+"<button onclick=\"vpreset('reset')\">Reset</button></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>Pitch</label>"
 "<input id=vgender type=range min=-100 max=100 value=0 oninput='vgv.textContent=vgender.value' onchange=voicefx() class=grow>"
 "<span id=vgv style=width:2.5em;text-align:right>0</span></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>Formant (tone)</label>"
+"<input id=vformant type=range min=-100 max=100 value=0 oninput='vfmv.textContent=vformant.value' onchange=voicefx() class=grow>"
+"<span id=vfmv style=width:2.5em;text-align:right>0</span></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>Volume</label>"
+"<input id=vvolume type=range min=-100 max=100 value=0 oninput='vvv.textContent=vvolume.value' onchange=voicefx() class=grow>"
+"<span id=vvv style=width:2.5em;text-align:right>0</span></div>"
 "<div class=row><label style=width:120px;color:var(--muted)>Robot</label>"
 "<input id=vrobot type=range min=0 max=100 value=0 oninput='vrv.textContent=vrobot.value' onchange=voicefx() class=grow>"
 "<span id=vrv style=width:2.5em;text-align:right>0</span></div>"
@@ -208,19 +288,47 @@ static const char PAGE[] =
 "<input id=vwhisper type=range min=0 max=100 value=0 oninput='vwv.textContent=vwhisper.value' onchange=voicefx() class=grow>"
 "<span id=vwv style=width:2.5em;text-align:right>0</span></div>"
 "<div class=hint>Live, no model, all platforms. <b>Enable</b> turns the changer on (the sliders keep "
-"their positions when off). <b>Gender</b> shifts pitch+formants (&#8722; deeper / + higher); "
-"<b>Robot</b> = ring-mod timbre; <b>Echo</b> = trailing echo; <b>Whisper</b> = breathy. Applies to the "
-"Quest mic everywhere (virtual mic, computer-control, cloud).</div>"
+"their positions when off). <b>Pitch</b> shifts pitch+formants (&#8722; deeper / + higher); "
+"<b>Formant</b> tilts the tone brighter/darker (vocal-tract size); <b>Volume</b> = output gain; "
+"<b>Robot</b> = ring-mod timbre; <b>Echo</b> = trailing echo; <b>Whisper</b> = breathy. The changer "
+"always feeds the host virtual mic (BSDR_QuestMic); the room/Quest only hears it when <b>Substitute</b> "
+"below is ticked.</div>"
 "<div class=row><label style=width:auto><input id=vsub type=checkbox style=width:auto onchange=voicefx()> "
 #if defined(__ANDROID__)
-"Substitute into the cloud (relay): stop the headset&#8217;s original voice and inject the changed audio</label></div>"
+"Substitute into the cloud (relay): stop the headset&#8217;s original voice and inject the changed (or AI-converted) audio</label></div>"
 "<div class=hint>Requires <b>Relay</b> active (we rewrite the headset&#8594;cloud packets in "
 #else
-"Substitute into the cloud (MITM/relay): stop the headset&#8217;s original voice and inject the changed audio</label></div>"
+"Substitute into the cloud (MITM/relay): stop the headset&#8217;s original voice and inject the changed (or AI-converted) audio</label></div>"
 "<div class=hint>Requires <b>MITM</b> or <b>Relay</b> active (we rewrite the headset&#8594;cloud packets in "
 #endif
 "flight via NFQUEUE) and the agent running with <b>root / CAP_NET_ADMIN</b> on Linux. Otherwise the change "
 "is still heard on the local virtual mic and the cloud-room fallback.</div></div>"
+/* AI voice conversion (RVC) — the model-based tier behind the same changer */
+"<div class=sub2><div class=t>Voice changer &#8212; AI voice (RVC) <span class=badge>model</span>"
+"<label style='margin-left:auto;width:auto;font-weight:400'><input id=vaion type=checkbox style=width:auto onchange=voiceai()> use AI</label></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>Quality</label>"
+"<select id=vaitier onchange=voiceai()><option value=1>CPU</option><option value=2>Small GPU</option><option value=3>Big GPU</option></select>"
+"<label style='color:var(--muted);margin-left:12px'>Voice</label>"
+"<select id=vaivoice onchange=voiceai() class=grow></select></div>"
+"<div class=row><label style=width:120px;color:var(--muted)>Pitch key</label>"
+"<input id=vaikey type=range min=-24 max=24 value=0 oninput='vaikv.textContent=vaikey.value' onchange=voiceai() class=grow>"
+"<span id=vaikv style=width:2.5em;text-align:right>0</span></div>"
+"<div class=hint id=vaistat>&#8212;</div>"
+"<div class=row><button onclick=vaidl()>Download engine models</button><span id=vaidls class=hint></span></div>"
+"<div class=row><input id=vaizip placeholder='engine models .zip path' class=grow><button onclick=vaiimp()>Import zip</button></div>"
+"<div class=t style=margin-top:8px>Add a voice"
+"<a href='https://huggingface.co/models?search=rvc+onnx' target=_blank rel=noopener style='margin-left:8px;font-weight:400;font-size:12px'>find voices online &#8599;</a></div>"
+"<div class=row><input id=vaddid placeholder=id style=max-width:120px><input id=vaddname placeholder='display name' class=grow></div>"
+"<div class=row><input id=vaddurl placeholder='voice .onnx URL (download online)' class=grow><button onclick=vaiAddUrl()>Download</button></div>"
+"<div class=row><input id=vaddpath placeholder='local .onnx path' class=grow><button onclick=\"vaddBrowse()\">Browse</button><button onclick=vaiAddFile()>Add file</button></div>"
+"<div id=vailist class=hint style=margin-top:4px></div>"
+"<div class=t style=margin-top:8px>Voice presets <span class=badge>up to 5</span></div><div id=vaipresets></div>"
+"<div class=hint>Converts your mic to the selected <b>voice</b> (an RVC <code>.onnx</code> you supply or download online &#8212; "
+"use <b>find voices online</b> above; note many community voices ship as <code>.pth</code> and must be exported to ONNX first). "
+"<b>Quality</b> = CPU / small-GPU / big-GPU (ONNX Runtime; falls back to CPU everywhere, Android included). Needs the "
+"engine base models once (Download or Import). When <b>use AI</b> is on it <b>replaces the DSP effects</b> above "
+"(Pitch/Formant/Robot/Echo/Whisper are bypassed) &#8212; only <b>Volume</b> and <b>Substitute</b> from the changer still apply. "
+"<b>Presets</b> save the whole changer state (AI + DSP knobs) to a named slot.</div></div>"
 /* Room mic: the OTHER participants' voices, consumed from the cloud room's SFU (micPort). Distinct
  * from BSDR_QuestMic (the headset owner's own voice, sniffed off the LAN). Needs an active cloud
  * session (Internet sharing on). */
@@ -270,7 +378,42 @@ static const char PAGE[] =
 "<select id=enc style=width:auto onchange=encoderSet()><option value=0>CPU — x264 (sharper text)</option>"
 "<option value=1>GPU — NVENC (offload / high bitrate)</option></select>"
 "<span class=hint style=margin-left:6px>x264 keeps low-bitrate text crisp; NVENC frees the CPU but "
-"needs more bitrate for the same sharpness. Saved across restarts.</span></div></div>"
+"needs more bitrate for the same sharpness. Saved across restarts.</span></div>"
+"<div class=row><label style=width:auto;color:var(--muted)>iGPU (Linux)</label>"
+"<label style=width:auto><input type=checkbox id=vaapi style=width:auto onchange=vaapiSet()> VAAPI encode</label>"
+"<label style='width:auto;margin-left:12px'><input type=checkbox id=kmsgrab style=width:auto onchange=kmsgrabSet()> kmsgrab capture</label>"
+"<span class=hint style=margin-left:6px>Linux + Intel/AMD iGPU: <b>VAAPI</b> encodes on the iGPU "
+"(frees the dGPU). <b>kmsgrab</b> grabs the screen via DRM/KMS — zero-copy when paired with VAAPI, but "
+"needs <code>CAP_SYS_ADMIN</code> (<code>setcap cap_sys_admin+ep</code>). Applied live (fresh keyframe); "
+"falls back to the normal path if unavailable.</span></div>"
+"<div class=row><label style=width:auto;color:var(--muted)>Mode</label>"
+"<select id=encmode style=width:auto onchange=encModeSet()><option value=0>Quality (default)</option>"
+"<option value=1>Balanced (NVENC p6 / x264 faster)</option>"
+"<option value=2>Performance (lighter CPU/GPU)</option></select>"
+"<span class=hint style=margin-left:6px>Higher levels use a lighter preset (Quality = NVENC p7 + 2-pass; "
+"Balanced = p6 single-pass / x264 faster; Performance = p4 single-pass / x264 superfast) — less CPU/GPU "
+"for a small quality drop. Applies on the next stream start.</span></div>"
+"<div class=row><label style=width:auto;color:var(--muted)>x264 threads</label>"
+"<input id=x264t type=number min=1 max=32 step=1 style=width:70px onchange=x264tSet()>"
+"<span class=hint style=margin-left:6px>Software (CPU) encode only: use N frame threads to spread encode "
+"across cores (still one NAL/frame). Adds ~(N-1) frames of latency, so leave at 1 unless a CPU host "
+"can't keep up at high resolution. Applies on the next stream start.</span></div>"
+"<div class=row><label style=width:auto;color:var(--muted)>Max FPS</label>"
+"<select id=fpscap style=width:auto onchange=fpsSet()><option value=0>Default (30)</option>"
+"<option value=24>24</option><option value=20>20</option><option value=15>15</option></select>"
+"<span class=hint style=margin-left:6px>Cap the capture/encode frame rate — the single biggest CPU "
+"saver on a busy host. Applies on the next stream start.</span></div>"
+"<div class=row><label style=width:auto;color:var(--muted)>Wi-Fi</label>"
+"<label style='width:auto;font-weight:400'><input id=lan1x type=checkbox style=width:auto onchange=lan1xSet()> "
+"send video once (halve the LAN uplink)</label>"
+"<span class=hint style=margin-left:6px>The desktop is normally sent twice for loss resilience; on a "
+"congested Wi-Fi, once cuts airtime in half. Takes effect live.</span></div>"
+"<div class=row><label style=width:auto;color:var(--muted)>&nbsp;</label>"
+"<label style='width:auto;font-weight:400'><input id=wifiopt type=checkbox style=width:auto onchange=wifiOptSet()> "
+"enable Wi-Fi network optimization</label>"
+"<span class=hint style=margin-left:6px>DSCP/WMM-marks the video+audio packets so the Wi-Fi stack gives "
+"them priority airtime over background traffic (downloads, other devices). Applies on the next stream "
+"start.</span></div></div>"
 
 "<div class=card><h2>2D&#8594;3D</h2>"
 "<div class=hint>Convert the stream to side-by-side 3D in real time. <b>Fast</b> is a light "
@@ -343,18 +486,18 @@ static const char PAGE[] =
 "it to speak; bsdrX listens until you stop, transcribes, and the LLM runs the action.</div>"
 
 "<div class=sub2><div class=t>Speech-to-text (STT)<span id=sttbadge class='badge free'>free online service</span></div>"
-"<div class=row><input id=se class=grow placeholder='leave blank = free online service'></div>"
-"<div class=row><input id=sm placeholder=whisper-1 style=width:150px>"
-"<input id=st type=password placeholder=token style=width:180px></div>"
+"<div class=row><input id=se class=grow placeholder='leave blank = free online service' onchange=voicecfg()></div>"
+"<div class=row><input id=sm placeholder=whisper-1 style=width:150px onchange=voicecfg()>"
+"<input id=st type=password placeholder=token style=width:180px onchange=voicecfg()></div>"
 "<div class=hint id=stthint>Leave the URL blank to use a built-in <b>free online</b> "
 "transcription service — no setup. For private/faster results, point it at your own "
 "Whisper server (e.g. <code>http://localhost:8080/inference</code>) or any OpenAI-compatible "
 "<code>/v1/audio/transcriptions</code> endpoint, plus its model and token.</div></div>"
 
 "<div class=sub2><div class=t>Language model (LLM)<span id=llmbadge class='badge custom'>not set</span></div>"
-"<div class=row><input id=le class=grow placeholder='https://api.openai.com/v1/chat/completions'></div>"
-"<div class=row><input id=lm placeholder=gpt-4o-mini style=width:150px>"
-"<input id=lt type=password placeholder=token style=width:180px></div>"
+"<div class=row><input id=le class=grow placeholder='https://api.openai.com/v1/chat/completions' onchange=voicecfg()></div>"
+"<div class=row><input id=lm placeholder=gpt-4o-mini style=width:150px onchange=voicecfg()>"
+"<input id=lt type=password placeholder=token style=width:180px onchange=voicecfg()></div>"
 "<div class=hint>Required for spoken <i>commands</i> (the model decides which desktop "
 "action to run). Any OpenAI-compatible chat endpoint works. Without it, speech is only typed out.</div></div>"
 
@@ -415,6 +558,16 @@ static const char PAGE[] =
 "function login(){api('/api/login',{email:email.value,password:pw.value})}"
 "function tlsToggle(){api('/api/tls',{insecure:tlsinsecure.checked?1:0})}"
 "function logout(){api('/api/logout',{})}"
+"function botLogin(){api('/api/bot/login',{email:botemail.value,password:botpw.value}).then(()=>{botpw.value=''})}"
+"function botLogout(){api('/api/bot/logout',{})}"
+"function botLeave(){botleavebtn.disabled=true;api('/api/bot/leave',{}).then(()=>{botleavebtn.disabled=false})}"
+"function botStop(){api('/api/bot/stop',{})}"
+"function botStart(){api('/api/bot/start',{})}"
+"function botMode(){api('/api/bot/mode',{mode:botmode.value})}"
+"function botFollowSet(){api('/api/bot/follow',{on:botfollow.checked?1:0})}"
+"function botLoopSet(){api('/api/bot/loopback',{on:botloop.checked?1:0})}"
+"function botSoloSet(){api('/api/bot/solo',{on:botsolo.checked?1:0})}"
+"function botJoin(){botjoinbtn.disabled=true;botjoinbtn.textContent='Joining…';api('/api/bot/join',{}).then(r=>{botjoinbtn.disabled=false;botjoinbtn.textContent='Join my room';if(!r||!r.ok)alert('Bot room-join failed — check that your headset is in a room and the bot is logged in (see debug log).');})}"
 "function sel(ip){api('/api/select',{ip:ip})}"
 "let cams=[],camMode='desktop';"
 "function srcRows(m){let cam=(m==='webcam'||m==='webcam3d');"
@@ -439,6 +592,13 @@ static const char PAGE[] =
 "function pointerModeToggle(){api('/api/pointermode',{touch:ptouch.checked?1:0})}"
 "function bitrateSet(){api('/api/bitrate',{mbps:+brate.value||0})}"
 "function encoderSet(){api('/api/encoder',{gpu:+enc.value})}"
+"function vaapiSet(){api('/api/vaapi',{on:vaapi.checked?1:0})}"
+"function kmsgrabSet(){api('/api/kmsgrab',{on:kmsgrab.checked?1:0})}"
+"function encModeSet(){api('/api/encmode',{level:+encmode.value})}"
+"function x264tSet(){api('/api/x264threads',{n:+x264t.value})}"
+"function fpsSet(){api('/api/fpscap',{fps:+fpscap.value})}"
+"function lan1xSet(){api('/api/lan1x',{on:lan1x.checked?1:0})}"
+"function wifiOptSet(){api('/api/wifiopt',{on:wifiopt.checked?1:0})}"
 "function fbClose(){document.getElementById('fb').style.display='none'}"
 "function showDonate(){document.getElementById('dn').style.display='block'}"
 "function dnClose(){document.getElementById('dn').style.display='none'}"
@@ -456,7 +616,7 @@ static const char PAGE[] =
 "(r.entries||[]).sort((a,b)=>(b.dir-a.dir)||a.name.localeCompare(b.name)).forEach(e=>{"
 "if(e.dir)mk('\\uD83D\\uDCC1 '+e.name,()=>fbBrowse(fbJoin(r.dir,e.name)));"
 "else mk('\\uD83C\\uDFAC '+e.name,()=>fbPick(fbJoin(r.dir,e.name)))})}"
-"function fbPick(f){if(fbTarget==='fs'){fssrc.value=f;faceswap();}else{path.value=f;srcpath();}fbClose()}"
+"function fbPick(f){if(fbTarget==='fs'){fssrc.value=f;faceswap();}else if(fbTarget&&document.getElementById(fbTarget)){document.getElementById(fbTarget).value=f;}else{path.value=f;srcpath();}fbClose()}"
 "async function loadWindows(){let ws=await api('/api/windows');let e=document.getElementById('win');e.innerHTML='';(ws||[]).forEach((o,i)=>{let p=document.createElement('option');p.value=i;p.textContent=o.title+(o.w?(' ('+o.w+'x'+o.h+')'):'');p.dataset.geo=JSON.stringify(o);e.appendChild(p)})}"
 "function selWin(){let e=document.getElementById('win');let o=JSON.parse(e.options[e.selectedIndex].dataset.geo);api('/api/region',{x:o.x,y:o.y,w:o.w,h:o.h})}"
 "function togglePause(){api('/api/pause',{toggle:true})}"
@@ -464,11 +624,43 @@ static const char PAGE[] =
 "function toggleShare(){api('/api/share',{toggle:true})}"
 #if defined(__ANDROID__)
 "function toggleSniff(){let on=snbtn.dataset.on==='1';api('/api/sniff',{want:on?0:1,password:''})}"
-#else
-"function toggleSniff(){let on=snbtn.dataset.on==='1';api('/api/sniff',{want:on?0:1,password:snpw.value}).then(()=>{snpw.value=''})}"
-#endif
 "function snMethodChange(){relayrow.style.display=(+snmethod.value===2)?'flex':'none';api('/api/sniffmethod',{method:+snmethod.value})}"
-"function voicefx(){api('/api/voicefx',{on:vfxon.checked?1:0,gender:+vgender.value,robot:+vrobot.value,echo:+vecho.value,whisper:+vwhisper.value,substitute:vsub.checked?1:0})}"
+#else
+/* Non-blocking Wi-Fi guardrail: ARP-MITM over Wi-Fi is unreliable and can briefly drop the headset's
+ * LAN link. When the operator picks/starts MITM on a Wi-Fi NIC, ask — OK keeps trying MITM, Cancel lets
+ * them change strategy (pick Relay). Only prompts when the server reports the capture NIC is wireless. */
+"function mitmWifiOk(){return confirm('MITM over Wi-Fi is unreliable and may briefly drop the headset connection (the session can time out).\\n\\nOK = try MITM anyway\\nCancel = keep the current method (use Relay / router companion instead)')}"
+"function toggleSniff(){let on=snbtn.dataset.on==='1';if(!on&&+snmethod.value===1&&snmethod.dataset.wifi==='1'&&!mitmWifiOk())return;api('/api/sniff',{want:on?0:1,password:snpw.value}).then(()=>{snpw.value=''})}"
+"function snMethodChange(){let m=+snmethod.value;if(m===1&&snmethod.dataset.wifi==='1'&&!mitmWifiOk()){snmethod.value=snmethod.dataset.cur||0;relayrow.style.display=(+snmethod.value===2)?'flex':'none';return;}snmethod.dataset.cur=m;relayrow.style.display=(m===2)?'flex':'none';api('/api/sniffmethod',{method:m})}"
+#endif
+"function voicefx(){api('/api/voicefx',{on:vfxon.checked?1:0,gender:+vgender.value,formant:+vformant.value,volume:+vvolume.value,robot:+vrobot.value,echo:+vecho.value,whisper:+vwhisper.value,substitute:vsub.checked?1:0})}"
+"var VPRESETS={feminize:{g:45,fm:30,vo:0,r:0,e:0,w:0},masculinize:{g:-45,fm:-25,vo:0,r:0,e:0,w:0},"
+"younger:{g:28,fm:18,vo:0,r:0,e:0,w:0},older:{g:-22,fm:-15,vo:0,r:0,e:6,w:18},"
+"chipmunk:{g:85,fm:40,vo:0,r:0,e:0,w:0},deep:{g:-70,fm:-30,vo:5,r:0,e:0,w:0},"
+"robot:{g:-10,fm:0,vo:0,r:75,e:10,w:0},reset:{g:0,fm:0,vo:0,r:0,e:0,w:0}};"
+"function vpreset(n){var p=VPRESETS[n];if(!p)return;vfxon.checked=true;"
+"vgender.value=p.g;vgv.textContent=p.g;vformant.value=p.fm;vfmv.textContent=p.fm;"
+"vvolume.value=p.vo;vvv.textContent=p.vo;vrobot.value=p.r;vrv.textContent=p.r;"
+"vecho.value=p.e;vev.textContent=p.e;vwhisper.value=p.w;vwv.textContent=p.w;voicefx()}"
+/* AI voice (RVC) */
+"function voiceai(){api('/api/voiceai',{on:vaion.checked?1:0,tier:+vaitier.value,voice:vaivoice.value||'',key:+vaikey.value})}"
+"function vaidl(){api('/api/voice-basedl',{})}"
+"function vaiimp(){if(vaizip.value)api('/api/voice-import',{path:vaizip.value})}"
+"function vaiAddUrl(){if(vaddurl.value&&vaddid.value)api('/api/voice-add-url',{url:vaddurl.value,id:vaddid.value,name:vaddname.value||''}).then(()=>{vaddurl.value=''})}"
+"function vaiAddFile(){if(vaddpath.value&&vaddid.value)api('/api/voice-add-file',{path:vaddpath.value,id:vaddid.value,name:vaddname.value||''}).then(()=>{vaddpath.value=''})}"
+"function vaddBrowse(){fbTarget='vaddpath';let p=vaddpath.value||'';let d=p.lastIndexOf('/')>0?p.substring(0,p.lastIndexOf('/')):'';fbBrowse(d)}"
+"function vaiDel(id){if(confirm('Delete voice '+id+'?'))api('/api/voice-delete',{id:id})}"
+"function vpSave(s){let nm=prompt('Preset name');if(nm)api('/api/voice-preset',{action:'save',slot:s,name:nm})}"
+"function vpApply(s){api('/api/voice-preset',{action:'apply',slot:s})}"
+"function vpDel(s){api('/api/voice-preset',{action:'delete',slot:s})}"
+"function renderVoiceAI(v){if(!v)return;if(document.activeElement!==vaion)vaion.checked=!!v.on;"
+"if(document.activeElement!==vaitier)vaitier.value=v.tier;if(document.activeElement!==vaikey){vaikey.value=v.key;vaikv.textContent=v.key;}"
+"let sel=vaivoice,cur=sel.value;sel.innerHTML='<option value=\"\">(pick a voice)</option>'+(v.voices||[]).map(o=>'<option value=\"'+o.id+'\">'+o.name+'</option>').join('');"
+"if(v.voice)sel.value=v.voice;else if(cur)sel.value=cur;"
+"let st=v.status||'';if(!v.available)st='ONNX not built in this agent';else if(!v.baseReady)st='engine base models needed';vaistat.textContent='Engine: '+st;"
+"let d=v.dl||{};vaidls.textContent=d.active?(d.name+' '+(d.pct<0?'…':d.pct+'%')):(d.err?('error: '+d.err):(v.baseReady?'base models present':''));"
+"vailist.innerHTML=(v.voices||[]).map(o=>'<div class=row style=gap:6px><span class=grow>'+o.name+' <span style=opacity:.6>('+o.id+', '+o.sr+'Hz)</span></span><button onclick=\"vaiDel(\\''+o.id+'\\')\">del</button></div>').join('')||'<i>no voices yet — add one above</i>';"
+"vaipresets.innerHTML=(v.presets||[]).map((p,i)=>'<div class=row style=gap:6px><span class=grow>'+(p.name?('#'+(i+1)+' '+p.name+(p.ai?' <span style=opacity:.6>AI</span>':'')):('<i>slot '+(i+1)+' empty</i>'))+'</span>'+(p.name?'<button onclick=vpApply('+i+')>apply</button><button onclick=vpDel('+i+')>del</button>':'')+'<button onclick=vpSave('+i+')>save</button></div>').join('');}"
 "function relayPortSet(){api('/api/relayport',{port:+relayport.value})}"
 "function faceswap(){api('/api/faceswap',{on:fson.checked?1:0,tier:+fstier.value,source:fssrc.value})}"
 "function voicecfg(){api('/api/voice',{stt:se.value,sttModel:sm.value,sttToken:st.value,llm:le.value,llmModel:lm.value,llmToken:lt.value})}"
@@ -498,20 +690,60 @@ static const char PAGE[] =
 "let err=(d&&d.err)?('<div style=color:#f85149>download error: '+d.err+'</div>'):'';"
 "tdmodels.innerHTML=rows+err+'<div style=color:var(--muted);margin-top:4px>cache: '+(m.dir||'?')+'</div>';}"
 "function dot(b){return '<span class=\"dot '+(b?'on':'off')+'\"></span>'}"
+/* collapsible panels: every card except the first becomes a click-to-toggle panel whose open/closed
+ * state persists in localStorage, with an on/off badge in the header that stays visible when collapsed */
+"function cardKey(t){t=t.toLowerCase();"
+"if(t.indexOf('second account')>=0)return'bot';"
+"if(t.indexOf('quest')>=0&&t.indexOf('mic')<0)return'quest';"
+"if(t.indexOf('headset mic')>=0)return'mic';"
+"if(t.indexOf('source')>=0)return'source';"
+"if(t.indexOf('2d')>=0)return'td';"
+"if(t.indexOf('face swap')>=0)return'fs';"
+"if(t.indexOf('voice assistant')>=0)return'va';"
+"if(t.indexOf('dependencies')>=0)return'dep';"
+"return t.replace(/[^a-z0-9]/g,'').slice(0,12);}"
+"function setupPanels(){document.querySelectorAll('.card').forEach(function(c,i){"
+"if(i===0)return;var h=c.querySelector('h2');if(!h||h.dataset.clp)return;h.dataset.clp='1';"
+"var key=cardKey(h.textContent);h.classList.add('clp');"
+"var r=document.createElement('span');r.className='hdrr';"
+"var en=document.createElement('span');en.className='en';en.id='en_'+key;"
+"var ch=document.createElement('span');ch.className='chev';ch.textContent='\\u25be';"
+"r.appendChild(en);r.appendChild(ch);h.appendChild(r);"
+"if(localStorage.getItem('clp:'+key)==='1')c.classList.add('col');"
+"h.addEventListener('click',function(){c.classList.toggle('col');"
+"localStorage.setItem('clp:'+key,c.classList.contains('col')?'1':'0');});});}"
+"function setEn(k,on,txt){var e=document.getElementById('en_'+k);if(!e)return;"
+"if(on===null){e.className='en';e.textContent=txt||'';}else{e.className='en '+(on?'y':'n');e.textContent=txt||(on?'on':'off');}}"
 "async function tick(){let s=await api('/api/status');"
 "cloud.innerHTML=dot(s.cloud.loggedIn)+'<span>'+(s.cloud.loggedIn?('Connected as '+s.cloud.name):('Not connected — '+s.cloud.msg))+'</span>'+(s.cloud.loggedIn?'<button onclick=logout() style=margin-left:auto>Log out</button>':'');"
 "loginform.style.display=s.cloud.loggedIn?'none':'flex';"
 "loginform2.style.display=s.cloud.loggedIn?'none':'flex';"
+"if(s.bot){let b=s.bot,bi=b.loggedIn;"
+"bot.innerHTML=dot(bi)+'<span>'+(bi?('Bot: '+b.name+(b.joined?(' — in room ('+(b.room||'')+')'):'')+(b.msg?(' — '+b.msg):'')):('Not logged in'+(b.msg?(' — '+b.msg):'')))+'</span>';"
+"botlogin.style.display=(!bi&&!b.stopped)?'flex':'none';"
+"botstart.style.display=(!bi&&b.stopped)?'flex':'none';"
+"botactions.style.display=bi?'flex':'none';"
+"botfollowrow.style.display=bi?'flex':'none';"
+"botlooprow.style.display=bi?'flex':'none';"
+"if(document.getElementById('botfollow')&&document.activeElement!==botfollow)botfollow.checked=!!b.follow;"
+"if(document.getElementById('botloop')&&document.activeElement!==botloop)botloop.checked=!!b.loopback;"
+"if(document.getElementById('botsolo')&&document.activeElement!==botsolo)botsolo.checked=!!b.solo;"
+"if(b.mode&&document.getElementById('botmode')&&document.activeElement!==botmode)botmode.value=b.mode;"
+"if(document.getElementById('botleavebtn'))botleavebtn.style.display=b.joined?'':'none';"
+"if(document.getElementById('botjoinbtn')){botjoinbtn.textContent=b.joined?'Re-join my room':'Join my room';}}"
 "if(document.activeElement!==tlsinsecure)tlsinsecure.checked=!!s.tlsInsecure;"
 "cloudshare.style.display=s.cloud.loggedIn?'flex':'none';"
 "if(s.cloud.loggedIn){let sh=s.cloud.internetSharing;sharelbl.textContent='Internet sharing: '+(sh?'ON':'off');sharebtn.textContent=sh?'Stop sharing':'Share to Internet';sharebtn.className=sh?'danger':'p';}"
 "quest.innerHTML=dot(s.quest.paired)+'<span>'+(s.quest.paired?('Connected: '+s.quest.name+' ('+s.quest.ip+')'):'No headset connected')+'</span>'+(s.quest.streaming?'<span class=pill>streaming</span>':'')+(s.quest.paired?'<button class=danger style=margin-left:auto onclick=disconnect()>Disconnect</button>':'');"
 "if(s.sniff){let sn=s.sniff;sniff.innerHTML=dot(sn.active)+'<span>'+(sn.active?('On — '+(sn.msg||'active')):('Off'+(sn.msg?(' — '+sn.msg):'')))+'</span>';snbtn.dataset.on=sn.want?'1':'0';snbtn.textContent=sn.want?'Stop mic':'Start mic';snbtn.className=sn.want?'danger':'p';"
-"if(document.activeElement!==snmethod&&sn.method!==undefined)snmethod.value=sn.method;"
+"if(document.activeElement!==snmethod&&sn.method!==undefined){snmethod.value=sn.method;snmethod.dataset.cur=sn.method;}"
+"if(sn.wifi!==undefined)snmethod.dataset.wifi=sn.wifi?'1':'0';"
 "relayrow.style.display=(sn.method===2)?'flex':'none';"
 "if(document.activeElement!==relayport&&sn.relayPort!==undefined)relayport.value=sn.relayPort||'';"
 "if(document.activeElement!==vfxon&&sn.fxOn!==undefined)vfxon.checked=sn.fxOn;"
 "if(document.activeElement!==vgender&&sn.gender!==undefined){vgender.value=sn.gender;vgv.textContent=sn.gender;}"
+"if(document.activeElement!==vformant&&sn.formant!==undefined){vformant.value=sn.formant;vfmv.textContent=sn.formant;}"
+"if(document.activeElement!==vvolume&&sn.volume!==undefined){vvolume.value=sn.volume;vvv.textContent=sn.volume;}"
 "if(document.activeElement!==vrobot&&sn.robot!==undefined){vrobot.value=sn.robot;vrv.textContent=sn.robot;}"
 "if(document.activeElement!==vecho&&sn.echo!==undefined){vecho.value=sn.echo;vev.textContent=sn.echo;}"
 "if(document.activeElement!==vwhisper&&sn.whisper!==undefined){vwhisper.value=sn.whisper;vwv.textContent=sn.whisper;}"
@@ -527,7 +759,14 @@ static const char PAGE[] =
 "if(document.activeElement!==ptouch)ptouch.checked=!!s.pointerTouch;"
 "if(s.quality){if(document.activeElement!==brate)brate.value=s.quality.brOverride?(s.quality.brOverride/1e6):'';"
 "breff.textContent='(now '+((s.quality.bitrate||0)/1e6).toFixed(1)+' Mbps'+(s.quality.brOverride?', overriding':', from headset')+')';"
-"if(document.activeElement!==enc)enc.value=s.quality.gpuEncode?'1':'0';}"
+"if(document.activeElement!==enc)enc.value=s.quality.gpuEncode?'1':'0';"
+"if(document.activeElement!==vaapi&&s.quality.vaapi!==undefined)vaapi.checked=!!s.quality.vaapi;"
+"if(document.activeElement!==kmsgrab&&s.quality.kmsgrab!==undefined)kmsgrab.checked=!!s.quality.kmsgrab;"
+"if(document.activeElement!==encmode&&s.quality.encLevel!==undefined)encmode.value=''+s.quality.encLevel;"
+"if(document.activeElement!==x264t&&s.quality.x264Threads!==undefined)x264t.value=''+(s.quality.x264Threads||1);"
+"if(document.activeElement!==fpscap&&s.quality.fpsCap!==undefined)fpscap.value=s.quality.fpsCap;"
+"if(document.activeElement!==lan1x&&s.quality.lan1x!==undefined)lan1x.checked=s.quality.lan1x;"
+"if(document.activeElement!==wifiopt&&s.quality.wifiOpt!==undefined)wifiopt.checked=s.quality.wifiOpt;}"
 "blankrow.style.display=s.android?'none':'';"   /* screen-blank is desktop-only */
 "if(document.activeElement!==cloudmic)cloudmic.checked=!!s.cloudMic;"
 "if(document.activeElement!==ownmiclocal)ownmiclocal.checked=!!s.ownerMicLocal;"
@@ -545,6 +784,7 @@ static const char PAGE[] =
 "if(document.activeElement!==fssrc)fssrc.value=fx.source||'';"
 "if(document.activeElement!==fstier&&fx.tier)fstier.value=fx.tier;"
 "fsstat.textContent='face swap: '+(fx.status||(fx.on?'on':'off'));renderFsModels(fx.models);}"
+"if(s.voiceai)renderVoiceAI(s.voiceai);"
 "if(document.activeElement!==se)se.value=s.voice.stt||'';"
 "if(document.activeElement!==sm)sm.value=s.voice.sttModel||'';"
 "if(document.activeElement!==le)le.value=s.voice.llm||'';"
@@ -558,8 +798,18 @@ static const char PAGE[] =
 "ccstatus.innerHTML=dot(cc.active)+'<span>'+(cc.active?('Armed — '+(cc.msg||'balloon active')):(cc.want?('Pending — '+(cc.msg||'waiting')):(ready?'Off — ready to enable':(s.android?'Off — set an LLM first':'Off — turn on the Quest mic and set an LLM first'))))+'</span>';"
 "ccbadge.textContent=cc.active?'armed':(cc.want?'pending':'off');ccbadge.className='badge '+(cc.active?'free':'custom');"
 "if(document.activeElement!==ccvis)ccvis.checked=!!cc.vision;}"
-"let pb=document.getElementById('pause');pb.textContent=s.quest.paused?'Restart':'Stop';pb.className=s.quest.paused?'p':'danger';}"
-"setInterval(tick,1000);tick();loadWindows();loadDeps();"
+"let pb=document.getElementById('pause');pb.textContent=s.quest.paused?'Restart':'Stop';pb.className=s.quest.paused?'p':'danger';"
+/* collapsed-panel enabled/disabled badges (computed from the same status) */
+"setEn('bot',!!(s.bot&&s.bot.loggedIn),s.bot&&s.bot.loggedIn?(s.bot.joined?'in room':'on'):'off');"
+"setEn('quest',!!s.quest.paired,s.quest.paired?(s.quest.streaming?'streaming':'connected'):'off');"
+"setEn('mic',!!((s.sniff&&(s.sniff.active||s.sniff.fxOn))||s.roomMic||(s.voiceai&&s.voiceai.on)),"
+"(s.sniff&&s.sniff.active)?'mic on':(((s.sniff&&s.sniff.fxOn)||(s.voiceai&&s.voiceai.on))?'voice fx':(s.roomMic?'room mic':'off')));"
+"setEn('source',null,(s.source&&s.source.mode)?s.source.mode:'');"
+"setEn('td',!!(s.threed&&s.threed.mode>0),(s.threed&&s.threed.mode>0)?'3D on':'off');"
+"setEn('fs',!!(s.faceswap&&s.faceswap.on),(s.faceswap&&s.faceswap.on)?'on':'off');"
+"setEn('va',!!(s.compctl&&(s.compctl.active||s.compctl.want)),s.compctl?(s.compctl.active?'armed':(s.compctl.want?'pending':'off')):'off');"
+"}"
+"setupPanels();setInterval(tick,1000);tick();loadWindows();loadDeps();"
 "</script></body></html>";
 
 static void respond(bsdr_socket_t c, int code, const char *ctype, const char *body, size_t blen) {
@@ -621,7 +871,7 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
             r == 1 ? "true" : "false", r == 0 ? "true" : "false", em);
         respond(c, 200, "application/json", out, ol);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
-        static char json[12288];
+        static char json[20480];   /* room for the faceswap + voiceai (voice library + presets) objects */
         size_t n = bsdr_app_status_json(a, json, sizeof(json));
         respond(c, 200, "application/json", json, n);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/login") == 0) {
@@ -632,6 +882,43 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/logout") == 0) {
         bsdr_app_logout(a);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/bot/login") == 0) {
+        char email[128] = "", pw[128] = "";
+        bsdr_json_get_str(body, "email", email, sizeof(email));
+        bsdr_json_get_str(body, "password", pw, sizeof(pw));
+        bsdr_app_bot_login(a, email, pw);             /* blocking HTTPS (second account) */
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/bot/logout") == 0) {
+        bsdr_app_bot_logout(a);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/bot/join") == 0) {
+        bool ok = bsdr_app_bot_join_room(a);          /* join the host's current room as the bot */
+        respond(c, 200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}", ok ? 11 : 12);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/bot/mode") == 0) {
+        char mode[8] = ""; bsdr_json_get_str(body, "mode", mode, sizeof mode);
+        bsdr_app_bot_set_mode(a, mode);               /* "audio" | "full"; persisted */
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/bot/follow") == 0) {
+        double on = 0; bsdr_json_get_double(body, "on", &on);
+        bsdr_app_set_bot_follow(a, on != 0);          /* follow the operator between rooms; persisted */
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/bot/loopback") == 0) {
+        double on = 0; bsdr_json_get_double(body, "on", &on);
+        bsdr_app_set_bot_loopback(a, on != 0);        /* bot room audio -> BSDR_RoomMic; persisted */
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/bot/solo") == 0) {
+        double on = 0; bsdr_json_get_double(body, "on", &on);
+        bsdr_app_set_bot_solo_owner(a, on != 0);      /* "listen only to me"; persisted, live */
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/bot/leave") == 0) {
+        bool ok = bsdr_app_bot_leave_room(a);         /* leave the room, stay logged in */
+        respond(c, 200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}", ok ? 11 : 12);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/bot/stop") == 0) {
+        bsdr_app_bot_stop(a);                         /* disconnect but remember the login */
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/bot/start") == 0) {
+        bsdr_app_bot_start(a);                         /* reconnect from the remembered session */
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/tls") == 0) {
         double insecure = 0; bsdr_json_get_double(body, "insecure", &insecure);
@@ -685,6 +972,44 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
          * Live-switchable (restarts a running session) and persisted across restarts. */
         double gpu = 0; bsdr_json_get_double(body, "gpu", &gpu);
         bsdr_app_set_gpu_encode(a, gpu != 0);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/vaapi") == 0) {
+        /* VAAPI iGPU encode (Linux). Applied live (in-place capture reopen), persisted. */
+        double on = 0; bsdr_json_get_double(body, "on", &on);
+        bsdr_app_set_vaapi(a, on != 0);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/kmsgrab") == 0) {
+        /* kmsgrab DRM/KMS capture (Linux; needs CAP_SYS_ADMIN). Applied live, persisted. */
+        double on = 0; bsdr_json_get_double(body, "on", &on);
+        bsdr_app_set_kmsgrab(a, on != 0);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/encmode") == 0) {
+        /* Encoder effort level: 0 quality (default) / 1 balanced / 2 performance. Persisted; applies on
+         * the next stream (re)start. Accept legacy "perf" (0/1) too. */
+        double level = 0;
+        if (bsdr_json_get_double(body, "level", &level) || bsdr_json_get_double(body, "perf", &level))
+            bsdr_app_set_enc_level(a, (int)level);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/x264threads") == 0) {
+        /* Opt-in x264 frame threads on the live --cpu path (P6.9). Persisted; next stream applies it. */
+        double n = 1; bsdr_json_get_double(body, "n", &n);
+        bsdr_app_set_x264_threads(a, (int)n);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/fpscap") == 0) {
+        /* Cap the capture/encode fps (0 = default 30). Persisted; applies on the next stream start. */
+        double fps = 0; bsdr_json_get_double(body, "fps", &fps);
+        bsdr_app_set_fps_cap(a, (int)fps);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/lan1x") == 0) {
+        /* Send LAN video once (halve the uplink) vs twice. Persisted; takes effect live. */
+        double on = 0; bsdr_json_get_double(body, "on", &on);
+        bsdr_app_set_lan_1x(a, on != 0);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/wifiopt") == 0) {
+        /* Wi-Fi network optimization: DSCP/WMM priority marking on the LAN media sockets. Persisted;
+         * applies on the next stream start. */
+        double on = 0; bsdr_json_get_double(body, "on", &on);
+        bsdr_app_set_wifi_opt(a, on != 0);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/model-import") == 0) {
         /* Import depth models from a zip that already exists on this machine (path given by the
@@ -754,15 +1079,18 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         bsdr_app_set_relay_port(a, (int)port);   /* router-companion relay port (Android's owner-mic path) */
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/voicefx") == 0) {
-        /* realtime Quest-mic voice change: master on + gender (-100..100) + effects + substitute */
-        double on = 1, gender = 0, robot = 0, echo = 0, whisper = 0, substitute = 0;
+        /* realtime Quest-mic voice change: master on + pitch/formant/volume + effects + substitute */
+        double on = 1, gender = 0, formant = 0, volume = 0, robot = 0, echo = 0, whisper = 0, substitute = 0;
         bsdr_json_get_double(body, "on", &on);
         bsdr_json_get_double(body, "gender", &gender);
+        bsdr_json_get_double(body, "formant", &formant);
+        bsdr_json_get_double(body, "volume", &volume);
         bsdr_json_get_double(body, "robot", &robot);
         bsdr_json_get_double(body, "echo", &echo);
         bsdr_json_get_double(body, "whisper", &whisper);
         bsdr_json_get_double(body, "substitute", &substitute);
-        bsdr_app_set_voicefx(a, on != 0, (int)gender, (int)robot, (int)echo, (int)whisper, substitute != 0);
+        bsdr_app_set_voicefx(a, on != 0, (int)gender, (int)formant, (int)volume,
+                             (int)robot, (int)echo, (int)whisper, substitute != 0);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/faceswap") == 0) {
         /* realtime face swap: enable + tier + source-image path (server-side) */
@@ -783,6 +1111,45 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         int n = zip[0] ? bsdr_faceswap_import_zip(zip) : -1;
         char out[48]; int ol = snprintf(out, sizeof(out), "{\"imported\":%d}", n);
         respond(c, 200, "application/json", out, ol);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/voiceai") == 0) {
+        double on = 0, tier = 1, key = 0; char voice[64] = "";
+        bsdr_json_get_double(body, "on", &on); bsdr_json_get_double(body, "tier", &tier);
+        bsdr_json_get_double(body, "key", &key); bsdr_json_get_str(body, "voice", voice, sizeof voice);
+        bsdr_app_set_voiceai(a, on != 0, (int)tier, voice, (int)key);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/voice-basedl") == 0) {
+        int rc = bsdr_voice_base_download_start();
+        respond(c, 200, "application/json", rc == 0 ? "{\"ok\":true}" : "{\"ok\":false}", rc == 0 ? 11 : 12);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/voice-import") == 0) {
+        char zip[1024] = ""; bsdr_json_get_str(body, "path", zip, sizeof zip);
+        int n = zip[0] ? bsdr_voice_base_import_zip(zip) : -1;
+        char out[48]; int ol = snprintf(out, sizeof out, "{\"imported\":%d}", n);
+        respond(c, 200, "application/json", out, ol);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/voice-add-url") == 0) {
+        char url[1024] = "", id[64] = "", name[96] = "";
+        bsdr_json_get_str(body, "url", url, sizeof url); bsdr_json_get_str(body, "id", id, sizeof id);
+        bsdr_json_get_str(body, "name", name, sizeof name);
+        int rc = bsdr_voice_download_start(url, id, name);
+        respond(c, 200, "application/json", rc == 0 ? "{\"ok\":true}" : "{\"ok\":false}", rc == 0 ? 11 : 12);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/voice-add-file") == 0) {
+        char p[1024] = "", id[64] = "", name[96] = "";
+        bsdr_json_get_str(body, "path", p, sizeof p); bsdr_json_get_str(body, "id", id, sizeof id);
+        bsdr_json_get_str(body, "name", name, sizeof name);
+        int rc = (p[0] && id[0]) ? bsdr_voice_add_file(p, id, name, 40000, 1) : -1;
+        respond(c, 200, "application/json", rc == 0 ? "{\"ok\":true}" : "{\"ok\":false}", rc == 0 ? 11 : 12);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/voice-delete") == 0) {
+        char id[64] = ""; bsdr_json_get_str(body, "id", id, sizeof id);
+        if (id[0]) bsdr_voice_delete(id);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/voice-preset") == 0) {
+        char act[16] = ""; double slot = 0; char name[64] = "";
+        bsdr_json_get_str(body, "action", act, sizeof act); bsdr_json_get_double(body, "slot", &slot);
+        bsdr_json_get_str(body, "name", name, sizeof name);
+        int s = (int)slot;
+        if (!strcmp(act, "save")) bsdr_app_voice_preset_save(a, s, name);
+        else if (!strcmp(act, "apply")) bsdr_app_voice_preset_apply(a, s);
+        else if (!strcmp(act, "delete")) bsdr_app_voice_preset_delete(a, s);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/windows") == 0) {
         bsdr_window wins[64], mons[16];
 #ifdef BSDR_HAVE_CAPTURE
@@ -944,7 +1311,13 @@ static void loop(void *arg) {
     struct bsdr_webui *w = (struct bsdr_webui *)arg;
     while (w->running) {
         bsdr_socket_t c = bsdr_tcp_accept(w->listener, NULL);
-        if (c == BSDR_INVALID_SOCKET) { if (w->running) bsdr_sleep_ms(20); continue; }
+        if (c == BSDR_INVALID_SOCKET) {
+            /* No pending connection. Sleep on the listener (up to 500ms) instead
+             * of a 50Hz busy-poll: the panel is idle almost all the time, and the
+             * timeout still lets us observe running=0 promptly on shutdown. */
+            if (w->running) bsdr_socket_wait_readable(w->listener, 500);
+            continue;
+        }
         char *buf = malloc(8192);
         if (buf) {
             int total = 0, r;

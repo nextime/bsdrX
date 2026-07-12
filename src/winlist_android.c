@@ -23,3 +23,11 @@ int bsdr_list_windows(const char *display, bsdr_window *out, int max) {
     (void)display; (void)out; (void)max;
     return 0;
 }
+
+/* No monitor enumeration either: MediaProjection exposes a single logical display
+ * whose geometry is only known at capture time, so the picker stays empty and the
+ * agent streams the whole screen. Mirrors bsdr_list_windows above. */
+int bsdr_list_monitors(const char *display, bsdr_window *out, int max) {
+    (void)display; (void)out; (void)max;
+    return 0;
+}

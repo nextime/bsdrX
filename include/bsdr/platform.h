@@ -71,4 +71,15 @@ void bsdr_mutex_free(bsdr_mutex *m);
 void bsdr_mutex_lock(bsdr_mutex *m);
 void bsdr_mutex_unlock(bsdr_mutex *m);
 
+/* Minimal condition variable, paired with a bsdr_mutex. Lets a consumer thread
+ * sleep until a producer signals instead of polling. The mutex must be held
+ * across wait; wait atomically releases it while blocked and re-acquires on wake
+ * (spurious wakeups possible — always re-check the predicate in a loop). */
+typedef struct bsdr_cond bsdr_cond;
+bsdr_cond *bsdr_cond_new(void);
+void bsdr_cond_free(bsdr_cond *c);
+void bsdr_cond_wait(bsdr_cond *c, bsdr_mutex *m);          /* wait indefinitely */
+void bsdr_cond_wait_ms(bsdr_cond *c, bsdr_mutex *m, int timeout_ms);
+void bsdr_cond_signal(bsdr_cond *c);                       /* wake one waiter */
+
 #endif /* BSDR_PLATFORM_H */

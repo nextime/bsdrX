@@ -66,6 +66,9 @@ int bsdr_audio_recv_playout(bsdr_audio_recv *r);
 /* Voice-activity duck: when on, playout mixes ONLY the loudest active stream and mutes the rest
  * (owner isolation while a voice command is captured over the cloud room-audio fallback). */
 void bsdr_audio_recv_set_duck(bsdr_audio_recv *r, int on);
+/* Identity solo: when ssrc != 0, playout mixes ONLY the stream with that SSRC (mute everyone else) —
+ * used to "listen only to me" (the room owner) via cloud_ssrc(ownerSessionId). 0 = mix all. */
+void bsdr_audio_recv_set_solo(bsdr_audio_recv *r, uint32_t ssrc);
 /* Strip the 8-byte BigSoup cloud trailer ([u32 ssrc][u32 frame_id]) before Opus decode — the room
  * audio the SFU sends back on the audio port carries it (as the sender appends). */
 void bsdr_audio_recv_enable_cloud_trailer(bsdr_audio_recv *r);

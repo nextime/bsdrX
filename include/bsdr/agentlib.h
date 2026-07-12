@@ -45,6 +45,8 @@ typedef struct {
     int dtls_timeout_ms;     /* 0 = 10000 */
     const char *cloud_data;       /* --cloud-data: "raw"|"dtls"|NULL(auto: raw then dtls) */
     const char *cloud_dtls_role;  /* --cloud-dtls-role: "client"|"server"|NULL(auto) */
+    const char *bot_mode;         /* --bot-mode: "audio"(REST join only)|"full"(avatar)|NULL(keep saved) */
+    const char *encoder_mode;     /* --encoder-mode: "performance"|"quality"|NULL(keep saved) */
     int cloud_latch_burst;        /* --cloud-latch-burst: # comedia keepalives on share start (default 12; 0=off) */
     int cloud_src_port;           /* --cloud-src-port: fixed local UDP source port for cloud video (0=ephemeral) */
     bool cloud_sticky_ports;      /* --cloud-sticky-ports: ephemeral 1st, then reuse same ports per relay IP across toggles */
@@ -57,7 +59,9 @@ typedef struct {
     bool use_kmsgrab;             /* --kmsgrab: DRM/KMS capture (zero-copy with --vaapi; needs CAP_SYS_ADMIN) */
     bool force_x11;               /* --x11: force x11grab (never the Wayland portal) */
     bool force_pipewire;          /* --wayland/--pipewire: force the portal + PipeWire capture */
-    bool use_sendmmsg;            /* --sendmmsg: batch LAN video fragments into one syscall */
+    bool pw_dmabuf;               /* --pw-dmabuf (experimental): zero-copy PipeWire dmabuf -> VAAPI */
+    bool use_sendmmsg;            /* --sendmmsg: batch LAN video fragments into one syscall (Linux; on by default) */
+    bool no_sendmmsg;             /* --no-sendmmsg: force the per-datagram send path (disable batching) */
     bool no_cloud_audio;          /* --no-cloud-audio: disable relay audio (default: ON, Opus + 8B trailer) */
     bool sniff_mic;               /* --sniff-mic: sniff the Quest's room mic -> BSDR_QuestMic */
     bool sniff_mitm;              /* --sniff-mitm: ARP-spoof so a switched LAN routes it through us */
@@ -76,6 +80,9 @@ typedef struct {
     int  threed_full;             /* --threed-full: full resolution per eye (default: light half-SBS) */
     int  threed_tier;             /* --threed-tier: in-process depth 0 none/ext, 1 cpu, 2 gpu, 3 hi */
     const char *threed_ai_cmd;    /* --threed-ai: external depth-estimator command (AI mode) */
+    int  faceswap_detect_every;   /* --faceswap-detect-every N (opt-in P4.5): detect every N frames */
+    int  x264_threads;            /* --x264-threads N (opt-in P6.9): N x264 frame threads on live --cpu */
+    bool ort_arena_off;           /* --ort-arena-off (experimental P4.6): disable ORT CPU mem arena (lower RSS) */
     int webui_port;          /* local control UI port; 0 = no UI */
     bool open_browser;       /* auto-open the control UI (desktop only) */
     bsdr_pairing_cb on_pairing_code;

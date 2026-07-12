@@ -160,13 +160,16 @@ void bsdr_audio_sender_free(bsdr_audio_sender *s) {
 #define BSDR_JB_DEFAULT  2
 #define BSDR_JB_SHRINK   250    /* clean in-order frames (~5 s) before trimming one frame of delay */
 
-typedef struct { uint8_t data[1500]; int len; uint16_t seq; bool present; } bsdr_jb_slot;
+/* data holds one Opus RTP payload; a 20 ms Opus frame maxes at ~1276 B (510 kbps), so 1300 is a safe
+ * ceiling (was 1500 = MTU-sized, ~200 B/slot of waste). Oversized packets were already dropped. */
+typedef struct { uint8_t data[1300]; int len; uint16_t seq; bool present; } bsdr_jb_slot;
 
 typedef struct {
     uint32_t     ssrc;
     OpusDecoder *dec;
     uint64_t     used_at;               /* LRU */
-    bsdr_jb_slot jb[BSDR_JB_SLOTS];
+    bsdr_jb_slot *jb;                   /* [BSDR_JB_SLOTS]; allocated lazily when the stream first
+                                         * appears (a fresh recv holds none), freed on eviction/close */
     int          count;                 /* buffered (present) packets */
     uint16_t     play_seq;              /* next RTP sequence number to play out */
     bool         started;               /* playout running (prebuffer reached) */
@@ -186,6 +189,8 @@ struct bsdr_audio_recv {
     uint64_t tick;     /* monotonic counter for LRU eviction */
     volatile int duck; /* voice-activity duck: mix ONLY the loudest stream, mute the rest (owner
                         * isolation while a voice command is captured over the cloud fallback). */
+    volatile uint32_t solo_ssrc; /* if non-zero, mix ONLY this SSRC (identity solo: "listen only to
+                        * <that participant>", e.g. the room owner) — mute every other stream. */
     int cloud_trailer; /* strip the 8-byte BigSoup trailer [u32 ssrc][u32 frame_id] before decode */
     bsdr_mic_stream streams[BSDR_MIC_STREAMS];
     int16_t pcm[BSDR_OPUS_FRAME * 2];   /* one mixed 20 ms frame (interleaved) */
@@ -204,10 +209,15 @@ static bsdr_mic_stream *mic_stream_for(bsdr_audio_recv *r, uint32_t ssrc) {
     if (slot < 0) slot = lru;
     bsdr_mic_stream *st = &r->streams[slot];
     if (st->dec) opus_decoder_destroy(st->dec);
+    bsdr_jb_slot *jb = st->jb;                       /* reuse this slot's ring if it already had one */
     memset(st, 0, sizeof(*st));
+    if (!jb) jb = calloc(BSDR_JB_SLOTS, sizeof(bsdr_jb_slot));
+    else     memset(jb, 0, (size_t)BSDR_JB_SLOTS * sizeof(bsdr_jb_slot));
+    if (!jb) return NULL;
+    st->jb = jb;
     int err = 0;
     st->dec = opus_decoder_create(BSDR_AUDIO_CLOCK_HZ, r->channels, &err);
-    if (err != OPUS_OK || !st->dec) { st->dec = NULL; return NULL; }
+    if (err != OPUS_OK || !st->dec) { free(st->jb); st->jb = NULL; st->dec = NULL; return NULL; }
     st->ssrc = ssrc; st->used_at = now; st->target = BSDR_JB_DEFAULT;
     BSDR_INFO("bsdr.audio", "mic: new incoming stream SSRC=%u (slot %d)", ssrc, slot);
     return st;
@@ -330,7 +340,10 @@ int bsdr_audio_recv_playout(bsdr_audio_recv *r) {
             int64_t e = 0; int n = frames * r->channels;
             for (int i = 0; i < n; i++) { int v = tmp[i]; e += v < 0 ? -v : v; }
             st->energy = st->energy * 0.6f + ((float)e / (float)n) * 0.4f;
-            if (!r->duck || st == speaker) {   /* duck off: mix all; duck on: only the speaker */
+            /* solo: include only the chosen SSRC; duck: include only the loudest; else mix all. */
+            bool include = (!r->duck || st == speaker);
+            if (r->solo_ssrc && st->ssrc != r->solo_ssrc) include = false;
+            if (include) {
                 for (int i = 0; i < n; i++) mix[i] += tmp[i];
                 any = true;
             }
@@ -348,6 +361,9 @@ int bsdr_audio_recv_playout(bsdr_audio_recv *r) {
 void bsdr_audio_recv_set_duck(bsdr_audio_recv *r, int on) {
     if (r) r->duck = on ? 1 : 0;
 }
+void bsdr_audio_recv_set_solo(bsdr_audio_recv *r, uint32_t ssrc) {
+    if (r) r->solo_ssrc = ssrc;   /* 0 = mix everyone; else mix only this SSRC */
+}
 void bsdr_audio_recv_enable_cloud_trailer(bsdr_audio_recv *r) {
     if (r) r->cloud_trailer = 1;
 }
@@ -355,8 +371,10 @@ void bsdr_audio_recv_enable_cloud_trailer(bsdr_audio_recv *r) {
 void bsdr_audio_recv_free(bsdr_audio_recv *r) {
     if (!r) return;
     if (!r->plain) { srtp_dealloc(r->srtp); bsdr_srtp_global_shutdown(); }
-    for (int i = 0; i < BSDR_MIC_STREAMS; i++)
+    for (int i = 0; i < BSDR_MIC_STREAMS; i++) {
         if (r->streams[i].dec) opus_decoder_destroy(r->streams[i].dec);
+        free(r->streams[i].jb);
+    }
     free(r);
 }
 
@@ -427,6 +445,7 @@ struct bsdr_audio_player {
     int16_t *ring;       /* sample ring */
     size_t cap, head, tail, count;
     bsdr_mutex *lock;
+    bsdr_cond *have_data;   /* signalled by _push; player sleeps on it when empty */
     bsdr_thread *thread;
     volatile int stop;
 };
@@ -438,6 +457,12 @@ static void player_thread(void *arg) {
     while (!p->stop) {
         int got = 0;
         bsdr_mutex_lock(p->lock);
+        /* Block until a push signals data (or stop). No busy-poll on silence:
+         * the owner-mic sniffer starts a player before any voice is captured,
+         * so this thread would otherwise spin at 200Hz for the whole session.
+         * Bounded wait keeps a stuck-signal from ever wedging shutdown. */
+        while (p->count == 0 && !p->stop)
+            bsdr_cond_wait_ms(p->have_data, p->lock, 200);
         while (got < frame_samples && p->count > 0) {
             chunk[got++] = p->ring[p->tail];
             p->tail = (p->tail + 1) % p->cap;
@@ -445,7 +470,6 @@ static void player_thread(void *arg) {
         }
         bsdr_mutex_unlock(p->lock);
         if (got >= p->channels) bsdr_pa_write(p->pa, chunk, got / p->channels);
-        else bsdr_sleep_ms(5);
     }
 }
 
@@ -455,9 +479,10 @@ bsdr_audio_player *bsdr_audio_player_new(const char *sink, int channels) {
     p->pa = bsdr_pa_play_open(sink, channels);
     if (!p->pa) { free(p); return NULL; }
     p->channels = channels;
-    p->cap = (size_t)BSDR_AUDIO_CLOCK_HZ * channels;   /* ~1 s */
+    p->cap = (size_t)(BSDR_AUDIO_CLOCK_HZ / 4) * channels;   /* ~250 ms (overflow drops oldest; 1 s was overkill) */
     p->ring = calloc(p->cap, sizeof(int16_t));
     p->lock = bsdr_mutex_new();
+    p->have_data = bsdr_cond_new();
     p->thread = bsdr_thread_start(player_thread, p);
     return p;
 }
@@ -472,14 +497,19 @@ void bsdr_audio_player_push(bsdr_audio_player *p, const int16_t *pcm, int frames
         p->ring[p->head] = pcm[i];
         p->head = (p->head + 1) % p->cap; p->count++;
     }
+    bsdr_cond_signal(p->have_data);   /* wake the player if it was sleeping */
     bsdr_mutex_unlock(p->lock);
 }
 
 void bsdr_audio_player_free(bsdr_audio_player *p) {
     if (!p) return;
+    bsdr_mutex_lock(p->lock);
     p->stop = 1;
+    bsdr_cond_signal(p->have_data);   /* unblock the player so it can exit */
+    bsdr_mutex_unlock(p->lock);
     if (p->thread) bsdr_thread_join(p->thread);
     bsdr_pa_close(p->pa);
+    bsdr_cond_free(p->have_data);
     bsdr_mutex_free(p->lock);
     free(p->ring);
     free(p);

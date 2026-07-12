@@ -61,6 +61,9 @@ bool bsdr_sctp_associated(bsdr_sctp *s);
 bool bsdr_sctp_failed(bsdr_sctp *s);
 /* Send a binary DataChannel message (PPID 53). */
 int bsdr_sctp_send(bsdr_sctp *s, const uint8_t *data, size_t len);
+/* Send a room broadcast message on SCTP stream 1 (BigData::Broadcast), PPID 53, WITHOUT DCEP —
+ * the bot's avatar/pose FlatBuffer for the room data plane. Matches bsandroid bsa_media_send_data. */
+int bsdr_sctp_send_room(bsdr_sctp *s, const uint8_t *data, size_t len);
 
 void bsdr_sctp_free(bsdr_sctp *s);
 

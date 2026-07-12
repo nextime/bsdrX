@@ -24,4 +24,11 @@
 /* on != 0 -> blank the physical display(s); on == 0 -> restore. Safe to call repeatedly. */
 void bsdr_screen_blank(int on);
 
+/* Recover a monitor left blanked by a PREVIOUS run that died without restoring (crash / SIGKILL /
+ * power loss). Call once at startup. Only the PERSISTENT backends need it — X11 xrandr and the
+ * Windows/macOS gamma ramps outlive the process; the Wayland wlr-gamma-control path auto-restores when
+ * the client disconnects, so it is deliberately skipped here (touching it would only override the
+ * compositor's night-light for our whole run). No-op where unavailable. */
+void bsdr_screen_blank_reset(void);
+
 #endif /* BSDR_SCREENBLANK_H */

@@ -54,7 +54,8 @@ const bsdr_model_info *bsdr_model_for_tier(int tier) {
 }
 
 /* ---- cache dir + fs helpers ------------------------------------------------------------------ */
-int bsdr_model_dir(char *out, size_t cap) {
+/* Build the model cache path WITHOUT creating it (safe to call on a read/status path). */
+int bsdr_model_dir_ro(char *out, size_t cap) {
     const char *ov = getenv("BSDR_MODEL_DIR");     /* --threed-model-dir sets this */
     if (ov && *ov) { snprintf(out, cap, "%s", ov); }
 #if defined(_WIN32)
@@ -69,6 +70,11 @@ int bsdr_model_dir(char *out, size_t cap) {
            if (x && *x) snprintf(out, cap, "%s/bsdrX/models", x);
            else { const char *h = getenv("HOME"); snprintf(out, cap, "%s/.cache/bsdrX/models", h ? h : "."); } }
 #endif
+    return 0;
+}
+
+int bsdr_model_dir(char *out, size_t cap) {
+    bsdr_model_dir_ro(out, cap);
     /* mkdir -p */
     char tmp[1024]; snprintf(tmp, sizeof tmp, "%s", out);
     for (char *p = tmp + 1; *p; p++) {
@@ -239,8 +245,14 @@ int bsdr_faceswap_model_dir(char *out, size_t cap) {
     MKDIR(out);
     return 0;
 }
+/* Path only, no mkdir — for presence checks / status polls. */
+int bsdr_faceswap_model_dir_ro(char *out, size_t cap) {
+    char base[768]; bsdr_model_dir_ro(base, sizeof base);
+    snprintf(out, cap, "%s%cfaceswap", base, PATHSEP);
+    return 0;
+}
 int bsdr_faceswap_file_present(const char *filename) {
-    char dir[900], path[1200]; bsdr_faceswap_model_dir(dir, sizeof dir);
+    char dir[900], path[1200]; bsdr_faceswap_model_dir_ro(dir, sizeof dir);   /* read: never mkdir */
     snprintf(path, sizeof path, "%s%c%s", dir, PATHSEP, filename);
     return file_exists(path);
 }

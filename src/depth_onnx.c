@@ -24,6 +24,10 @@ const char *bsdr_depth_tier_name(bsdr_depth_tier t) {
                  case BSDR_DEPTH_HI: return "hi"; default: return "auto"; }
 }
 
+/* --ort-arena-off (P4.6): disable ORT's CPU mem arena on depth+faceswap. Defined here (a core lib
+ * file, always compiled) so agent.c and faceswap.c can extern it; set from the CLI at startup. */
+int bsdr_ort_arena_off = 0;
+
 #ifdef BSDR_HAVE_ONNX
 #include "onnxruntime_c_api.h"
 #ifdef _WIN32
@@ -170,7 +174,17 @@ bsdr_depth *bsdr_depth_open(bsdr_depth_tier tier) {
     OrtAllocator *alloc = NULL;
     if (ort_bad(ort, ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "bsdr", &d->env), "CreateEnv")) goto fail;
     if (ort_bad(ort, ort->CreateSessionOptions(&d->opts), "CreateSessionOptions")) goto fail;
-    ort_drop(ort, ort->SetIntraOpNumThreads(d->opts, 0));   /* 0 = let ORT pick */
+    /* Depth infers only every 3rd frame, so the ORT thread pool sits idle most of the time. Stop the
+     * workers spin-waiting between Runs (pins cores for nothing) and keep the graph sequential; cap
+     * intra-op threads so a many-core host doesn't oversubscribe on this small model. allow_spinning=0
+     * trades a few us of wake latency for a large idle-CPU saving — invisible at a 3-frame cadence. */
+    ort_drop(ort, ort->AddSessionConfigEntry(d->opts, "session.intra_op.allow_spinning", "0"));
+    ort_drop(ort, ort->AddSessionConfigEntry(d->opts, "session.inter_op.allow_spinning", "0"));
+    ort_drop(ort, ort->SetSessionExecutionMode(d->opts, ORT_SEQUENTIAL));
+    ort_drop(ort, ort->SetInterOpNumThreads(d->opts, 1));
+    ort_drop(ort, ort->SetIntraOpNumThreads(d->opts, 4));   /* cap (was 0 = all cores) */
+    if (bsdr_ort_arena_off)                                  /* --ort-arena-off: free the idle arena's dead RAM */
+        ort_drop(ort, ort->DisableCpuMemArena(d->opts));
     ort_drop(ort, ort->SetSessionGraphOptimizationLevel(d->opts, ORT_ENABLE_ALL));
     select_ep(d, tier);
     /* ORT's model path is ORTCHAR_T*: wchar_t on Windows, char on POSIX. Convert the UTF-8 path. */

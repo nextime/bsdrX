@@ -32,9 +32,11 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <time.h>
+#include <errno.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_sig(int s) { (void)s; g_stop = 1; }
@@ -57,7 +59,18 @@ static int  g_sub = 0;                 /* substitute mode active */
 static int  g_drop = 0;                /* the FORWARD DROP rule is installed */
 static char g_quest[64], g_cloud[64];  /* the flow currently dropped */
 static int  g_cport = 0;
-static int  g_cloud_fd = -1;           /* UDP socket to the cloud (stable source for mediasoup) */
+static int  g_cloud_fd = -1;           /* UDP socket to the cloud (legacy 'A' path only) */
+static int  g_raw_fd = -1;             /* IP_HDRINCL raw socket: inject the modified datagram with
+                                        * src=Quest so it reuses the Quest's NAT/conntrack flow (the
+                                        * only source mediasoup's comedia latch keeps accepting) */
+
+static void raw_open(void) {
+    if (g_raw_fd >= 0) return;
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);   /* IPPROTO_RAW => IP_HDRINCL on */
+    if (fd < 0) { fprintf(stderr, "bsdr_micrelay: raw socket failed (need root): %s\n", strerror(errno)); return; }
+    int one = 1; (void)setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof one);
+    g_raw_fd = fd;
+}
 
 static void drop_del(void) {
     if (!g_drop) return;
@@ -160,12 +173,21 @@ int main(int argc, char **argv) {
                 if (mode == 1) {
                     if (!g_sub || g_cloud_fd < 0 || strcmp(g_cloud, cs) != 0 || g_cport != port)
                         cloud_reopen(cloud_be, port);
+                    raw_open();                     /* for the 'F' (full-datagram) inject path */
                     drop_add(quest, cs, port);
                     g_sub = 1; last_ctrl = now_ms();
                 } else {
                     if (g_sub) { drop_del(); g_sub = 0; fprintf(stderr, "bsdr_micrelay: substitute OFF\n"); }
                 }
-            } else if (m[4] == 'A' && g_sub && g_cloud_fd >= 0) {   /* modified RTP -> cloud */
+            } else if (m[4] == 'F' && g_sub && g_raw_fd >= 0 && r > 5 + 20) {
+                /* Full modified IPv4 datagram (src=Quest, dst=cloud). RAW-inject it: the kernel keeps our
+                 * source and conntrack/masquerade re-uses the Quest flow's NAT mapping, so the cloud sees
+                 * the same source tuple as the original -> comedia accepts it (no mute). */
+                const uint8_t *dg = m + 5; int dglen = (int)(r - 5);
+                struct sockaddr_in dst; memset(&dst, 0, sizeof dst);
+                dst.sin_family = AF_INET; memcpy(&dst.sin_addr.s_addr, dg + 16, 4);  /* dst IP from header */
+                if (sendto(g_raw_fd, dg, (size_t)dglen, 0, (struct sockaddr *)&dst, sizeof dst) > 0) subbed++;
+            } else if (m[4] == 'A' && g_sub && g_cloud_fd >= 0) {   /* legacy: modified RTP -> UDP socket */
                 if (send(g_cloud_fd, m + 5, (size_t)(r - 5), 0) > 0) subbed++;
             }
         }
@@ -174,6 +196,7 @@ int main(int argc, char **argv) {
     }
     drop_del();
     if (g_cloud_fd >= 0) close(g_cloud_fd);
+    if (g_raw_fd >= 0) close(g_raw_fd);
     mc_cap_close(cap);
     close(fd);
     fprintf(stderr, "bsdr_micrelay: stopped (%lu forwarded, %lu substituted)\n", fwd, subbed);

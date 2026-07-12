@@ -1,0 +1,240 @@
+// Bigscreen VR — room / avatar network state schema
+// Reconstructed from IL2CPP dump.cs (Steam build), namespace Bigscreen.Flatbuffer.
+// Source: scratchpad/steamdump/dump.cs lines ~599693–601038 (plus Vec3/Vec4 @490568).
+// Primary source of truth = the static Create<Name>(FlatBufferBuilder, ...) signatures,
+// which give exact field NAME / TYPE / ORDER. Getters confirm types.
+//
+// flatcc is little-endian; FlatBuffers wire format is always little-endian -> matches, no swaps.
+//
+// IL2CPP "private Struct __p" => FlatBuffers STRUCT (inline, fixed layout) -> `struct` below.
+// IL2CPP "private Table  __p" => FlatBuffers TABLE  (vtable, optional fields) -> `table` below.
+//
+// Field default values (= 0, = False in the dump) are the table defaults; emitted here where known.
+// Items marked UNCERTAIN could not be fully confirmed and should be validated against live captures.
+
+namespace Bigscreen.Flatbuffer;
+
+// ---------------------------------------------------------------------------
+// Math primitives (FlatBuffers structs — fixed inline layout)
+// ---------------------------------------------------------------------------
+
+// Vector3 @599693 / CreateVector3(X,Y,Z)
+struct Vector3 { x:float; y:float; z:float; }
+
+// Quaternion @599729 / CreateQuaternion(X,Y,Z,W)
+struct Quaternion { x:float; y:float; z:float; w:float; }
+
+// Vector2 @600332 / CreateVector2(X,Y)
+struct Vector2 { x:float; y:float; }
+
+// ColorRGBA @600128 / CreateColorRGBA(X,Y,Z,A) — bytes (ubyte)
+struct ColorRGBA { x:ubyte; y:ubyte; z:ubyte; a:ubyte; }
+
+// SyncedAppearance @600296 / CreateSyncedAppearance(PrimaryColor, SecondaryColor, Style)
+// NOTE: declared as a Struct in IL2CPP, all int fields, no defaults.
+struct SyncedAppearance { primary_color:int; secondary_color:int; style:int; }
+
+// PoseState @599769 — STRUCT composed of Vector3 Pos + Quaternion Rot.
+// CreatePoseState(pos_X,pos_Y,pos_Z, rot_X,rot_Y,rot_Z,rot_W)  => position + quaternion.
+// This is THE transform primitive used for head/hands/monitors/props.
+struct PoseState { pos:Vector3; rot:Quaternion; }
+
+// Older duplicate math primitives (TypeDefIndex 10886/10887, global namespace, no Bigscreen ns).
+// Kept for inventory completeness; the *_State tables above use Vector3/Quaternion, not these.
+// struct Vec3 { x:float; y:float; z:float; }            // @490568
+// struct Vec4 { x:float; y:float; z:float; w:float; }   // @490604
+
+// ---------------------------------------------------------------------------
+// Avatar / accessory customization (reliable state)
+// ---------------------------------------------------------------------------
+
+// AccessoryState @600706 / CreateAccessoryState(currentAnchorPointType, currentAnchorPointIndex,
+//                                                accessoryId, customizationType)
+table AccessoryState {
+  current_anchor_point_type:int  = 0;
+  current_anchor_point_index:int = 0;
+  accessory_id:int               = 0;
+  customization_type:int         = 0;
+}
+
+// AvatarState @600770 / CreateAvatarState(eyeIndex, mouthIndex, hairIndex, skinToneIndex,
+//   primaryColorIndex, secondaryColorIndex, eyebrowsIndex, torsoIndex, bodyTypeIndex,
+//   eyeColorIndex, beardIndex, hairColorIndex, hatPrimaryColorIndex, hatSecondaryColorIndex,
+//   glassesColorIndex, accessoryStates[])
+table AvatarState {
+  eye_index:int                 = 0;
+  mouth_index:int               = 0;
+  hair_index:int                = 0;
+  skin_tone_index:int           = 0;
+  primary_color_index:int       = 0;
+  secondary_color_index:int     = 0;
+  eyebrows_index:int            = 0;
+  torso_index:int               = 0;
+  body_type_index:int           = 0;
+  eye_color_index:int           = 0;
+  beard_index:int               = 0;
+  hair_color_index:int          = 0;
+  hat_primary_color_index:int   = 0;
+  hat_secondary_color_index:int = 0;
+  glasses_color_index:int       = 0;
+  accessory_states:[AccessoryState];
+}
+
+// ---------------------------------------------------------------------------
+// *** ROOT (reliable channel): per-user identity + seat + avatar ***
+// UserState @600930 / CreateUserState(userId, areaIndex, seatIndex, hmd, secondsInRoom,
+//                                     avatar, wearingHMD, showingHead, usingMicTool)
+// Has GetRootAsUserState + FinishUserStateBuffer => sent standalone as a root buffer.
+// ---------------------------------------------------------------------------
+table UserState {
+  user_id:string;             // session/user id key (READ to identify users; WRITE bot's own)
+  area_index:int     = 0;     // logical area within the room
+  seat_index:int     = 0;     // READ inviter's seat; WRITE bot's chosen seat
+  hmd:int            = 0;     // HMD/device type enum (UNCERTAIN enum values)
+  seconds_in_room:float = 0;
+  avatar:AvatarState;         // customization (bot can send a minimal/default one)
+  wearing_hmd:bool   = false;
+  showing_head:bool  = false;
+  using_mic_tool:bool = false;
+}
+
+// ---------------------------------------------------------------------------
+// Hand + tick transform (unreliable / high-frequency channel)
+// ---------------------------------------------------------------------------
+
+// HandState @600364 / no all-args Create (built via Start/Add/End). Field order from getters:
+//   ShowingHand(bool), Type(int), Handedness(int), LaserActive(bool), LaserLength(float),
+//   Pose(PoseState), ShowingPointingDevice(bool), Poses(int), ShowHandUI(bool),
+//   MarkerId(int), MarkerDrawing(bool)
+table HandState {
+  showing_hand:bool          = false;
+  type:int                   = 0;   // hand/controller type enum (UNCERTAIN)
+  handedness:int             = 0;   // 0/1 left/right (UNCERTAIN mapping)
+  laser_active:bool          = false;
+  laser_length:float         = 0;
+  pose:PoseState;                    // hand transform (position + quaternion)
+  showing_pointing_device:bool = false;
+  poses:int                  = 0;   // pose/gesture index (UNCERTAIN)
+  show_hand_ui:bool          = false;
+  marker_id:int              = 0;
+  marker_drawing:bool        = false;
+}
+
+// ---------------------------------------------------------------------------
+// *** ROOT (unreliable channel): per-tick avatar transform ***
+// TickState @600474 — built via Start/Add/End; field order from getters:
+//   MicLoudness(float), HeadPose(PoseState), LeftHand(HandState), RightHand(HandState)
+// Has GetRootAsTickState + FinishTickStateBuffer => sent standalone, ~every frame/tick.
+// This is the buffer the bot WRITES frequently to place its head + hands,
+// and READS to track the inviter's live head position.
+// ---------------------------------------------------------------------------
+table TickState {
+  mic_loudness:float = 0;   // voice activity / speaking level (READ to detect speaking)
+  head_pose:PoseState;      // head transform (position + quaternion) — WRITE/READ
+  left_hand:HandState;
+  right_hand:HandState;
+}
+
+// ===========================================================================
+// Other room-content state tables (inventory completeness; not required by the
+// avatar/seat bot but share the same channel family). Field orders from Create
+// signatures / getters; some marked UNCERTAIN.
+// ===========================================================================
+
+// PresenterState @599801 / CreatePresenterState(userId, format, timeStarted, aspectRatio,
+//                                               brightness, added)
+table PresenterState {
+  user_id:string;
+  format:int       = 0;
+  time_started:int = 0;
+  aspect_ratio:float = 0;
+  brightness:float   = 0;
+  added:bool         = false;
+}
+
+// MonitorState @599520 (Start/Add/End). Field order from getters:
+//   Frame, OwnerUserSessionId, ScreenId (strings), Pose(PoseState), Scale, Visible,
+//   CurveDegrees, Depth, Brightness
+table MonitorState {
+  frame:string;
+  owner_user_session_id:string;
+  screen_id:string;
+  pose:PoseState;
+  scale:float        = 0;
+  visible:bool       = false;
+  curve_degrees:int  = 0;
+  depth:float        = 0;
+  brightness:float   = 0;
+}
+
+// PaintToolsState @599640 (Start/Add/End): Pose(PoseState), Active(bool)
+table PaintToolsState {
+  pose:PoseState;
+  active:bool = false;
+}
+
+// SelfieStickState @600061 — UNCERTAIN: built via Start/Add/End, fields not fully read.
+// table SelfieStickState { /* UNCERTAIN: likely pose + active */ }
+
+// PropState @599891 — UNCERTAIN: has GuidLength etc.; not fully read (not needed by bot).
+// table PropState { /* UNCERTAIN */ }
+
+// MediaInfo @599409 / CreateMediaInfo(requestId, position, url, durationMs, mediaWidth,
+//   mediaHeight, textureWidth, textureHeight, textureId)
+table MediaInfo {
+  request_id:int   = 0;
+  position:float   = 0;
+  url:string;
+  duration_ms:uint    = 0;
+  media_width:uint    = 0;
+  media_height:uint   = 0;
+  texture_width:uint  = 0;
+  texture_height:uint = 0;
+  texture_id:int      = 0;
+}
+
+// TrackInfo @600541 / CreateTrackInfo(id, format, kind, isActive, label, language)
+table TrackInfo {
+  id:int        = 0;
+  format:int    = 0;
+  kind:int      = 0;
+  is_active:bool = false;
+  label:string;
+  language:string;
+}
+
+// TrackInfoList @600631 / CreateTrackInfoList(count, activeTrackId, tracks[])
+table TrackInfoList {
+  count:int           = 0;
+  active_track_id:int = 0;
+  tracks:[TrackInfo];
+}
+
+// SubtitleCue @600168 (Start/Add/End): Id, Kind, StartTime, Duration, FontUnitType(int),
+//   FontColor(ColorRGBA), BackgroundColor(ColorRGBA), ShowBackgroundAlways(bool),
+//   FontStyle(int), IsBold(bool), Lines([string])
+table SubtitleCue {
+  id:int            = 0;
+  kind:int          = 0;
+  start_time:int    = 0;
+  duration:int      = 0;
+  font_unit_type:int = 0;
+  font_color:ColorRGBA;
+  background_color:ColorRGBA;
+  show_background_always:bool = false;
+  font_style:int    = 0;
+  is_bold:bool      = false;
+  lines:[string];
+}
+
+// Mini-game / room-object state (not avatar-related; kept for completeness):
+// LightswitchState @599360  / CreateLightswitchState(intensity:float)
+// DartboardState   @599277  / CreateDartboardState(boardID, playerID, points1, points2, isLateSync)
+// BowlingLaneState @599122  / CreateBowlingLaneState(laneID, players[PlayerPoints], isLateSync)
+// PlayerPoints     @599048  / CreatePlayerPoints(playerName, throws[])
+// CreatedPropList  @599203  / CreateCreatedPropList(propStates[], propName)
+
+// root_type is per-message; the bot uses two roots on the data channel:
+//   reliable   -> UserState   (seat/avatar/identity)
+//   unreliable -> TickState   (head+hands pose, frequent)
+root_type TickState;

@@ -24,6 +24,14 @@
 #ifdef __ANDROID__
 #  include <dlfcn.h>
 #endif
+#if !defined(_WIN32)
+#  include <fcntl.h>
+#  include <unistd.h>
+#  include <sys/mman.h>
+#  include <sys/stat.h>
+#endif
+
+extern int bsdr_ort_arena_off;   /* --ort-arena-off (defined in agent.c) */
 
 /* arcface 5-point destination template (for a 112x112 aligned face). */
 static const float ARCFACE_DST[5][2] = {
@@ -52,6 +60,20 @@ struct bsdr_faceswap {
     int   have_source;
     char  status[128];
     const char *ep;
+    /* Per-frame scratch, hoisted out of the hot path (fixed sizes; single capture thread). Allocated
+     * once in _open. lb is the 640x640 letterbox; lb_nw/lb_nh track the written region so we only
+     * re-zero the pad when the input geometry changes (a capture reopen at a new resolution). */
+    uint8_t *lb;                      /* DET_SIZE*DET_SIZE*3 */
+    int      lb_nw, lb_nh;
+    float   *det_blob;                /* 3*DET_SIZE*DET_SIZE */
+    float   *embed_blob;              /* 3*112*112 */
+    float   *swap_blob;               /* 3*128*128 */
+    /* P4.5 (opt-in): run SCRFD detection only every detect_every frames (>=2), reusing the last
+     * boxes/keypoints in between; the swap still runs every frame. 0/1 = detect every frame. */
+    int      detect_every;
+    unsigned proc_frames;
+    face_t   cached_faces[MAX_FACES];
+    int      cached_n;
 };
 
 /* ---- ORT status helpers ---- */
@@ -174,15 +196,17 @@ static int detect(bsdr_faceswap *fs, const uint8_t *rgb, int w, int h, face_t *f
     /* letterbox to 640x640 (scale keeps aspect, pad bottom/right) */
     float scale = fminf((float)DET_SIZE/w,(float)DET_SIZE/h);
     int nw=(int)(w*scale), nh=(int)(h*scale);
-    uint8_t *lb=calloc((size_t)DET_SIZE*DET_SIZE*3,1);
-    if (!lb) return 0;
+    uint8_t *lb = fs->lb;                       /* hoisted; pad stays zero across frames */
+    if (nw!=fs->lb_nw || nh!=fs->lb_nh) {       /* geometry changed -> re-zero the (new) pad */
+        memset(lb, 0, (size_t)DET_SIZE*DET_SIZE*3);
+        fs->lb_nw=nw; fs->lb_nh=nh;
+    }
     for (int y=0;y<nh;y++) for (int x=0;x<nw;x++){
         float px[3]; rgb_bilinear(rgb,w,h,x/scale,y/scale,px);
         uint8_t *d=lb+((size_t)y*DET_SIZE+x)*3; d[0]=(uint8_t)px[0]; d[1]=(uint8_t)px[1]; d[2]=(uint8_t)px[2];
     }
-    float *blob=malloc((size_t)3*DET_SIZE*DET_SIZE*sizeof(float));
+    float *blob=fs->det_blob;
     to_blob(lb,DET_SIZE,127.5f,128.0f,blob);   /* SCRFD: RGB, (x-127.5)/128, NCHW */
-    free(lb);
     int64_t dims[4]={1,3,DET_SIZE,DET_SIZE};
     OrtValue *in=mk_input(fs,blob,dims,4);
     OrtValue *outs[9]={0};
@@ -221,7 +245,6 @@ static int detect(bsdr_faceswap *fs, const uint8_t *rgb, int w, int h, face_t *f
     }
     for (int i=0;i<9;i++) if (outs[i]) o->ReleaseValue(outs[i]);
     if (in) o->ReleaseValue(in);
-    free(blob);
     /* NMS (greedy by score) */
     for (int i=0;i<nf;i++) for (int j=i+1;j<nf;j++) if (faces[j].score>faces[i].score){ face_t t=faces[i]; faces[i]=faces[j]; faces[j]=t; }
     int keep=0; int used[MAX_FACES]={0};
@@ -245,7 +268,7 @@ static void align_face(const uint8_t *rgb, int w, int h, const face_t *f, int si
 /* ArcFace embedding of an aligned 112 face -> normalized 512. */
 static int embed(bsdr_faceswap *fs, const uint8_t *aligned112, float out512[512]) {
     const OrtApi *o=fs->ort;
-    float *blob=malloc(3*112*112*sizeof(float));
+    float *blob=fs->embed_blob;
     to_blob(aligned112,112,127.5f,127.5f,blob);
     int64_t dims[4]={1,3,112,112}; OrtValue *in=mk_input(fs,blob,dims,4); OrtValue *ov=NULL;
     int rc=-1;
@@ -258,7 +281,6 @@ static int embed(bsdr_faceswap *fs, const uint8_t *aligned112, float out512[512]
     }
     if (ov) o->ReleaseValue(ov);
     if (in) o->ReleaseValue(in);
-    free(blob);
     return rc;
 }
 
@@ -291,26 +313,50 @@ static void paste_back(uint8_t *rgb, int w, int h, const float *fake /*3x128x128
 /* Load the 512x512 inswapper projection ("buff2fs") from the .onnx protobuf. It's stored as the
  * initializer's packed float_data (TensorProto field 4, wire type 2 → tag 0x22) of exactly
  * 512*512*4 bytes, immediately followed by the name field (0x42 len 7 "buff2fs"). Scan for that. */
-static int load_emap(const char *path, float *emap) {
-    FILE *f=fopen(path,"rb"); if(!f) return -1;
-    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
-    if (sz<=0){ fclose(f); return -1; }
-    uint8_t *buf=malloc((size_t)sz); if(!buf){fclose(f);return -1;}
-    if (fread(buf,1,(size_t)sz,f)!=(size_t)sz){ free(buf); fclose(f); return -1; }
-    fclose(f);
+/* Scan a mapped protobuf blob for the packed "buff2fs" float_data (512*512*4 B). buf/sz describe the
+ * whole .onnx file. Reads only (bounded); no allocation. */
+static int scan_emap(const uint8_t *buf, long sz, float *emap) {
     const size_t need=(size_t)512*512*4;
-    int rc=-1;
-    for (long j=0;j+5<sz && rc!=0;j++){
+    for (long j=0;j+5<sz;j++){
         if (buf[j]!=0x22) continue;                 /* field 4 (float_data), wire type 2 (packed) */
         size_t len=0; int shift=0; long k=j+1;
         while (k<sz){ uint8_t b=buf[k++]; len|=(size_t)(b&0x7f)<<shift; if(!(b&0x80))break; shift+=7; if(shift>35){len=0;break;} }
         if (len!=need || k+(long)need>sz) continue;
         /* verify the "buff2fs" name follows this blob (disambiguates from any other 1 MB float array) */
         long after=k+(long)need;
-        if (after+9<=sz && memcmp(buf+after,"\x42\x07""buff2fs",9)==0) { memcpy(emap,buf+k,need); rc=0; }
+        if (after+9<=sz && memcmp(buf+after,"\x42\x07""buff2fs",9)==0) { memcpy(emap,buf+k,need); return 0; }
     }
-    free(buf);
+    return -1;
+}
+
+/* mmap the ~530 MB inswapper_128.onnx read-only and scan the mapping in place, instead of reading the
+ * whole file into a heap buffer (which spikes RSS by ~530 MB every time faceswap is enabled). The
+ * mapped pages are reclaimable and shared with the file cache. */
+static int load_emap(const char *path, float *emap) {
+#if defined(_WIN32)
+    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh==INVALID_HANDLE_VALUE) return -1;
+    LARGE_INTEGER li;
+    if (!GetFileSizeEx(fh,&li) || li.QuadPart<=0) { CloseHandle(fh); return -1; }
+    HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mh) { CloseHandle(fh); return -1; }
+    const uint8_t *buf = (const uint8_t *)MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+    int rc = buf ? scan_emap(buf, (long)li.QuadPart, emap) : -1;
+    if (buf) UnmapViewOfFile(buf);
+    CloseHandle(mh); CloseHandle(fh);
     return rc;
+#else
+    int fd=open(path,O_RDONLY); if(fd<0) return -1;
+    struct stat st;
+    if (fstat(fd,&st)!=0 || st.st_size<=0) { close(fd); return -1; }
+    size_t sz=(size_t)st.st_size;
+    const uint8_t *buf=mmap(NULL,sz,PROT_READ,MAP_PRIVATE,fd,0);
+    close(fd);                                      /* the mapping keeps its own ref */
+    if (buf==MAP_FAILED) return -1;
+    int rc=scan_emap(buf,(long)sz,emap);
+    munmap((void*)buf,sz);
+    return rc;
+#endif
 }
 
 /* ---- EP selection (mirrors depth_onnx) ---- */
@@ -360,6 +406,17 @@ bsdr_faceswap *bsdr_faceswap_open(const char *model_dir, int use_gpu) {
     OrtAllocator *al=NULL;
     if (ob(o,o->CreateEnv(ORT_LOGGING_LEVEL_WARNING,"bsdrfs",&fs->env),"CreateEnv")) goto fail;
     if (ob(o,o->CreateSessionOptions(&fs->opts),"opts")) goto fail;
+    /* These options are shared by all three faceswap sessions (det/embed/swap). Stop the ORT thread
+     * pool spin-waiting between Runs (it idles between frames), keep the graph sequential, and cap
+     * intra-op threads so a many-core host doesn't oversubscribe across the three per-frame Runs.
+     * allow_spinning=0 is latency-neutral in practice (a few us wake cost). */
+    od(o,o->AddSessionConfigEntry(fs->opts,"session.intra_op.allow_spinning","0"));
+    od(o,o->AddSessionConfigEntry(fs->opts,"session.inter_op.allow_spinning","0"));
+    od(o,o->SetSessionExecutionMode(fs->opts,ORT_SEQUENTIAL));
+    od(o,o->SetInterOpNumThreads(fs->opts,1));
+    od(o,o->SetIntraOpNumThreads(fs->opts,4));   /* cap (was ORT default = all cores) */
+    if (bsdr_ort_arena_off)                       /* --ort-arena-off: free the idle arena's dead RAM */
+        od(o,o->DisableCpuMemArena(fs->opts));
     od(o,o->SetSessionGraphOptimizationLevel(fs->opts,ORT_ENABLE_ALL));
     select_ep(fs,use_gpu);
     fs->det=open_sess(fs,model_dir,"det_10g.onnx");
@@ -379,6 +436,16 @@ bsdr_faceswap *bsdr_faceswap_open(const char *model_dir, int use_gpu) {
     { char emp[1024]; snprintf(emp,sizeof emp,"%s/inswapper_128.onnx",model_dir);
       fs->have_emap = (load_emap(emp,fs->emap)==0);
       if (!fs->have_emap) BSDR_WARN("bsdr.faceswap","could not extract emap from inswapper — swaps disabled"); }
+    /* Hoist the per-frame scratch (fixed sizes). lb starts fully zeroed; detect() re-zeroes only when
+     * the input geometry changes (lb_nw/lb_nh sentinel = -1 forces the first zero). */
+    fs->lb         = calloc((size_t)DET_SIZE*DET_SIZE*3, 1);
+    fs->det_blob   = malloc((size_t)3*DET_SIZE*DET_SIZE*sizeof(float));
+    fs->embed_blob = malloc((size_t)3*112*112*sizeof(float));
+    fs->swap_blob  = malloc((size_t)3*128*128*sizeof(float));
+    if (!fs->lb || !fs->det_blob || !fs->embed_blob || !fs->swap_blob) {
+        BSDR_WARN("bsdr.faceswap","scratch alloc failed"); goto fail;
+    }
+    fs->lb_nw = fs->lb_nh = -1;
     snprintf(fs->status,sizeof fs->status,"faceswap (%s)%s",fs->ep,fs->have_emap?"":" [no-emap]");
     BSDR_INFO("bsdr.faceswap","loaded det/rec/swap from %s (%s)",model_dir,fs->ep);
     return fs;
@@ -406,18 +473,33 @@ int bsdr_faceswap_set_source_rgb(bsdr_faceswap *fs, const uint8_t *rgb, int w, i
 }
 
 int bsdr_faceswap_ready(const bsdr_faceswap *fs){ return fs && fs->have_source && fs->have_emap; }
+
+void bsdr_faceswap_set_detect_every(bsdr_faceswap *fs, int n){ if (fs) fs->detect_every = n; }
 const char *bsdr_faceswap_status(const bsdr_faceswap *fs){ return fs?fs->status:"unavailable"; }
 
 int bsdr_faceswap_process_rgb(bsdr_faceswap *fs, uint8_t *rgb, int w, int h) {
     if (!fs||!rgb) return -1;
     if (!fs->have_source) return 0;
     const OrtApi *o=fs->ort;
-    face_t faces[MAX_FACES]; int n=detect(fs,rgb,w,h,faces,MAX_FACES);
+    /* P4.5: on the detect-every-N cadence, reuse the last boxes/keypoints (in full-image coords, so
+     * valid at the same resolution) instead of re-detecting; the swap below still runs every frame.
+     * Always detect on frame 0 and whenever no cache exists. */
+    face_t faces[MAX_FACES]; int n;
+    int every = fs->detect_every > 1 ? fs->detect_every : 1;
+    if (every > 1 && fs->proc_frames > 0 && (fs->proc_frames % (unsigned)every) != 0 && fs->cached_n >= 0) {
+        n = fs->cached_n;
+        if (n > 0) memcpy(faces, fs->cached_faces, sizeof(face_t)*n);
+    } else {
+        n = detect(fs,rgb,w,h,faces,MAX_FACES);
+        fs->cached_n = n;
+        if (n > 0) memcpy(fs->cached_faces, faces, sizeof(face_t)*n);
+    }
+    fs->proc_frames++;
     int swapped=0;
     for (int i=0;i<n;i++){
         uint8_t al[128*128*3]; float M[6];
         align_face(rgb,w,h,&faces[i],128,al,M);
-        float *blob=malloc(3*128*128*sizeof(float));
+        float *blob=fs->swap_blob;
         int hw=128*128; for(int y=0;y<128;y++)for(int x=0;x<128;x++){ const uint8_t*p=al+((size_t)y*128+x)*3;
             blob[0*hw+y*128+x]=p[0]/255.f; blob[1*hw+y*128+x]=p[1]/255.f; blob[2*hw+y*128+x]=p[2]/255.f; }
         int64_t td[4]={1,3,128,128}, sd[2]={1,512};
@@ -431,7 +513,6 @@ int bsdr_faceswap_process_rgb(bsdr_faceswap *fs, uint8_t *rgb, int w, int h) {
         if (ov) o->ReleaseValue(ov);
         if (tv) o->ReleaseValue(tv);
         if (sv) o->ReleaseValue(sv);
-        free(blob);
     }
     return swapped;
 }
@@ -447,6 +528,7 @@ void bsdr_faceswap_close(bsdr_faceswap *fs) {
         if (fs->opts) o->ReleaseSessionOptions(fs->opts);
         if (fs->env) o->ReleaseEnv(fs->env);
     }
+    free(fs->lb); free(fs->det_blob); free(fs->embed_blob); free(fs->swap_blob);
     free(fs);
 }
 
@@ -455,6 +537,7 @@ bsdr_faceswap *bsdr_faceswap_open(const char *d,int g){ (void)d;(void)g; return 
 int bsdr_faceswap_set_source_rgb(bsdr_faceswap *f,const uint8_t *r,int w,int h){ (void)f;(void)r;(void)w;(void)h; return -1; }
 int bsdr_faceswap_ready(const bsdr_faceswap *f){ (void)f; return 0; }
 int bsdr_faceswap_process_rgb(bsdr_faceswap *f,uint8_t *r,int w,int h){ (void)f;(void)r;(void)w;(void)h; return -1; }
+void bsdr_faceswap_set_detect_every(bsdr_faceswap *f,int n){ (void)f;(void)n; }
 const char *bsdr_faceswap_status(const bsdr_faceswap *f){ (void)f; return "unavailable (no ONNX)"; }
 void bsdr_faceswap_close(bsdr_faceswap *f){ (void)f; }
 #endif

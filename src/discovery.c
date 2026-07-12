@@ -74,7 +74,12 @@ static void discovery_loop(void *arg) {
         struct sockaddr_in from;
         int n = bsdr_udp_recvfrom(d->sock, in, sizeof(in), &from);
         if (n < 0) {
-            if (d->running) bsdr_sleep_ms(50);
+            /* No packet ready. Sleep on the socket (up to 300ms) instead of a
+             * 20Hz busy-poll: the Quest re-broadcasts every ~5s so the added
+             * latency is invisible, and the timeout still lets us observe
+             * running=0 promptly. Socket stays non-blocking so recvfrom drains
+             * any backlog before we wait again. */
+            if (d->running) bsdr_socket_wait_readable(d->sock, 300);
             continue;
         }
         if (!bsdr_check_message_header(in, (size_t)n)) {

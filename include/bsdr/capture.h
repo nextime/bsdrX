@@ -37,10 +37,19 @@ typedef struct {
     int cpu_only;          /* --cpu: force CPU scale/convert (no CUDA filter graph) */
     int use_vaapi;         /* --vaapi: encode on the iGPU via VAAPI (frees the dGPU; AMD = radeonsi) */
     int use_kmsgrab;       /* --kmsgrab: capture via DRM/KMS instead of x11grab (zero-copy w/ --vaapi) */
+    int enc_level;         /* encoder effort: 0 = quality (nvenc p7 + 2-pass / x264 veryfast),
+                            * 1 = balanced (nvenc p6 + 1-pass / x264 faster),
+                            * 2 = performance (nvenc p4 + 1-pass / x264 superfast). Lower GPU/CPU as it
+                            * rises, at some quality cost. (was the old enc_perf bool.) */
+    int enc_x264_threads;  /* opt-in (P6.9): >1 = N x264 FRAME threads on the live --cpu path (kept to
+                            * one NAL/frame via slices=1); adds ~(N-1) frames latency. 0/1 = single. */
     /* Wayland: desktop capture backend selection (Linux). Default autodetect = try X11 (x11grab)
      * first, fall back to the xdg-desktop-portal + PipeWire path on a Wayland session. */
     int force_x11;         /* --x11: never use the Wayland portal (x11grab/kmsgrab only) */
     int force_pipewire;    /* --wayland / --pipewire: always use the portal + PipeWire path */
+    int pw_dmabuf;         /* --pw-dmabuf (EXPERIMENTAL): negotiate dmabuf from PipeWire and import it
+                            * zero-copy into VAAPI (needs --vaapi). Falls back to the CPU MAP_BUFFERS
+                            * path if dmabuf negotiation or VAAPI import fails. Off by default. */
     const char *input_file;/* non-NULL: decode this file instead of grabbing the screen (re-encodes
                             * so an overlay can be composited). Forces the CPU scale path. */
     int loop;              /* file mode: seek back to 0 at EOF */

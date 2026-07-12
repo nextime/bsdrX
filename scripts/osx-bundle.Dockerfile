@@ -33,6 +33,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       clang lld libc6-dev gcc nasm flex bison \
     && rm -rf /var/lib/apt/lists/*
 
+# rcodesign (apple-codesign) — an ad-hoc Mach-O code-signer that runs on Linux. strip invalidates the
+# linker's ad-hoc signature on the arm64 slice, and Apple Silicon refuses to exec an arm64 binary with an
+# invalid/absent signature, so build-osx-bundle.sh re-signs after lipo. Static musl build, no runtime deps.
+ARG RCODESIGN_VER=0.27.0
+RUN curl -fsSL "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${RCODESIGN_VER}/apple-codesign-${RCODESIGN_VER}-x86_64-unknown-linux-musl.tar.gz" \
+      | tar xz -C /tmp \
+    && install -m0755 "/tmp/apple-codesign-${RCODESIGN_VER}-x86_64-unknown-linux-musl/rcodesign" /usr/local/bin/rcodesign \
+    && rm -rf "/tmp/apple-codesign-${RCODESIGN_VER}-x86_64-unknown-linux-musl" \
+    && rcodesign --version
+
 # Bring in the darwin cross-toolchain + macOS SDK from the carrier image.
 COPY --from=osxcross /osxcross /osxcross
 ENV PATH=/osxcross/bin:${PATH}

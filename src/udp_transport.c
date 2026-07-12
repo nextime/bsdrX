@@ -30,6 +30,18 @@
 #  include <sys/uio.h>
 #endif
 
+void bsdr_udp_set_dscp(bsdr_udp *u, int dscp) {
+    if (!u || u->sock == BSDR_INVALID_SOCKET || dscp < 0) return;
+    int tos = (dscp & 0x3f) << 2;   /* DSCP in the top 6 bits of the TOS byte; ECN left 0 */
+    /* Linux mac80211 reads the IP DSCP to pick the WMM access category (top 3 bits -> 802.1d prio):
+     * CS4(32)->AC_VI, EF(46)->AC_VI/VO — lifting our media above best-effort background Wi-Fi traffic. */
+#if defined(_WIN32)
+    (void)setsockopt(u->sock, IPPROTO_IP, IP_TOS, (const char *)&tos, sizeof tos);
+#else
+    (void)setsockopt(u->sock, IPPROTO_IP, IP_TOS, &tos, sizeof tos);
+#endif
+}
+
 bool bsdr_udp_open(bsdr_udp *u, uint16_t local_port,
                    const char *remote_ip, uint16_t remote_port) {
     memset(u, 0, sizeof(*u));

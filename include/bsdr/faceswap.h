@@ -42,6 +42,11 @@ int bsdr_faceswap_process_rgb(bsdr_faceswap *fs, uint8_t *rgb, int w, int h);
 
 const char *bsdr_faceswap_status(const bsdr_faceswap *fs);
 
+/* Opt-in (P4.5): run face DETECTION only every n frames (n>=2), reusing the last boxes/keypoints in
+ * between; the swap still runs every frame. n<=1 (default) = detect every frame. ~halves faceswap
+ * CPU at the cost of slight tracking lag on fast head motion. */
+void bsdr_faceswap_set_detect_every(bsdr_faceswap *fs, int n);
+
 void bsdr_faceswap_close(bsdr_faceswap *fs);
 
 #endif /* BSDR_FACESWAP_H */

@@ -29,6 +29,7 @@
 #  include <errno.h>
 #  include <pthread.h>
 #  include <fcntl.h>
+#  include <poll.h>
 #  if defined(__linux__) && !defined(__ANDROID__)
 #    include <sys/random.h>   /* getrandom(); on Android (bionic) it's API 28+, so use /dev/urandom instead */
 #  endif
@@ -232,6 +233,60 @@ void bsdr_mutex_unlock(bsdr_mutex *m) {
 #endif
 }
 
+/* --------------------------------------------------------------- condition */
+struct bsdr_cond {
+#if defined(_WIN32)
+    CONDITION_VARIABLE cv;
+#else
+    pthread_cond_t c;
+#endif
+};
+
+bsdr_cond *bsdr_cond_new(void) {
+    struct bsdr_cond *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+#if defined(_WIN32)
+    InitializeConditionVariable(&c->cv);
+#else
+    pthread_cond_init(&c->c, NULL);
+#endif
+    return c;
+}
+void bsdr_cond_free(bsdr_cond *c) {
+    if (!c) return;
+#if !defined(_WIN32)
+    pthread_cond_destroy(&c->c);
+#endif
+    free(c);
+}
+void bsdr_cond_wait(bsdr_cond *c, bsdr_mutex *m) {
+#if defined(_WIN32)
+    SleepConditionVariableCS(&c->cv, &m->cs, INFINITE);
+#else
+    pthread_cond_wait(&c->c, &m->m);
+#endif
+}
+void bsdr_cond_wait_ms(bsdr_cond *c, bsdr_mutex *m, int timeout_ms) {
+    if (timeout_ms < 0) { bsdr_cond_wait(c, m); return; }
+#if defined(_WIN32)
+    SleepConditionVariableCS(&c->cv, &m->cs, (DWORD)timeout_ms);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += timeout_ms / 1000;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    pthread_cond_timedwait(&c->c, &m->m, &ts);
+#endif
+}
+void bsdr_cond_signal(bsdr_cond *c) {
+#if defined(_WIN32)
+    WakeConditionVariable(&c->cv);
+#else
+    pthread_cond_signal(&c->c);
+#endif
+}
+
 /* ------------------------------------------------------------------ sockets */
 void bsdr_socket_close(bsdr_socket_t s) {
     if (s == BSDR_INVALID_SOCKET) return;
@@ -283,6 +338,23 @@ void bsdr_set_nonblocking(bsdr_socket_t s) {
 #else
     int fl = fcntl(s, F_GETFL, 0);
     if (fl != -1) fcntl(s, F_SETFL, fl | O_NONBLOCK);
+#endif
+}
+
+int bsdr_socket_wait_readable(bsdr_socket_t s, int timeout_ms) {
+#if defined(_WIN32)
+    WSAPOLLFD pfd = { 0 };
+    pfd.fd = s;
+    pfd.events = POLLRDNORM;
+    int r = WSAPoll(&pfd, 1, timeout_ms);
+    if (r > 0) return 1;
+    return r;   /* 0 = timeout, <0 = error */
+#else
+    struct pollfd pfd = { .fd = s, .events = POLLIN, .revents = 0 };
+    int r;
+    do { r = poll(&pfd, 1, timeout_ms); } while (r < 0 && errno == EINTR);
+    if (r > 0) return 1;
+    return r;   /* 0 = timeout, <0 = error */
 #endif
 }
 

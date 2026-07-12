@@ -1,11 +1,15 @@
-# bsdrX Makefile — works two ways:
+# bsdrX Makefile — configured build (autotools-style):
 #
-#   ./configure && make           configured host build (honors config.mk)
-#   make                          build for the local OS (no configure needed)
-#   make linux                    build for Linux            -> build-linux/
+#   ./configure && make && make install     build + install for the LOCAL platform
+#
+#   ./configure                   REQUIRED first — and again after 'make distclean' or whenever your
+#                                 libraries / linking change. Detects the platform, verifies every
+#                                 needed library (+ a compile/link smoke test), and writes config.mk.
+#   make                          build from config.mk (does NOT run configure) -> build/bsdr_agent
 #   make windows WIN_DEPS=DIR     cross-build for Windows (= windows-media) -> build-windows-media/
-#   make osx                      native build ON macOS (full media via configure)
 #   make osxcross OSX_DEPS=DIR    cross-build macOS from Linux (osxcross)   -> build-osx/
+#   make all                      raw build (bypasses the config.mk-required gate); used by the
+#                                 bundle/cross scripts with explicit vars
 #
 #   Every target is full-feature (desktop capture + audio + SCTP + SRTP); there
 #   is no core-only build. A build whose media deps are missing errors out.
@@ -25,6 +29,10 @@ CONFIG_MK := $(wildcard config.mk)
 
 MAKEFLAGS += --no-print-directory
 BASE_CFLAGS := -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -Ithird_party/miniz
+# roomstate.c + botroom.c + the flatcc runtime need these includes in EVERY config. They are added
+# straight to the compile recipes (not just CFLAGS) so a bundle/cross script that passes its own
+# CFLAGS= on the make command line — which would defeat a plain `CFLAGS +=` — still gets them.
+FLATCC_INC := -Ithird_party/flatcc/include -Isrc/generated
 
 # ---- host defaults (used only when config.mk did not set them) -------------
 UNAME_S := $(shell uname -s)
@@ -151,7 +159,11 @@ OSX_DEPS   ?=                    # darwin dep prefix: openssl + opus + srtp2 + u
 # In-process depth on macOS: enabled when OSX_DEPS holds the onnxruntime headers (CoreML EP is
 # built into the macOS ORT). The .dylib is shipped in the .app; rpath resolves it there.
 OSX_ONNX_DEF  = $(if $(wildcard $(OSX_DEPS)/include/onnxruntime_c_api.h),-DBSDR_HAVE_ONNX=1,)
-OSX_ONNX_LIBS = $(if $(wildcard $(OSX_DEPS)/include/onnxruntime_c_api.h),-lonnxruntime -Wl,-rpath,@executable_path/../Frameworks,)
+# NB: the value contains commas (-Wl,-rpath,...). Inside $(if ...) those commas would terminate the
+# "then" argument early — leaving a bare "-Wl" (clang: unknown warning option) and silently dropping the
+# rpath, so the .app couldn't find the bundled libonnxruntime.dylib. Emit the commas via $(comma).
+comma := ,
+OSX_ONNX_LIBS = $(if $(wildcard $(OSX_DEPS)/include/onnxruntime_c_api.h),-lonnxruntime -Wl$(comma)-rpath$(comma)@executable_path/../Frameworks,)
 OSX_BUILD  ?= build-osx          # per-arch override so x86_64/arm64 don't clobber
 # Full macOS media stack (mirrors ./configure's macos branch): CoreAudio audio +
 # owner-mic sniffer (libpcap) + SRTP + SCTP DataChannel + the RTP video sender +
@@ -189,10 +201,13 @@ CORE_SRC := src/log.c src/net.c src/json.c src/input_decode.c \
             src/overlay.c src/httpc.c src/tls.c src/stt.c src/llm.c \
             src/compcontrol.c src/voice.c src/screenshot.c src/threed.c \
             src/depth_onnx.c src/model_store.c src/webcam.c src/voicefx.c src/faceswap.c src/micsub.c src/deps.c src/screenblank.c \
+            src/roomstate.c src/botroom.c src/botaudio.c src/voicestore.c src/voiceai.c \
             $(INJECT_SRC) $(WINLIST_SRC) $(SCTP_SRC) $(MEDIA_SRC)
 # miniz (vendored, third_party) backs model_store.c's zip import; built in every config.
+# flatcc runtime (vendored) backs roomstate.c's FlatBuffers avatar/room-state codec (bot Plane-2).
 # Map both .c and .m (macOS AVFoundation shims) sources to objects.
-CORE_OBJ := $(patsubst src/%.m,$(BUILD)/%.o,$(patsubst src/%.c,$(BUILD)/%.o,$(CORE_SRC))) $(BUILD)/miniz.o
+CORE_OBJ := $(patsubst src/%.m,$(BUILD)/%.o,$(patsubst src/%.c,$(BUILD)/%.o,$(CORE_SRC))) $(BUILD)/miniz.o \
+            $(BUILD)/flatcc_builder.o $(BUILD)/flatcc_emitter.o $(BUILD)/flatcc_refmap.o
 
 # Wayland privacy screen-blank: configure sets WAYLAND_GAMMA=1 (libwayland-client + wayland-scanner
 # present) and adds src/screenblank_wayland.c to MEDIA_SRC. Generate the wlr-gamma-control client glue
@@ -236,15 +251,18 @@ endif
 
 .PHONY: native all require-full-media linux windows windows-media osx osxcross check install uninstall clean distclean print-media-src
 
-# Default target: build for the platform we're running ON. macOS -> the native 'osx' target
-# (configure + build); everything else -> the native host build. Cross-compiling to another OS is
-# still explicit (make windows / make osxcross / android).
+# Default target: build from config.mk. `make` does NOT run ./configure — configure is the separate,
+# required readiness gate (run it first, and again after 'make distclean' or when deps/linking change).
+# config.mk records the platform + verified libs, so `make` just builds. Cross builds stay explicit
+# (make windows / make osxcross / android), and `make all` bypasses this gate for the bundle scripts.
 .DEFAULT_GOAL := native
 native:
-	@case "$$(uname -s)" in \
-	  Darwin) $(MAKE) osx ;; \
-	  *)      $(MAKE) all ;; \
-	esac
+	@test -f config.mk || { \
+	  echo "bsdrX: not configured — run ./configure first." >&2; \
+	  echo "  local build sequence:  ./configure && make && make install" >&2; \
+	  echo "  (re-run ./configure after 'make distclean' or when your libraries/linking change.)" >&2; \
+	  exit 1; }
+	+$(MAKE) all
 
 all: require-full-media $(AGENT) $(TOOLS) $(ALL_TESTS)
 	@echo "bsdrX built -> $(BUILD)/  (CC=$(CC))"
@@ -275,17 +293,21 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 $(BUILD)/%.o: src/%.c $(CONFIG_MK) | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(FLATCC_INC) -c $< -o $@
 
 # Obj-C (.m) units — macOS only (webcam_macos.m). clang selects the Obj-C frontend by extension;
 # the AVFoundation/Foundation frameworks it needs are already in OSX_MEDIA_LIBS.
 $(BUILD)/%.o: src/%.m $(CONFIG_MK) | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(FLATCC_INC) -c $< -o $@
 
 # vendored miniz (third-party): compile warning-free (-w), no bsdr includes needed.
 # _LARGEFILE64_SOURCE makes glibc define __USE_LARGEFILE64, so miniz takes its
 # fopen64/ftello64 large-file I/O path (miniz.h documents this) instead of the
 # fallback branch that emits a "may not support large files" #pragma message.
+# flatcc runtime (vendored, third-party): compile warning-free (-w); only needs its own include dir.
+$(BUILD)/flatcc_%.o: third_party/flatcc/runtime/%.c | $(BUILD)
+	$(CC) $(CFLAGS) $(FLATCC_INC) -w -c $< -o $@
+
 $(BUILD)/miniz.o: third_party/miniz/miniz.c | $(BUILD)
 	$(CC) $(CFLAGS) -D_LARGEFILE64_SOURCE=1 -w -c $< -o $@
 
@@ -317,8 +339,10 @@ $(BUILD)/bsdr_micrelay$(EXEEXT): tools/bsdr_micrelay.c src/micsniff_capture.c | 
 # Every target is full-feature (capture+encode, audio, SCTP, SRTP). There is no
 # core-only build — see require-full-media above. Native `linux` autodetects the
 # host media deps; `windows` and `osxcross` pin them through their *_DEPS prefix.
-linux:
-	$(MAKE) all BUILD=build-linux
+# On Linux `make linux` is just `make` — the native, config.mk-gated build into build/. It exists only
+# for symmetry with the cross targets (make windows / make osxcross). Build into another dir with
+# `make BUILD=<dir>` (which propagates through `native` -> `all`).
+linux: native
 
 # `windows` = the full media-capable mingw build (was `windows-media`). Kept as an
 # alias so scripts/build-win-bundle.sh (make windows-media) keeps working.

@@ -54,12 +54,14 @@ fi
 find "$WORK" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
 git -C "$ROOT" archive HEAD | tar -x -C "$WORK" --exclude='*.pcap' --exclude='*.pcapng' --exclude='*.log'
 
-# 3. sanitize: blank the Bigscreen API key default so it never reaches the public mirror
+# 3. sanitize: blank BOTH Bigscreen API keys (companion + client) so neither reaches the public mirror
 CLOUD_H="$WORK/include/bsdr/cloud.h"
 if [ -f "$CLOUD_H" ]; then
-  perl -0pi -e 's/(BSDR_CLOUD_API_KEY_DEFAULT\s*\\?\s*)"[^"]*"/$1""/s' "$CLOUD_H"
-  leftover="$(perl -0ne 'print $1 if /BSDR_CLOUD_API_KEY_DEFAULT\s*\\?\s*"([^"]*)"/' "$CLOUD_H")"
-  [ -z "$leftover" ] || { echo "!! ABORT: API key not blanked (len ${#leftover})" >&2; exit 1; }
+  for K in BSDR_CLOUD_API_KEY_DEFAULT BSDR_CLOUD_CLIENT_KEY_DEFAULT; do
+    perl -0pi -e "s/(${K}\\s*\\\\?\\s*)\"[^\"]*\"/\${1}\"\"/s" "$CLOUD_H"
+    leftover="$(perl -0ne "print \$1 if /${K}\\s*\\\\?\\s*\"([^\"]*)\"/" "$CLOUD_H")"
+    [ -z "$leftover" ] || { echo "!! ABORT: ${K} not blanked (len ${#leftover})" >&2; exit 1; }
+  done
 fi
 
 # 4. commit + push (with a meaningful message summarising the changes in this snapshot)

@@ -14,9 +14,11 @@
  * the two-tap crossfade keeping the output continuous and the duration unchanged. No FFT, O(1)/sample,
  * so it runs identically on every platform (incl. Android, which has no ffmpeg). */
 #include "bsdr/voicefx.h"
+#include "bsdr/voiceai.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <math.h>
 
 struct bsdr_voicefx {
@@ -34,6 +36,14 @@ struct bsdr_voicefx {
     float *edl;        /* echo delay line */
     int    elen, ewr;  /* echo line length + write index */
     uint32_t rng;      /* xorshift noise for whisper */
+    float  tilt;       /* formant/brightness tilt amount, [-0.8, 0.8]; 0 = flat */
+    float  lp;         /* one-pole low-pass state for the tilt filter */
+    float  gain;       /* output gain (linear); 1.0 = unity */
+    /* AI (RVC) tier — sits behind this same interface; when on, replaces the DSP shift/robot/etc. */
+    bsdr_voiceai *ai;
+    int    ai_on;
+    float  ai_key;     /* pitch shift in semitones for the AI tier */
+    char   ai_sig[1408]; /* current engine config signature (reload only when it changes) */
 };
 
 bsdr_voicefx *bsdr_voicefx_new(int sample_rate) {
@@ -42,6 +52,7 @@ bsdr_voicefx *bsdr_voicefx_new(int sample_rate) {
     if (!v) return NULL;
     v->sr = sample_rate;
     v->shift = 1.0f;
+    v->gain = 1.0f;
     /* ~50 ms window: long enough that the sweep period is sub-audible, short enough for low latency. */
     v->len = sample_rate / 20;
     if (v->len < 256) v->len = 256;
@@ -62,13 +73,40 @@ void bsdr_voicefx_set_params(bsdr_voicefx *v, const bsdr_voicefx_params *p) {
     int r = p->robot < 0 ? 0 : p->robot > 100 ? 100 : p->robot;
     int e = p->echo   < 0 ? 0 : p->echo   > 100 ? 100 : p->echo;
     int w = p->whisper< 0 ? 0 : p->whisper> 100 ? 100 : p->whisper;
+    int fm= p->formant< -100 ? -100 : p->formant > 100 ? 100 : p->formant;
+    int vo= p->volume < -100 ? -100 : p->volume  > 100 ? 100 : p->volume;
     v->robot = r / 100.0f;
     v->echo = e / 100.0f;
     v->whisper = w / 100.0f;
+    v->tilt = (fm / 100.0f) * 0.8f;                      /* brightness tilt, +/-0.8 */
+    v->gain = powf(10.0f, (vo / 100.0f) * 12.0f / 20.0f); /* +/-100 -> +/-12 dB */
 }
 
 int bsdr_voicefx_active(const bsdr_voicefx *v) {
-    return v && (v->shift != 1.0f || v->robot > 0 || v->echo > 0 || v->whisper > 0);
+    return v && (v->ai_on || v->shift != 1.0f || v->robot > 0 || v->echo > 0 || v->whisper > 0 ||
+                 v->tilt != 0.0f || v->gain != 1.0f);
+}
+
+int bsdr_voicefx_ai_active(const bsdr_voicefx *v) {
+    return v && v->ai_on && v->ai && bsdr_voiceai_ready(v->ai);
+}
+
+void bsdr_voicefx_set_ai(bsdr_voicefx *v, int on, int tier, const char *content, const char *rmvpe,
+                         const char *voice, int voice_sr, float key_semitones) {
+    if (!v) return;
+    v->ai_key = key_semitones;
+    if (!on || !bsdr_voiceai_available() || !content || !content[0] || !voice || !voice[0]) {
+        if (v->ai) { bsdr_voiceai_close(v->ai); v->ai = NULL; v->ai_sig[0] = 0; }
+        v->ai_on = 0;
+        return;
+    }
+    char sig[1408];
+    snprintf(sig, sizeof sig, "%d|%s|%s|%s|%d", tier, content, rmvpe ? rmvpe : "", voice, voice_sr);
+    if (v->ai && strcmp(sig, v->ai_sig) == 0) { v->ai_on = 1; return; }   /* config unchanged */
+    if (v->ai) { bsdr_voiceai_close(v->ai); v->ai = NULL; }
+    v->ai = bsdr_voiceai_open(tier, content, (rmvpe && rmvpe[0]) ? rmvpe : NULL, voice, v->sr, voice_sr);
+    snprintf(v->ai_sig, sizeof v->ai_sig, "%s", sig);
+    v->ai_on = 1;   /* on even if open failed -> process() passes through until a model resolves */
 }
 
 void bsdr_voicefx_set_shift(bsdr_voicefx *v, float shift) {
@@ -100,6 +138,19 @@ static inline float tap(const bsdr_voicefx *v, float delay) {
 
 void bsdr_voicefx_process(bsdr_voicefx *v, int16_t *pcm, int frames) {
     if (!v || !pcm || frames <= 0 || !bsdr_voicefx_active(v)) return;
+
+    /* AI (RVC) tier: convert to the target voice (buffers internally, same-length in place), then only
+     * the volume post-gain from the DSP knobs. Passes through until the engine is warmed/ready. */
+    if (v->ai_on && v->ai) {
+        bsdr_voiceai_process(v->ai, pcm, pcm, frames, v->ai_key);
+        if (v->gain != 1.0f)
+            for (int n = 0; n < frames; n++) {
+                float s = (float)pcm[n] * (1.0f / 32768.0f) * v->gain;
+                int val = (int)(s * 32768.0f);
+                pcm[n] = (int16_t)(val > 32767 ? 32767 : (val < -32768 ? -32768 : val));
+            }
+        return;
+    }
 
     const int   L     = v->len;
     const float half  = (float)L * 0.5f;
@@ -148,6 +199,16 @@ void bsdr_voicefx_process(bsdr_voicefx *v, int16_t *pcm, int frames) {
             s = out;
         }
 
+        /* 5) formant/tone: a one-pole tilt — boost/cut the highs relative to a ~2 kHz split, which
+         * shifts the perceived vocal-tract size (brighter = smaller/younger, darker = bigger/older). */
+        if (v->tilt != 0.0f) {
+            v->lp += 0.25f * (s - v->lp);              /* ~2 kHz low-pass */
+            s = s + v->tilt * (s - v->lp);             /* + = emphasise highs, - = emphasise lows */
+        }
+
+        /* 6) output gain */
+        if (v->gain != 1.0f) s *= v->gain;
+
         int val = (int)(s * 32768.0f);
         if (val > 32767) val = 32767; else if (val < -32768) val = -32768;
         pcm[n] = (int16_t)val;
@@ -156,6 +217,7 @@ void bsdr_voicefx_process(bsdr_voicefx *v, int16_t *pcm, int frames) {
 
 void bsdr_voicefx_free(bsdr_voicefx *v) {
     if (!v) return;
+    if (v->ai) bsdr_voiceai_close(v->ai);
     free(v->buf);
     free(v->edl);
     free(v);

@@ -75,12 +75,30 @@ if [ -f "$BSDRX_DEPS/include/onnxruntime_c_api.h" ]; then
   MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_ONNX=1"; MEDIA_LIBS="$MEDIA_LIBS -lonnxruntime"
 fi
 
-make all BUILD=build-bundle EXEEXT= BUILD_TESTS=no \
+# Wayland privacy screen-blank (wlr-gamma-control, wlroots compositors). Needs wayland-scanner +
+# libwayland-client in the build image; the Makefile codegens the client glue from the vendored XML.
+# We pass WAYLAND_GAMMA explicitly either way: this build sets its own vars instead of ./configure, so a
+# stale config.mk from a prior ./configure must NOT leak WAYLAND_GAMMA=1 into an image without the scanner
+# (that's exactly what tripped "wayland-scanner: Command not found"). Absent -> X11 xrandr screen-blank only.
+WAYLAND_GAMMA=
+WLG_SRC=""; WLG_CFLAGS=""; WLG_LIBS=""
+if command -v wayland-scanner >/dev/null 2>&1 && pkg-config --exists wayland-client 2>/dev/null; then
+  WAYLAND_GAMMA=1
+  WLG_SRC="src/screenblank_wayland.c"
+  MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_WAYLAND_GAMMA=1"
+  WLG_CFLAGS="$(pkg-config --cflags wayland-client)"
+  WLG_LIBS="$(pkg-config --libs wayland-client)"
+  echo ">> Wayland privacy screen-blank = wlr-gamma-control"
+else
+  echo ">> WARN: wayland-scanner/libwayland-client not in the build image — Wayland screen-blank stubbed (X11 xrandr only)"
+fi
+
+make all BUILD=build-bundle EXEEXT= BUILD_TESTS=no WAYLAND_GAMMA="$WAYLAND_GAMMA" \
   INJECT_SRC=src/inject_linux.c WINLIST_SRC=src/winlist.c \
-  MEDIA_SRC="$MEDIA_SRC" SCTP_SRC=src/sctp.c \
-  CFLAGS="$BASE_CFLAGS $MEDIA_DEF $PW_CFLAGS -I$BSDRX_DEPS/include" \
+  MEDIA_SRC="$MEDIA_SRC $WLG_SRC" SCTP_SRC=src/sctp.c \
+  CFLAGS="$BASE_CFLAGS $MEDIA_DEF $PW_CFLAGS $WLG_CFLAGS -I$BSDRX_DEPS/include" \
   LDFLAGS="-L$BSDRX_DEPS/lib -Wl,-rpath,\$\$ORIGIN/../lib -Wl,--disable-new-dtags" \
-  LDLIBS="$MEDIA_LIBS"
+  LDLIBS="$MEDIA_LIBS $WLG_LIBS"
 
 BIN="build-bundle/bsdr_agent"
 test -x "$BIN"
