@@ -53,13 +53,23 @@ endif
 # Point ONNX_PREFIX at an onnxruntime prebuilt (include/ + lib/); auto-detected from a sibling
 # onnx-deps/ checkout or /opt/onnxruntime. Absent -> depth_onnx.c stubs out and the 2D->3D neural
 # tiers report unavailable (the external helper + heuristic still work).
-ONNX_PREFIX ?= $(firstword $(wildcard ../onnx-deps/onnxruntime-linux-* /opt/onnxruntime))
+# Prefer the repo-local prebuilt fetched by scripts/fetch-onnx.sh; fall back to a legacy sibling
+# ../onnx-deps checkout or /opt. (A ./configure build sets these via config.mk instead — see configure.)
+ONNX_PREFIX ?= $(firstword $(wildcard third_party/onnxruntime/linux-x64 ../onnx-deps/onnxruntime-linux-* /opt/onnxruntime))
 HOST_ONNX_DEF  :=
 HOST_ONNX_LIBS :=
 ifneq ($(strip $(ONNX_PREFIX)),)
   HOST_ONNX_DEF  := -DBSDR_HAVE_ONNX=1 -I$(ONNX_PREFIX)/include
-  HOST_ONNX_LIBS := -L$(ONNX_PREFIX)/lib -lonnxruntime -Wl,-rpath,$(ONNX_PREFIX)/lib
+  # rpath must be ABSOLUTE (a relative rpath resolves against the process cwd, so the agent only
+  # finds libonnxruntime.so.1 when launched from the build dir). Also add $ORIGIN/../lib so an
+  # installed tree (bin/ + lib/) is relocatable and finds the copy that `make install` drops in libdir.
+  HOST_ONNX_LIBS := -L$(ONNX_PREFIX)/lib -lonnxruntime \
+                    -Wl,-rpath,$(abspath $(ONNX_PREFIX)/lib) -Wl,-rpath,'$$ORIGIN/../lib'
+  # lib dir `make install` copies into libdir (a bundled ORT ships next to the agent). config.mk
+  # overrides this for a ./configure build (empty there for a system ORT — nothing to copy).
+  ONNX_LIB_INSTALL ?= $(abspath $(ONNX_PREFIX)/lib)
 endif
+ONNX_LIB_INSTALL ?=
 
 # ---- canonical media source groups (single source of truth) ----------------
 # Every media-enabled build (host autodetect, windows-media, osxcross) derives
@@ -72,7 +82,7 @@ MEDIA_SRC_SCTP  := src/sctp.c
 # NB: threed.c is in CORE_SRC, not here — agent.c's main() calls bsdr_threed_mode_parse
 # unconditionally, so it must link in core-only builds too (the SBS transform it also
 # provides is only *applied* on the BSDR_HAVE_CAPTURE path).
-MEDIA_SRC_VIDEO := src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/fileaudio.c src/capture_pipewire.c
+MEDIA_SRC_VIDEO := src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/fileaudio.c src/capture_pipewire.c src/term.c
 MEDIA_SRC_AUDIO := src/audio.c src/micsniff.c src/micsniff_capture.c
 MEDIA_SRC_ALL   := $(MEDIA_SRC_SCTP) $(MEDIA_SRC_VIDEO) $(MEDIA_SRC_AUDIO)
 
@@ -222,6 +232,16 @@ $(BUILD)/wlr-gamma-control-protocol.c: protocols/wlr-gamma-control-unstable-v1.x
 $(BUILD)/wlr-gamma-control-protocol.o: $(BUILD)/wlr-gamma-control-protocol.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(BUILD)/screenblank_wayland.o: $(BUILD)/wlr-gamma-control-client-protocol.h
+endif
+
+# Terminal PTY backend: configure sets HAVE_VTERM=1 (Linux, vendored libvterm present) and adds
+# src/term_pty.c to MEDIA_SRC plus -DBSDR_HAVE_VTERM/-Ithird_party/libvterm/include. Compile the
+# vendored libvterm (third_party, MIT) warning-free (-w) like miniz/flatcc and link it in.
+ifeq ($(HAVE_VTERM),1)
+VTERM_OBJ := $(patsubst third_party/libvterm/src/%.c,$(BUILD)/vterm_%.o,$(wildcard third_party/libvterm/src/*.c))
+CORE_OBJ += $(VTERM_OBJ)
+$(BUILD)/vterm_%.o: third_party/libvterm/src/%.c | $(BUILD)
+	$(CC) $(CFLAGS) -w -Ithird_party/libvterm/include -c $< -o $@
 endif
 
 LIB   := $(BUILD)/libbsdr_core.a
@@ -417,6 +437,16 @@ install: all
 	         "$(DESTDIR)$(mandir)/man1"
 	cp -p $(AGENT) $(TOOLS) "$(DESTDIR)$(bindir)/"
 	cp -p $(LIB) "$(DESTDIR)$(libdir)/"
+	@# ONNX Runtime shared lib: the agent NEEDs libonnxruntime.so.1 at runtime; install the whole
+	@# .so symlink chain (+ the provider shim) so the $ORIGIN/../lib rpath resolves it after install.
+	@# ONNX_LIB_INSTALL is the lib dir we linked against (from config.mk, or the Makefile default);
+	@# EMPTY for a system ORT -> nothing to copy (the loader already finds it).
+	@if [ -n "$(strip $(ONNX_LIB_INSTALL))" ] && [ -e "$(ONNX_LIB_INSTALL)/libonnxruntime.so.1" ]; then \
+	  cp -a "$(ONNX_LIB_INSTALL)"/libonnxruntime.so* "$(DESTDIR)$(libdir)/"; \
+	  [ -e "$(ONNX_LIB_INSTALL)/libonnxruntime_providers_shared.so" ] && \
+	    cp -a "$(ONNX_LIB_INSTALL)/libonnxruntime_providers_shared.so" "$(DESTDIR)$(libdir)/" || true; \
+	  echo "installed onnxruntime runtime libs to $(DESTDIR)$(libdir)"; \
+	fi
 	cp -p include/bsdr/*.h "$(DESTDIR)$(includedir)/bsdr/"
 	cp -p docs/bsdr_agent.1 docs/bsdr_micrelay.1 "$(DESTDIR)$(mandir)/man1/"
 	@echo "installed to $(DESTDIR)$(prefix)"
@@ -428,6 +458,7 @@ uninstall:
 	      "$(DESTDIR)$(libdir)/libbsdr_core.a" \
 	      "$(DESTDIR)$(mandir)/man1/bsdr_agent.1" \
 	      "$(DESTDIR)$(mandir)/man1/bsdr_micrelay.1"
+	rm -f "$(DESTDIR)$(libdir)"/libonnxruntime.so* "$(DESTDIR)$(libdir)/libonnxruntime_providers_shared.so"
 	rm -rf "$(DESTDIR)$(includedir)/bsdr"
 
 clean:

@@ -28,6 +28,10 @@
 # prepared test APKs
 *.apk
 
+# ONNX Runtime prebuilt (downloaded by scripts/fetch-onnx.sh; pinned+SHA-verified, not committed —
+# only third_party/flatcc + third_party/miniz are vendored SOURCE)
+/third_party/onnxruntime/
+
 # macOS cross-build deps (keep the recipe, drop the output)
 /osx-deps/
 /.relaycache/

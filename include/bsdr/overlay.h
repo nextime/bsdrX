@@ -29,6 +29,7 @@ typedef enum {
     BSDR_OVL_VOL_DOWN,
     BSDR_OVL_VOL_UP,
     BSDR_OVL_SEEK,        /* value = 0..1 position */
+    BSDR_OVL_LOOP,        /* toggle continuous file/playlist loop */
     BSDR_OVL_EXIT,
     BSDR_OVL_VOICE        /* mic: start a voice command */
 } bsdr_overlay_action;
@@ -41,6 +42,7 @@ void bsdr_overlay_free(bsdr_overlay *o);
 void bsdr_overlay_set_visible(bsdr_overlay *o, bool visible);
 bool bsdr_overlay_visible(bsdr_overlay *o);
 void bsdr_overlay_set_playing(bsdr_overlay *o, bool playing);
+void bsdr_overlay_set_loop(bsdr_overlay *o, bool loop);   /* highlight the loop button when on */
 void bsdr_overlay_set_volume(bsdr_overlay *o, int vol_0_100);
 /* `seekable` shows the position bar (file playback); frac is 0..1. */
 void bsdr_overlay_set_position(bsdr_overlay *o, double frac, bool seekable);

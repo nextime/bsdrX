@@ -43,11 +43,38 @@ void bsdr_pw_capture_close(bsdr_pw_capture *c) { (void)c; }
 
 #include <dbus/dbus.h>
 
+/* PipeWire's SPA header macros (the SPA_POD_*_INIT compound literals + spa_pod_*_init inline helpers)
+ * deliberately leave the trailing `_padding` field uninitialised, which trips
+ * -Wmissing-field-initializers all through this file under -Wextra. It's third-party-header noise, not
+ * our bug and not fixable from here, so silence just that one warning for this PipeWire-only TU. The
+ * pragma sits before the SPA includes so it also covers their inline-function bodies. */
+#if defined(__GNUC__)
+#  pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
+
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 #include <spa/param/props.h>
-#include <spa/param/buffers.h>
+/* enum spa_param_buffers (SPA_PARAM_BUFFERS_*): PipeWire >= 0.3.2x splits it into
+ * <spa/param/buffers.h>; older releases (e.g. 0.3.19 on Debian 11) define it in
+ * <spa/param/param.h>. Pick whichever this SPA provides. */
+#if defined(__has_include) && __has_include(<spa/param/buffers.h>)
+#  include <spa/param/buffers.h>
+#else
+#  include <spa/param/param.h>
+#endif
 #include <spa/pod/builder.h>
+
+/* These SPA_POD_PROP_FLAG_* bits (used by the --pw-dmabuf modifier negotiation) were added to
+ * spa/pod/pod.h after PipeWire 0.3.19 (Debian 11 ships 0.3.19, which has only READONLY/HARDWARE/
+ * HINT_DICT). They're #define macros, so #ifndef cleanly detects their absence; define the standard,
+ * stable bit values as a fallback so the dmabuf path builds on older SPA too. */
+#ifndef SPA_POD_PROP_FLAG_MANDATORY
+#  define SPA_POD_PROP_FLAG_MANDATORY   (1u << 3)
+#endif
+#ifndef SPA_POD_PROP_FLAG_DONT_FIXATE
+#  define SPA_POD_PROP_FLAG_DONT_FIXATE (1u << 4)
+#endif
 
 /* EXPERIMENTAL dmabuf zero-copy path (--pw-dmabuf): negotiate a DRM dmabuf from PipeWire and hand
  * capture.c a DRM_PRIME AVFrame it can hwmap straight into VAAPI. Needs the libav hwcontext headers;

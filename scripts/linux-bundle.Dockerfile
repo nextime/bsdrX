@@ -1,7 +1,11 @@
 # Build environment for scripts/build-linux-bundle.sh.
 #
-# Ubuntu 20.04 (glibc 2.31) base so the produced binaries run on 20.04+ /
-# Debian 11+ / RHEL 8+. Builds a PRIVATE, MINIMAL ffmpeg (+ openssl3, x264, opus,
+# Debian 11 "bullseye" (glibc 2.31) base — same low glibc floor as Ubuntu 20.04 so
+# the produced binaries run on 20.04+ / Debian 11+, but UNLIKE focal, bullseye ships
+# libpipewire-0.3-dev + libwayland-dev + wayland-scanner, so the AppImage gets real
+# Wayland desktop capture (xdg-desktop-portal + PipeWire) and the wlr-gamma-control
+# screen-blank instead of falling back to x11grab-only. Builds a PRIVATE, MINIMAL
+# ffmpeg (+ openssl3, x264, opus,
 # libsrtp2, usrsctp, libpcap) into /opt/bsdrx-deps — only the codecs/muxers/devices
 # bsdrX actually uses (H.264 via nvenc/x264, mjpeg screenshots, x11grab capture,
 # file demux + h264 bitstream filter), so the dependency graph stays tiny instead
@@ -11,7 +15,7 @@
 #   docker build -f scripts/linux-bundle.Dockerfile -t bsdrx-linux-deps scripts
 #   docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/out bsdrx-linux-deps \
 #           bash /src/scripts/build-linux-bundle.sh
-FROM ubuntu:20.04
+FROM debian:11-slim
 ENV DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-c"]
 
@@ -21,6 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libx11-dev libxext-dev libxfixes-dev libxcb1-dev libxcb-shm0-dev \
       libxcb-shape0-dev libxcb-xfixes0-dev libpulse-dev libdrm-dev \
       libpipewire-0.3-dev libdbus-1-dev \
+      libpipewire-0.3-modules libspa-0.2-modules \
+      libwayland-dev libwayland-bin wayland-protocols \
       python3 file patchelf \
     && rm -rf /var/lib/apt/lists/*
 

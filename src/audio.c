@@ -383,7 +383,7 @@ void bsdr_audio_recv_free(bsdr_audio_recv *r) {
 #if !defined(_WIN32) && !defined(__ANDROID__) && !defined(__APPLE__)
 struct bsdr_pa { pa_simple *s; int channels; };
 
-static bsdr_pa *pa_open(const char *dev, int channels, pa_stream_direction_t dir) {
+static bsdr_pa *pa_open_ex(const char *dev, int channels, pa_stream_direction_t dir, int quiet) {
     pa_sample_spec ss;
     ss.format = PA_SAMPLE_S16NE;
     ss.rate = BSDR_AUDIO_CLOCK_HZ;
@@ -410,16 +410,21 @@ static bsdr_pa *pa_open(const char *dev, int channels, pa_stream_direction_t dir
                                  dir, dev && *dev ? dev : NULL,
                                  dir == PA_STREAM_RECORD ? "desktop-audio" : "quest-mic",
                                  &ss, NULL, &attr, &err);
-    if (!s) { BSDR_ERROR("bsdr.audio", "pulse open: %s", pa_strerror(err)); return NULL; }
+    if (!s) { if (!quiet) BSDR_ERROR("bsdr.audio", "pulse open: %s", pa_strerror(err)); return NULL; }
     bsdr_pa *pa = calloc(1, sizeof(*pa));
     pa->s = s; pa->channels = channels;
     return pa;
 }
 bsdr_pa *bsdr_pa_record_open(const char *source, int channels) {
-    return pa_open(source, channels, PA_STREAM_RECORD);
+    return pa_open_ex(source, channels, PA_STREAM_RECORD, 0);
 }
 bsdr_pa *bsdr_pa_play_open(const char *sink, int channels) {
-    return pa_open(sink, channels, PA_STREAM_PLAYBACK);
+    return pa_open_ex(sink, channels, PA_STREAM_PLAYBACK, 0);
+}
+/* Quiet playback open: no ERROR log if the sink isn't present. Used for optional/lazy opens (the
+ * owner-mic sniffer polls for the virtual mic sink, which only exists during a streaming session). */
+bsdr_pa *bsdr_pa_play_open_quiet(const char *sink, int channels) {
+    return pa_open_ex(sink, channels, PA_STREAM_PLAYBACK, 1);
 }
 int bsdr_pa_read(bsdr_pa *pa, int16_t *pcm, int frames) {
     int err = 0;
@@ -448,12 +453,14 @@ struct bsdr_audio_player {
     bsdr_cond *have_data;   /* signalled by _push; player sleeps on it when empty */
     bsdr_thread *thread;
     volatile int stop;
+    volatile int dead;      /* set when the sink went away (writes fail) — caller reopens */
 };
 
 static void player_thread(void *arg) {
     bsdr_audio_player *p = (bsdr_audio_player *)arg;
     int16_t chunk[BSDR_OPUS_FRAME * 2];
     int frame_samples = BSDR_OPUS_FRAME * p->channels;
+    int fails = 0;                 /* consecutive write failures -> the sink was unloaded */
     while (!p->stop) {
         int got = 0;
         bsdr_mutex_lock(p->lock);
@@ -469,14 +476,20 @@ static void player_thread(void *arg) {
             p->count--;
         }
         bsdr_mutex_unlock(p->lock);
-        if (got >= p->channels) bsdr_pa_write(p->pa, chunk, got / p->channels);
+        if (got >= p->channels) {
+            if (bsdr_pa_write(p->pa, chunk, got / p->channels) < 0) {
+                if (++fails > 10) p->dead = 1;   /* sink unloaded (session ended) -> caller reopens */
+            } else fails = 0;
+        }
     }
 }
 
-bsdr_audio_player *bsdr_audio_player_new(const char *sink, int channels) {
+int bsdr_audio_player_dead(const bsdr_audio_player *p) { return p && p->dead; }
+
+static bsdr_audio_player *player_new_ex(const char *sink, int channels, int quiet) {
     bsdr_audio_player *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
-    p->pa = bsdr_pa_play_open(sink, channels);
+    p->pa = quiet ? bsdr_pa_play_open_quiet(sink, channels) : bsdr_pa_play_open(sink, channels);
     if (!p->pa) { free(p); return NULL; }
     p->channels = channels;
     p->cap = (size_t)(BSDR_AUDIO_CLOCK_HZ / 4) * channels;   /* ~250 ms (overflow drops oldest; 1 s was overkill) */
@@ -485,6 +498,12 @@ bsdr_audio_player *bsdr_audio_player_new(const char *sink, int channels) {
     p->have_data = bsdr_cond_new();
     p->thread = bsdr_thread_start(player_thread, p);
     return p;
+}
+bsdr_audio_player *bsdr_audio_player_new(const char *sink, int channels) {
+    return player_new_ex(sink, channels, 0);
+}
+bsdr_audio_player *bsdr_audio_player_new_quiet(const char *sink, int channels) {
+    return player_new_ex(sink, channels, 1);   /* no ERROR if the sink isn't up yet */
 }
 
 void bsdr_audio_player_push(bsdr_audio_player *p, const int16_t *pcm, int frames) {

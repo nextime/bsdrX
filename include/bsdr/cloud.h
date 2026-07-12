@@ -87,6 +87,9 @@ bool bsdr_cloud_login(int client_mode, const char *email, const char *password,
 /* Fetch the account profile (display name; also socialId/isVerified under the client key) with an
  * access token. `api_key` = the key that minted the token (companion for host, client for bot). */
 bool bsdr_cloud_account(const char *api_key, const char *access_token, char *name, size_t name_len);
+/* Like bsdr_cloud_account but returns the HTTP status: 0 = server unreachable (network), 2xx = valid,
+ * 4xx = reached-but-rejected. Lets restore keep a saved session across a transient connect failure. */
+int  bsdr_cloud_account_status(const char *api_key, const char *access_token, char *name, size_t name_len);
 
 /* Renew an access token using a refresh token. `api_key` = the key that minted the session (companion
  * for host, client for bot; also selects the system-info flavor). Fills out->access_token/refresh_token. */

@@ -36,6 +36,20 @@ single source loops at its end.
 Encode the \fB\-\-file\fR stream on the GPU (NVENC) instead of libx264 (the default). libx264
 usually looks better at the low bitrates the headset requests; use this to offload the CPU.
 .TP
+.BI \-\-terminal [=BACKEND]
+Stream a shell/terminal to the headset (ideal on a \fBheadless\fR machine) with the Quest's
+keyboard \(em and mouse, when the program supports it \(em injected into it. \fBBACKEND\fR is
+\fBpty\fR (default) or \fBxvfb\fR. \fBpty\fR renders an in-process terminal emulator (libvterm)
+straight to video, needing no X server; \fBxvfb\fR runs a private Xvfb + xterm captured with
+x11grab and injects input via XTEST (needs \fBxvfb\fR + \fBxterm\fR installed). The in-VR bar
+gives an exit-to-desktop control; if the shell exits it returns to the desktop.
+.TP
+.BI \-\-terminal\-cmd " CMD"
+Program to run in the terminal source (default: \fB$SHELL\fR, else \fB/bin/bash\fR).
+.TP
+.BI \-\-terminal\-size " CxR"
+PTY grid size in columns x rows (default \fB120x36\fR).
+.TP
 .B \-\-no\-video
 Don't stream video (input/control only).
 .TP

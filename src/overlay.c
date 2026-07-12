@@ -38,6 +38,8 @@
 #define VB_X1 0.80
 #define VU_X0 0.81
 #define VU_X1 0.86
+#define LP_X0 0.87
+#define LP_X1 0.92
 #define EX_X0 0.93
 #define EX_X1 0.99
 
@@ -55,6 +57,7 @@
 struct bsdr_overlay {
     bool visible;
     bool playing;
+    bool loop;         /* continuous file/playlist loop (button highlight) */
     int volume;        /* 0..100 */
     double position;   /* 0..1 */
     bool seekable;
@@ -87,6 +90,7 @@ void bsdr_overlay_free(bsdr_overlay *o) {
 void bsdr_overlay_set_visible(bsdr_overlay *o, bool v) { o->visible = v; }
 bool bsdr_overlay_visible(bsdr_overlay *o) { return o->visible; }
 void bsdr_overlay_set_playing(bsdr_overlay *o, bool p) { o->playing = p; }
+void bsdr_overlay_set_loop(bsdr_overlay *o, bool l) { o->loop = l; }
 void bsdr_overlay_set_volume(bsdr_overlay *o, int v) { o->volume = v < 0 ? 0 : v > 100 ? 100 : v; }
 void bsdr_overlay_set_position(bsdr_overlay *o, double f, bool s) {
     o->position = f < 0 ? 0 : f > 1 ? 1 : f; o->seekable = s;
@@ -170,6 +174,13 @@ void bsdr_overlay_render_nv12(bsdr_overlay *o, uint8_t *y, int ys,
     int vu0 = px(VU_X0, w), vu1 = px(VU_X1, w), vuc = (vu0 + vu1) / 2;
     fill_y(y, ys, w, h, vu0, cy - 1, vu1, cy + 2, W);                       /* plus - */
     fill_y(y, ys, w, h, vuc - 1, cy - ih, vuc + 2, cy + ih, W);            /* plus | */
+    /* loop toggle: a rectangle outline (repeat), bright when on, dim when off */
+    int lp0 = px(LP_X0, w), lp1 = px(LP_X1, w);
+    uint8_t lw = o->loop ? W : 100;
+    fill_y(y, ys, w, h, lp0, cy - ih, lp1, cy - ih + 2, lw);            /* top */
+    fill_y(y, ys, w, h, lp0, cy + ih - 2, lp1, cy + ih, lw);            /* bottom */
+    fill_y(y, ys, w, h, lp0, cy - ih, lp0 + 2, cy + ih, lw);            /* left */
+    fill_y(y, ys, w, h, lp1 - 2, cy - ih, lp1, cy + ih, lw);            /* right */
     /* exit: X */
     int ex0 = px(EX_X0, w), ex1 = px(EX_X1, w);
     for (int r = -ih; r <= ih; r++) {
@@ -189,6 +200,7 @@ bsdr_overlay_action bsdr_overlay_hit(bsdr_overlay *o, double nx, double ny,
         if (value) *value = (nx - SK_X0) / (SK_X1 - SK_X0);
         return BSDR_OVL_SEEK;
     }
+    if (nx >= LP_X0 && nx <= LP_X1) return BSDR_OVL_LOOP;
     if (nx >= VD_X0 && nx <= VD_X1) return BSDR_OVL_VOL_DOWN;
     if (nx >= VU_X0 && nx <= VU_X1) return BSDR_OVL_VOL_UP;
     if (nx >= VB_X0 && nx <= VB_X1) {   /* click on the volume bar = set level */

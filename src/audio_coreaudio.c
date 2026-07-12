@@ -157,6 +157,8 @@ static bsdr_pa *pa_new(const char *dev, int channels, int record) {
 
 bsdr_pa *bsdr_pa_record_open(const char *source, int channels) { return pa_new(source, channels, 1); }
 bsdr_pa *bsdr_pa_play_open(const char *sink, int channels)     { return pa_new(sink,   channels, 0); }
+/* No noisy backend error to suppress here (the loopback device is persistent) -> same as _play_open. */
+bsdr_pa *bsdr_pa_play_open_quiet(const char *sink, int channels){ return pa_new(sink,   channels, 0); }
 
 int bsdr_pa_read(bsdr_pa *pa, int16_t *pcm, int frames) {
     if (!pa) return -1;

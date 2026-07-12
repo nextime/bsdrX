@@ -72,6 +72,8 @@ typedef struct bsdr_app {
     bool cloud_auto_share;        /* follow the Quest's RDC screen (auto start/stop) */
     int  cloud_screen_misses;     /* consecutive /rooms polls with no screen (debounce stop) */
     bool cloud_starting;          /* a stream-start is in flight (prevents a double-start race) */
+    bool unpair_pending;          /* Quest unpaired (or heartbeat lost) — cloud teardown is on a grace timer */
+    uint64_t unpair_deadline_ms;  /* when the grace expires and we actually stop the relay (0 = none) */
     char cloud_data_mode[8];      /* "" (auto) | "raw" | "dtls" — cloud data channel transport */
     char cloud_dtls_role[8];      /* "" (auto) | "client" | "server" — cloud data DTLS role */
     bool cloud_no_video;          /* --no-cloud-video: don't produce relay video (default: video ON) */
@@ -104,15 +106,21 @@ typedef struct bsdr_app {
     bool paused;                  /* web stop/restart */
     bool disconnect_req;          /* operator asked to drop the paired Quest */
     /* source */
-    char source[16];              /* "desktop" | "file" | "webcam" | "webcam3d" */
-    char source_path[512];        /* file path/URL, or (webcam) the primary/left camera device */
+    char source[16];              /* "desktop" | "file" | "webcam" | "webcam3d" | "terminal" */
+    char source_path[512];        /* file path/URL, (webcam) primary/left camera, or (terminal) the shell/command */
     char source_path2[512];       /* webcam3d: the right-eye camera device */
+    /* Terminal source (headless console streaming): render a shell to the headset with the Quest's
+     * keyboard/mouse injected. "pty" = in-process libvterm (no X needed); "xvfb" = a private Xvfb +
+     * xterm captured via x11grab (XTEST injection). term_cols/rows size the pty grid (0 = default). */
+    char term_backend[8];         /* "pty" | "xvfb" (empty = pty) */
+    int  term_cols, term_rows;    /* pty grid size; 0 = default (120x36) */
     volatile unsigned source_gen; /* bump when the source changes so the live session reopens capture */
     volatile unsigned encoder_gen;/* bump on a CPU<->GPU encoder toggle so the session reopens capture
                                    * IN PLACE (no full restart, which would drop the input channel) */
     /* In-VR media-bar playback controls for file streaming — shared by the LAN video+audio threads,
      * the input thread, and the cloud audio sender. Edge-triggered seek via a generation counter. */
     volatile int file_paused;     /* play/pause */
+    volatile int file_loop;       /* 1 = play the file/playlist continuously in loop (web UI / overlay) */
     volatile int file_volume;     /* 0..100 audio gain (init 100) */
     volatile unsigned file_seek_gen; /* bump to request a seek to file_seek_frac */
     double file_seek_frac;        /* seek target 0..1 (written before bumping file_seek_gen) */
@@ -339,6 +347,13 @@ bool bsdr_app_get_internet_sharing(bsdr_app *a);
 /* Poll for a Quest-provisioned screen and start the relay stream once it exists.
  * Call periodically (the agent does, ~every few seconds) while sharing is on. */
 void bsdr_app_cloud_tick(bsdr_app *a);
+/* Unpair grace: set_paired(false) does NOT stop the relay immediately — it arms a grace timer so a
+ * quick unpair/re-pair (or a transient heartbeat gap) keeps the internet-share stream alive. Call
+ * bsdr_app_unpair_grace_expired() each loop; it stops the relay + clears sharing once the timer lapses
+ * with no re-pair (returns true that tick). bsdr_app_unpair_now() finalizes immediately (deliberate
+ * operator disconnect). A subsequent set_paired(true) cancels the pending teardown. */
+bool bsdr_app_unpair_grace_expired(bsdr_app *a);
+void bsdr_app_unpair_now(bsdr_app *a);
 
 /* The single LAN encoder feeds each encoded access unit here (w/h = encoded resolution); forwarded
  * to the relay as plain RTP in COUPLED mode. No-op in --video-decoupled mode (relay self-captures). */
@@ -348,6 +363,7 @@ void bsdr_app_feed_cloud_video(bsdr_app *a, const uint8_t *au, size_t len, int w
 void bsdr_app_select_quest(bsdr_app *a, const char *ip);
 unsigned bsdr_app_select_gen(bsdr_app *a);
 void bsdr_app_set_source(bsdr_app *a, const char *mode, const char *path);
+void bsdr_app_set_file_loop(bsdr_app *a, int on);   /* loop the file/playlist continuously (persisted) */
 /* Stereo webcam: set/get the right-eye camera device (used when source mode is "webcam3d"). */
 void bsdr_app_set_source_right(bsdr_app *a, const char *dev);
 void bsdr_app_get_source_right(bsdr_app *a, char *dev, size_t dl);
@@ -365,6 +381,10 @@ void bsdr_app_set_sniff(bsdr_app *a, bool want, const char *password);
 bool bsdr_app_take_sniff(bsdr_app *a, bool *want, bool *mitm, char *pw, size_t pwlen);
 void bsdr_app_set_sniff_status(bsdr_app *a, bool active, const char *msg);
 void bsdr_app_get_source(bsdr_app *a, char *mode, size_t ml, char *path, size_t pl);
+/* Terminal-source backend + pty grid size. Set persists across restarts. backend "pty"|"xvfb"
+ * (NULL/empty keeps current); cols/rows <= 0 keep current. */
+void bsdr_app_set_terminal(bsdr_app *a, const char *backend, int cols, int rows);
+void bsdr_app_get_terminal(bsdr_app *a, char *backend, size_t bl, int *cols, int *rows);
 void bsdr_app_set_quality(bsdr_app *a, int w, int h, int bitrate);
 void bsdr_app_get_quality(bsdr_app *a, int *w, int *h, int *bitrate);
 /* Web-UI bitrate override: bps to force, or 0 to follow whatever the headset asks for. Recomputes

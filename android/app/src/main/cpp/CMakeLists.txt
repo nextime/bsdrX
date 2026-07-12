@@ -52,6 +52,7 @@ set(CORE_SRC
   ${CORE}/micsub.c                      # owner-mic cloud substitution (NFQUEUE) — stub on Android
   ${CORE}/deps.c                        # 3rd-party dependency manager (empty list on Android)
   ${CORE}/screenblank.c                 # privacy screen-blank (no-op on Android)
+  ${CORE}/term.c                        # terminal source: Android compiles the stub (headless-only feature)
   # Android platform shims (replace capture.c / inject_*.c / pulse half / winlist / filesrc)
   ${CORE}/capture_android.c ${CORE}/audio_android.c ${CORE}/inject_android.c
   ${CORE}/winlist_android.c ${CORE}/filesrc_android.c ${CORE}/voice_android.c

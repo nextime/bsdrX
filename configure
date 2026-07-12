@@ -20,6 +20,7 @@ prefix=/usr/local
 host=
 with_openssl=
 with_onnx=
+onnx_fetch=yes         # auto-download the pinned ONNX Runtime prebuilt if not found (--no-onnx-fetch to skip)
 enable_sctp=yes        # media is on by default; deps auto-detected below
 enable_video=yes
 enable_audio=yes
@@ -40,6 +41,7 @@ for arg in "$@"; do
         --host=*)         host=${arg#*=} ;;
         --with-openssl=*) with_openssl=${arg#*=} ;;
         --with-onnx=*)    with_onnx=${arg#*=} ;;
+        --no-onnx-fetch)  onnx_fetch=no ;;
         --enable-sctp)    enable_sctp=yes ;;
         --enable-video)   enable_video=yes ;;
         --enable-audio)   enable_audio=yes ;;
@@ -225,7 +227,7 @@ if [ "$enable_video" = yes ]; then
     if [ "$target" = linux ] || [ "$target" = macos ]; then
         # Desktop capture + local-file streaming + 2D->3D (all ffmpeg): Linux via
         # x11grab/kmsgrab + nvenc/vaapi/x264, macOS via avfoundation + h264_videotoolbox.
-        MEDIA_SRC="$MEDIA_SRC src/capture.c src/filesrc.c src/fileaudio.c src/capture_pipewire.c"   # threed.c is in the Makefile's CORE_SRC; capture_pipewire = Wayland (stub off Linux)
+        MEDIA_SRC="$MEDIA_SRC src/capture.c src/filesrc.c src/fileaudio.c src/capture_pipewire.c src/term.c"   # threed.c is in the Makefile's CORE_SRC; capture_pipewire = Wayland (stub off Linux); term.c = terminal source (Linux; stub elsewhere)
         MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_CAPTURE=1"
         MEDIA_CFLAGS="$MEDIA_CFLAGS $(pkg --cflags libavcodec libavformat libavdevice libavutil libswscale libswresample libavfilter 2>/dev/null)"
         MEDIA_LIBS="$MEDIA_LIBS $(pkg $PKG_LIBS libavcodec libavformat libavdevice libavutil libswscale libswresample libavfilter 2>/dev/null)"
@@ -248,6 +250,17 @@ if [ "$enable_video" = yes ] && [ "$target" = linux ]; then
     else
         echo "configure: Wayland capture OFF (install libpipewire-0.3-dev + libdbus-1-dev); x11grab/kmsgrab only"
     fi
+fi
+# --- Terminal source, PTY backend: vendored libvterm (third_party) + a pseudo-terminal ------------
+# Renders a shell straight to video with NO X server (the truly-headless path). The library is
+# vendored (MIT), so this is always built on Linux. The XVFB backend reuses x11grab + XTEST (above).
+HAVE_VTERM=
+if [ "$enable_video" = yes ] && [ "$target" = linux ] && [ -f third_party/libvterm/src/vterm.c ]; then
+    MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_VTERM=1 -Ithird_party/libvterm/include"
+    MEDIA_LIBS="$MEDIA_LIBS -lutil"   # forkpty/openpty
+    MEDIA_SRC="$MEDIA_SRC src/term_pty.c"
+    HAVE_VTERM=1
+    echo "configure: terminal PTY backend = vendored libvterm 0.3.3 (headless console)"
 fi
 # --- Wayland privacy screen-blank: wlr-gamma-control (wlroots compositors) ---------------------------
 # Linux only; independent of capture. Needs libwayland-client + wayland-scanner (to generate the client
@@ -323,20 +336,73 @@ fi
 # checkout, or /opt/onnxruntime; absent -> those units stub out (no error, it's optional).
 ONNX_DEF=
 ONNX_LIBS=
+# ONNX Runtime is a version-PINNED prebuilt (1.20.1), so the pinned copy wins over an arbitrary system
+# one (its ABI is version-locked). Preference order:
+#   --with-onnx=DIR  >  repo-local third_party/onnxruntime/<host> (fetched by scripts/fetch-onnx.sh)  >
+#   legacy sibling ../onnx-deps / /opt  >  auto-fetch the pinned prebuilt  >  a SYSTEM install (offline
+#   fallback only)  >  disabled. It is a PREBUILT binary — we download it, we do NOT build it from
+#   source (that's a huge C++/CMake project); scripts/fetch-onnx.sh verifies its SHA256. ONNX_LIB_INSTALL
+#   is the lib dir `make install` copies into libdir; EMPTY for a system ORT (the loader already finds it).
 onnx_prefix=
+onnx_system=
+ONNX_LIB_INSTALL=
+case "$(uname -s 2>/dev/null):$(uname -m 2>/dev/null)" in
+    Darwin:arm64|Darwin:aarch64) onnx_host=osx-arm64; onnx_sib='../onnx-deps/onnxruntime-osx-arm64-*' ;;
+    *)                            onnx_host=linux-x64; onnx_sib='../onnx-deps/onnxruntime-linux-x64-*' ;;
+esac
 if [ -n "$with_onnx" ]; then
     onnx_prefix="$with_onnx"
 else
-    for d in ../onnx-deps/onnxruntime-linux-* /opt/onnxruntime; do
+    for d in "third_party/onnxruntime/$onnx_host" $onnx_sib /opt/onnxruntime; do
         [ -f "$d/include/onnxruntime_c_api.h" ] && { onnx_prefix="$d"; break; }
     done
+    if [ -z "$onnx_prefix" ] && [ "$onnx_fetch" != no ] && [ -f scripts/fetch-onnx.sh ]; then
+        echo "configure: ONNX Runtime not found locally -> fetching the pinned prebuilt for $onnx_host"
+        if sh scripts/fetch-onnx.sh "$onnx_host" >&2; then
+            [ -f "third_party/onnxruntime/$onnx_host/include/onnxruntime_c_api.h" ] && \
+                onnx_prefix="third_party/onnxruntime/$onnx_host"
+        else
+            echo "configure: fetch failed (offline?) -> trying a system ONNX Runtime" >&2
+        fi
+    fi
+    if [ -z "$onnx_prefix" ]; then
+        if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libonnxruntime 2>/dev/null; then
+            onnx_system="pkg-config"
+        else
+            for h in /usr/include/onnxruntime_c_api.h /usr/include/onnxruntime/onnxruntime_c_api.h \
+                     /usr/local/include/onnxruntime_c_api.h /usr/local/include/onnxruntime/onnxruntime_c_api.h; do
+                [ -f "$h" ] && { onnx_system="$h"; break; }
+            done
+        fi
+    fi
 fi
 if [ -n "$onnx_prefix" ] && [ -f "$onnx_prefix/include/onnxruntime_c_api.h" ]; then
     ONNX_DEF="-DBSDR_HAVE_ONNX=1 -I$onnx_prefix/include"
-    ONNX_LIBS="-L$onnx_prefix/lib -lonnxruntime -Wl,-rpath,$onnx_prefix/lib"
-    echo "configure: in-process depth + face swap = ONNX Runtime at $onnx_prefix"
+    # rpath must be ABSOLUTE: a relative rpath resolves against the process cwd, so the agent only
+    # finds libonnxruntime.so.1 when launched from the build dir (the reported bug). Also add
+    # $ORIGIN/../lib so an installed tree (bin/ + lib/) is self-contained and finds the copy that
+    # `make install` drops in libdir. (The $$ becomes $ in config.mk -> make -> the single quotes
+    # keep the shell from expanding $ORIGIN at link time.)
+    onnx_abs=$(cd "$onnx_prefix/lib" 2>/dev/null && pwd)
+    [ -n "$onnx_abs" ] || onnx_abs="$onnx_prefix/lib"
+    ONNX_LIBS="-L$onnx_prefix/lib -lonnxruntime -Wl,-rpath,$onnx_abs -Wl,-rpath,'\$\$ORIGIN/../lib'"
+    ONNX_LIB_INSTALL="$onnx_abs"
+    echo "configure: in-process depth + face swap = ONNX Runtime at $onnx_prefix (rpath $onnx_abs + \$ORIGIN/../lib)"
+elif [ -n "$onnx_system" ]; then
+    # System ORT (offline fallback): headers + libonnxruntime.so already where the compiler/loader look.
+    # No -L/rpath, and `make install` must NOT copy a system lib (ONNX_LIB_INSTALL stays empty).
+    if [ "$onnx_system" = "pkg-config" ]; then
+        ONNX_DEF="-DBSDR_HAVE_ONNX=1 $(pkg-config --cflags libonnxruntime)"
+        ONNX_LIBS="$(pkg-config --libs libonnxruntime)"
+    else
+        ONNX_DEF="-DBSDR_HAVE_ONNX=1 -I$(dirname "$onnx_system")"
+        ONNX_LIBS="-lonnxruntime"
+    fi
+    echo "configure: in-process depth + face swap = system ONNX Runtime ($onnx_system) [pinned prebuilt unavailable]"
 else
-    echo "configure: ONNX Runtime not found -> 2D->3D neural tiers + face swap stub out (pass --with-onnx=DIR to enable)"
+    echo "configure: ONNX Runtime unavailable -> the NEURAL 2D->3D + face-swap tiers are disabled (they need"
+    echo "           ONNX Runtime; the DSP/heuristic paths still build). Get it with: ./scripts/fetch-onnx.sh"
+    echo "           (or pass --with-onnx=DIR, or install libonnxruntime). See ./configure --help."
 fi
 
 # Final flag strings (used both for the smoke test below and the emitted config.mk).
@@ -391,10 +457,12 @@ WINLIST_SRC = $WINLIST_SRC
 SCTP_SRC    = $SCTP_SRC
 MEDIA_SRC   = $MEDIA_SRC
 WAYLAND_GAMMA = $WAYLAND_GAMMA
+HAVE_VTERM = $HAVE_VTERM
 
 CFLAGS  = $CFLAGS_OUT
 LDFLAGS = $LDFLAGS_OUT
 LDLIBS  = $LDLIBS_OUT
+ONNX_LIB_INSTALL = $ONNX_LIB_INSTALL
 EOF
 
 if [ -f config.mk ] && cmp -s config.mk.new config.mk; then

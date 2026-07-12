@@ -71,6 +71,13 @@ typedef struct {
     int threed_full;        /* 1 = full-res per eye (2x width) */
     int threed_tier;        /* AI in-process depth tier: 0 external/none, 1 cpu, 2 gpu, 3 hi */
     char threed_ai_cmd[256];/* AI-mode external depth helper command */
+    /* Raw in-process frame source (terminal PTY backend): when raw_render is non-NULL the capture
+     * pulls frames from it instead of grabbing a screen/decoding a file — like the PipeWire path but
+     * CPU-only. raw_render fills a packed 32-bit BGR0 buffer (raw_w x raw_h, stride = raw_w*4) and
+     * returns 0 on a frame, <0 at EOF. Forces the CPU scale path (composites the exit bar). */
+    int (*raw_render)(void *user, uint8_t *bgr0, int w, int h);
+    void *raw_user;
+    int raw_w, raw_h;
 } bsdr_capture_config;
 
 bsdr_capture *bsdr_capture_open(const bsdr_capture_config *cfg);

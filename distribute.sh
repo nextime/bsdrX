@@ -268,8 +268,25 @@ build_android(){
     release) task=assembleRelease; apk="$ROOT/android/app/build/outputs/apk/release/app-release.apk";;
     *)       task=assembleDebug;   apk="$ROOT/android/app/build/outputs/apk/debug/app-debug.apk";;
   esac
+  # JDK selection: Kotlin 1.9.x (bundled IntelliJ JavaVersion parser) crashes on a Java 22+ / early-access
+  # version string (e.g. "25.0.4-ea") — its daemon dies mid-flush and corrupts the incremental cache. The
+  # Android build targets Java 17, so prefer an installed JDK 17/21 for the Gradle run when the active JDK
+  # is newer/unparseable. An explicit JAVA_HOME pointing at a 17/21 JDK is honoured as-is.
+  local jdk=""
+  if [ -n "${JAVA_HOME:-}" ] && "$JAVA_HOME/bin/java" -version 2>&1 | grep -qE 'version "(17|21)[.\"]'; then
+    jdk="$JAVA_HOME"
+  else
+    for c in /usr/lib/jvm/java-17-openjdk-* /usr/lib/jvm/java-21-openjdk-* /usr/lib/jvm/openjdk-17 \
+             /usr/lib/jvm/temurin-17-* /usr/lib/jvm/temurin-21-* \
+             /Library/Java/JavaVirtualMachines/*-17*/Contents/Home /Library/Java/JavaVirtualMachines/*-21*/Contents/Home; do
+      [ -x "$c/bin/javac" ] || continue
+      "$c/bin/java" -version 2>&1 | grep -qE 'version "(17|21)[.\"]' && { jdk="$c"; break; }
+    done
+  fi
+  if [ -n "$jdk" ]; then export JAVA_HOME="$jdk"; ok "Android JDK=$JAVA_HOME"
+  else warn "no JDK 17/21 found; using default java ($(java -version 2>&1 | head -1)) — Kotlin 1.9 may fail on a 22+/-ea JDK"; fi
   log "  running gradle $task (first run downloads the NDK toolchain)…"
-  if ( cd "$ROOT/android" && ANDROID_HOME="$ANDROID_HOME" ANDROID_SDK_ROOT="$ANDROID_HOME" ./gradlew --no-daemon "$task" ); then
+  if ( cd "$ROOT/android" && ANDROID_HOME="$ANDROID_HOME" ANDROID_SDK_ROOT="$ANDROID_HOME" PATH="$JAVA_HOME/bin:$PATH" ./gradlew --no-daemon "$task" ); then
     if [ -f "$apk" ]; then cp -f "$apk" "$DIST/bsdrX-android-$VERSION.apk"; ok "packaged bsdrX-android-$VERSION.apk"; record android OK "$(secs $((SECONDS-t0)))";
     else err "APK not produced at $apk"; record android FAIL "no apk"; fi
   else err "gradle $task failed"; record android FAIL "gradle"; fi

@@ -75,6 +75,8 @@ bsdr_pa *bsdr_pa_play_open(const char *sink, int channels) {
     BSDR_INFO("bsdr.audio", "android play open (%d ch) -> AudioTrack", channels);
     return p;
 }
+/* No optional/absent sink on Android (AudioTrack is always present) -> same as _play_open. */
+bsdr_pa *bsdr_pa_play_open_quiet(const char *sink, int channels) { return bsdr_pa_play_open(sink, channels); }
 
 int bsdr_pa_read(bsdr_pa *pa, int16_t *pcm, int frames) {
     size_t need = (size_t)frames * pa->channels, got = 0;

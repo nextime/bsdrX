@@ -125,6 +125,12 @@ struct bsdr_capture {
     uint8_t *fs_rgb;
     int is_file;                /* decoding a file rather than grabbing the screen */
     int is_webcam;              /* capturing a camera (live, like screen; CPU scale path) */
+    /* ---- raw in-process frame source (terminal PTY): frames pulled from a render callback ---- */
+    int is_raw;
+    int (*raw_render)(void *user, uint8_t *bgr0, int w, int h);
+    void *raw_user;
+    int raw_w, raw_h;
+    uint8_t *raw_buf;           /* BGR0 render target the callback fills; wrapped into c->raw */
     int is_stereo;              /* two cameras composited side-by-side (real stereo SBS) */
     /* ---- stereo right-eye input (is_stereo): a second full decode+scale pipeline ---- */
     AVFormatContext *fmt2;
@@ -671,6 +677,31 @@ bsdr_capture *bsdr_capture_open(const bsdr_capture_config *cfg_in) {
         goto have_input;
     }
 
+    /* ---- Raw in-process frame source (terminal PTY backend): frames come from a render callback
+     * (packed BGR0), not a screen grab / file. Set up dummy fmt/dec carrying only size+pixfmt+timebase
+     * for the shared scale/encode setup — exactly like the PipeWire path — and force the CPU path. ---- */
+    if (cfg.raw_render && cfg.raw_w > 0 && cfg.raw_h > 0) {
+        c->is_raw = 1;
+        c->raw_render = cfg.raw_render; c->raw_user = cfg.raw_user;
+        c->raw_w = cfg.raw_w; c->raw_h = cfg.raw_h;
+        cfg.cpu_only = 1; cfg.use_vaapi = 0; cfg.use_kmsgrab = 0;
+        c->raw_buf = av_malloc((size_t)c->raw_w * c->raw_h * 4);
+        if (!c->raw_buf) { bsdr_capture_close(c); return NULL; }
+        c->fmt = avformat_alloc_context();
+        if (!c->fmt) { bsdr_capture_close(c); return NULL; }
+        AVStream *st = avformat_new_stream(c->fmt, NULL);
+        if (!st) { bsdr_capture_close(c); return NULL; }
+        st->time_base = (AVRational){ 1, cfg.fps };
+        c->vstream = 0;
+        c->dec = avcodec_alloc_context3(NULL);   /* not opened — carries size/pixfmt for scale setup */
+        if (!c->dec) { bsdr_capture_close(c); return NULL; }
+        c->dec->pix_fmt = AV_PIX_FMT_BGR0;
+        c->dec->width = c->raw_w; c->dec->height = c->raw_h;
+        c->dec->time_base = (AVRational){ 1, cfg.fps };
+        BSDR_INFO("bsdr.capture", "raw source: in-process render %dx%d BGR0 -> CPU encode", c->raw_w, c->raw_h);
+        goto have_input_pw;
+    }
+
     AVDictionary *opts = NULL;
     char vsize[32];
     if (cfg.width > 0 && cfg.height > 0) {
@@ -797,9 +828,7 @@ have_input:;
         if (!c->raw2) goto fail;
     }
 
-#ifdef BSDR_HAVE_PIPEWIRE
-have_input_pw:;   /* PipeWire path joins here: fmt/dec already set by cap_open_pipewire (no avformat decode) */
-#endif
+have_input_pw:;   /* PipeWire + raw-render paths join here: fmt/dec already set (no avformat decode) */
 #if defined(__APPLE__)
     /* macOS single-window / region capture: avfoundation grabbed the whole display (no grab-time crop),
      * so apply the web-UI x/y/w/h here in software. Clamp to the frame and align to even so 4:2:0 chroma
@@ -1052,6 +1081,23 @@ int bsdr_capture_frame(bsdr_capture *c, const uint8_t **au, size_t *len,
         }
     }
 
+    if (c->is_raw) {
+        /* Terminal PTY source: pull one packed-BGR0 frame from the render callback and wrap it as
+         * c->raw (like the PipeWire fast-path). A <0 return means the shell exited — signal EOF so the
+         * agent falls back to the desktop. Pace to the target fps. */
+        int rr = c->raw_render(c->raw_user, c->raw_buf, c->raw_w, c->raw_h);
+        if (rr < 0) return -1;
+        int ms = 1000 / (c->fps > 0 ? c->fps : 30);
+        bsdr_sleep_ms((unsigned)ms);
+        av_frame_unref(c->raw);
+        c->raw->format = c->dec->pix_fmt;
+        c->raw->width  = c->dec->width;
+        c->raw->height = c->dec->height;
+        c->raw->data[0]     = c->raw_buf;
+        c->raw->linesize[0] = c->raw_w * 4;
+        goto have_raw;
+    }
+
 #ifdef BSDR_HAVE_PIPEWIRE
     if (c->pw && c->pw_dmabuf_active) {
         /* --pw-dmabuf: the frame is a DRM_PRIME dmabuf. Push it through the VAAPI graph (hwmap ->
@@ -1126,9 +1172,7 @@ read_frame:
     if (avcodec_receive_frame(c->dec, c->raw) != 0) return 0;
     if (c->is_file) cap_pace(c, c->raw->pts);
 
-#ifdef BSDR_HAVE_PIPEWIRE
-have_raw:;   /* jump target for the Wayland/PipeWire fast-path above; absent (and unreferenced) otherwise */
-#endif
+have_raw:;   /* jump target for the PipeWire / raw-render fast-paths above (both wrap c->raw directly) */
     /* Voice-command balloon: composite onto the SOURCE frame (before scale/convert/
      * upload) so it survives both the CPU and the GPU (VAAPI/CUDA) encode paths — no
      * CPU-encode fallback needed. Only a software packed-RGB32 frame can be drawn on;
@@ -1240,6 +1284,7 @@ void bsdr_capture_close(bsdr_capture *c) {
     if (c->opkt) { av_packet_unref(c->opkt); av_packet_free(&c->opkt); }
     if (c->ipkt) { av_packet_unref(c->ipkt); av_packet_free(&c->ipkt); }
     if (c->raw) av_frame_free(&c->raw);
+    if (c->raw_buf) { av_free(c->raw_buf); c->raw_buf = NULL; }   /* terminal PTY render target */
     if (c->raw2) av_frame_free(&c->raw2);
     if (c->yuv) av_frame_free(&c->yuv);
     if (c->src) av_frame_free(&c->src);

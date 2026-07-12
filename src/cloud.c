@@ -168,7 +168,11 @@ bool bsdr_cloud_login(int client_mode, const char *email, const char *password,
     return out->ok;
 }
 
-bool bsdr_cloud_account(const char *api_key, const char *access_token, char *name, size_t name_len) {
+/* Returns the HTTP status of GET /auth/account: 0 = the server could NOT be reached (network failure —
+ * distinct from a rejected token), 2xx = the token is valid, 401/403/... = reached but rejected. Fills
+ * `name` best-effort on a 2xx. Restore uses this to tell "offline" from "invalid token" so a transient
+ * connect failure doesn't throw away a good saved session. */
+int bsdr_cloud_account_status(const char *api_key, const char *access_token, char *name, size_t name_len) {
     char req[1024];
     snprintf(req, sizeof(req),
         "GET /auth/account HTTP/1.1\r\n"
@@ -181,23 +185,30 @@ bool bsdr_cloud_account(const char *api_key, const char *access_token, char *nam
 
     static char resp[16384];
     int n = https_request(BSDR_CLOUD_API_HOST, req, resp, sizeof(resp));
-    if (n < 0 || status_code(resp) / 100 != 2) return false;
+    if (n < 0) return 0;                       /* unreachable — network failure, NOT an invalid token */
+    int code = status_code(resp);
+    if (code / 100 != 2) return code;          /* reached, but the token was rejected */
     const char *body = strstr(resp, "\r\n\r\n");
-    if (!body) return false;
-    body += 4;
-    /* Surface identity + verified flag so we can tell WHICH account this token is and whether it can
-     * join a VerifiedUsersOnly room (the room-join gate). isVerified/socialId come straight from
-     * /auth/account, same shape as the ownerSocialProfile in GET /rooms. */
-    { char sid[80] = "", ver[8] = "";
-      bsdr_json_get_str(body, "socialId", sid, sizeof sid);
-      bsdr_json_get_str(body, "isVerified", ver, sizeof ver);   /* "true"/"false" if present as a token */
-      BSDR_INFO("bsdr.cloud", "account: socialId=%s isVerified=%s  body: %.400s",
-                sid[0] ? sid : "?", ver[0] ? ver : "?", body); }
-    /* best-effort: pull a display name / username field */
-    if (bsdr_json_get_str(body, "displayName", name, name_len)) return true;
-    if (bsdr_json_get_str(body, "username", name, name_len)) return true;
-    if (bsdr_json_get_str(body, "email", name, name_len)) return true;
-    return false;
+    if (body) {
+        body += 4;
+        /* Surface identity + verified flag so we can tell WHICH account this token is and whether it can
+         * join a VerifiedUsersOnly room (the room-join gate). isVerified/socialId come straight from
+         * /auth/account, same shape as the ownerSocialProfile in GET /rooms. */
+        { char sid[80] = "", ver[8] = "";
+          bsdr_json_get_str(body, "socialId", sid, sizeof sid);
+          bsdr_json_get_str(body, "isVerified", ver, sizeof ver);   /* "true"/"false" if present as a token */
+          BSDR_INFO("bsdr.cloud", "account: socialId=%s isVerified=%s  body: %.400s",
+                    sid[0] ? sid : "?", ver[0] ? ver : "?", body); }
+        /* best-effort: pull a display name / username field */
+        (void)(bsdr_json_get_str(body, "displayName", name, name_len) ||
+               bsdr_json_get_str(body, "username", name, name_len) ||
+               bsdr_json_get_str(body, "email", name, name_len));
+    }
+    return code;   /* 2xx = valid */
+}
+
+bool bsdr_cloud_account(const char *api_key, const char *access_token, char *name, size_t name_len) {
+    return bsdr_cloud_account_status(api_key, access_token, name, name_len) / 100 == 2;
 }
 
 /* ---- base64 (for the WS connectionString) ---- */

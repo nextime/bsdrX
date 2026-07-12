@@ -92,11 +92,33 @@ composited on top, and the source's own audio is streamed:
 - **Window** — cast a single application window (all platforms: X11/Windows window
   lists, macOS CGWindowList + software crop, Android's MediaProjection app picker).
 - **Video file / playlist** — a local file, or a `.txt` **playlist** (one entry per
-  line, looped). `--file PATH`.
+  line). `--file PATH`. Switching to a file from the web UI is **seamless**: the desktop
+  keeps streaming until the file's first frame is ready (make-before-break — no black gap
+  while you pick it), and the file is **re-encoded** through the pipeline so any input
+  codec / resolution / fps is normalized to what the Quest needs. A single file **plays
+  once and returns to the desktop** when it ends; a **loop** toggle (web UI checkbox *and*
+  the in-VR media bar) plays it/the playlist continuously instead. A file that **fails to
+  play** (bad codec/definition, unreadable) falls back to the desktop rather than
+  black-screening the headset. Whenever a **non-desktop** source is streaming (file, webcam,
+  stereo) the in-VR **media bar** is shown with an **exit-to-desktop** button, so you can
+  always get back to the desktop from the headset.
 - **http / https / rtsp URL** — stream a network video source. `--file URL`.
 - **Webcam** — a single camera as the source.
 - **Stereo-3D two-camera** — two cameras composited side-by-side as a *real* stereo
   pair (mount them ~6 cm apart, level); this bypasses the depth-based 2D→3D synth.
+- **Terminal / console** — stream a **shell** to the headset with the Quest's keyboard
+  (and mouse, when supported) injected into it. This works on a **headless** machine (no
+  monitor). `--terminal[=pty|xvfb]`, `--terminal-cmd CMD` (default `$SHELL`),
+  `--terminal-size CxR`. Two backends:
+  - **`pty`** (default) — an in-process terminal emulator (vendored **libvterm**) rendered
+    straight to the video stream, needing **no X server at all** — the truly-headless path.
+    Keystrokes go to the pty; the mouse is forwarded only when the running program turns on
+    terminal mouse reporting (e.g. `htop`, `vim` with mouse on) — the "when supported" case.
+  - **`xvfb`** — a private **Xvfb** + **xterm** captured with x11grab; input is injected via
+    **XTEST** (Xvfb has no evdev backend, so uinput can't reach it). A full graphical terminal
+    with real mouse support; needs `xvfb` + `xterm` installed on the host.
+  Like the other non-desktop sources it shows the in-VR bar with an **exit-to-desktop**
+  button, and if the shell exits (or the backend fails to start) it returns to the desktop.
 
 ### 2D→3D — real-time depth conversion
 
@@ -388,6 +410,7 @@ encoder paths, and the build targets).
 | Video file / URL / playlist source | ✅ | ✅ | ✅ | ✅ (MediaExtractor transcode) |
 | Webcam source | ✅ V4L2 | ✅ DirectShow | ✅ AVFoundation (enumerated dropdown) | ✅ CameraManager |
 | Stereo-3D two-camera | ✅ | ✅ | ✅ | ✅ |
+| Terminal / console source (headless) | ✅ pty (libvterm) + xvfb (XTEST) | — | — | — |
 | Hardware (GPU) encode | ✅ NVENC/CUDA + VAAPI + kmsgrab | ✅ NVENC / AMF / QSV / MediaFoundation | ✅ VideoToolbox | ✅ MediaCodec |
 | CPU encode (x264) | ✅ | ✅ | ✅ (fallback) | — (HW codec) |
 | 2D→3D `fast` heuristic | ✅ | ✅ | ✅ | ✅ |
@@ -570,6 +593,17 @@ The build is autotools-style: **`./configure && make && make install`**. `make` 
 **libraries / linking change** (it re-detects deps and rewrites `config.mk`; it's idempotent, so a
 no-op re-run won't force a rebuild). Bare `make` with no `config.mk` stops and tells you to configure.
 
+**ONNX Runtime (neural 2D→3D + face swap + AI voice).** ORT is a version-**pinned** prebuilt
+(1.20.1). It's a large C++ project, so it's **downloaded, not built**: `./configure` auto-runs
+`scripts/fetch-onnx.sh`, which pulls the official release for your platform into a git-ignored
+`third_party/onnxruntime/<platform>/` and **verifies its SHA256** (the committed script + pinned
+version/hash is what makes the build reproducible — the binary itself is not committed). The rpath is
+baked absolute plus `$ORIGIN/../lib`, and `make install` copies the lib into `$(libdir)`, so an
+installed `bin`+`lib` tree is self-contained and relocatable. Overrides: `--with-onnx=DIR` to point at
+your own copy, `--no-onnx-fetch` to skip the download (then a **system** `libonnxruntime` is used if
+present, else the neural tiers disable — the DSP/heuristic paths still build). Fetch a platform
+manually with `./scripts/fetch-onnx.sh linux-x64|osx-arm64|win-x64`.
+
 CMake is also supported:
 `cmake -S . -B build -DBSDR_ENABLE_VIDEO=ON -DBSDR_ENABLE_AUDIO=ON -DBSDR_ENABLE_SCTP=ON && cmake --build build -j`
 
@@ -637,6 +671,8 @@ a debug APK.
 ./build/bsdr_agent --sniff-mic --compctl-vision   # voice computer-control with vision
 ./build/bsdr_agent --file movie.mp4 --threed fast # a 2D→3D movie
 ./build/bsdr_agent --threed-tier cpu --threed ai  # built-in neural depth
+./build/bsdr_agent --terminal                     # stream a shell (headless, no X); type from the Quest
+./build/bsdr_agent --terminal=xvfb --terminal-cmd htop  # a graphical xterm (Xvfb) running htop, with mouse
 ```
 
 See `man bsdr_agent` / [`docs/bsdr_agent.1`](docs/bsdr_agent.1) for every option.

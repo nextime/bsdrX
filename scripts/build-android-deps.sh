@@ -96,9 +96,16 @@ for ABI in "${ABIS[@]}"; do
     cmake_dep "usrsctp-master" -Dsctp_build_programs=OFF -Dsctp_build_shared_lib=OFF
 
   echo "== onnxruntime $ORT_VER (in-process depth; NNAPI EP) =="
+  # Pinned Maven AAR + SHA256, mirroring the desktop scripts/fetch-onnx.sh. NB: the Android AAR lags the
+  # desktop GitHub release — 1.20.1 is desktop-only, so Android pins the latest published AAR (1.20.0);
+  # the ONNX Runtime C API is stable across the point release, so depth_onnx.c/faceswap.c/voiceai.c are
+  # ABI-compatible either way. Bump ORT_VER + ORT_AAR_SHA256 together when a newer AAR ships.
+  ORT_AAR_SHA256=07a8f71ef890afed8c6087a56220e6d558a492804276ee2dd7cb7f6262242027
   if [ ! -f "$PREFIX/lib/libonnxruntime.so" ]; then
     [ -f "onnxruntime-android-$ORT_VER.aar" ] || curl -fsSL -o "onnxruntime-android-$ORT_VER.aar" \
       "https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/$ORT_VER/onnxruntime-android-$ORT_VER.aar"
+    _got=$(sha256sum "onnxruntime-android-$ORT_VER.aar" | cut -d' ' -f1)
+    [ "$_got" = "$ORT_AAR_SHA256" ] || { echo "ERROR: onnxruntime-android-$ORT_VER.aar SHA256 mismatch (got $_got)"; exit 1; }
     rm -rf aar-$ABI && mkdir aar-$ABI && ( cd aar-$ABI && unzip -q "../onnxruntime-android-$ORT_VER.aar" )
     cp -a aar-$ABI/headers/* "$PREFIX/include/"
     cp -a "aar-$ABI/jni/$ABI/libonnxruntime.so" "$PREFIX/lib/"

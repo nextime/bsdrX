@@ -347,7 +347,8 @@ static const char PAGE[] =
 "<label><input type=radio name=src value=desktop onclick=pickSrc('desktop') style=width:auto> Desktop</label> "
 "<label><input type=radio name=src value=file onclick=pickSrc('file') style=width:auto> Video file</label> "
 "<label><input type=radio name=src value=webcam onclick=pickSrc('webcam') style=width:auto> Webcam</label> "
-"<label><input type=radio name=src value=webcam3d onclick=pickSrc('webcam3d') style=width:auto> Stereo 3D (2 cams)</label></div>"
+"<label><input type=radio name=src value=webcam3d onclick=pickSrc('webcam3d') style=width:auto> Stereo 3D (2 cams)</label> "
+"<label><input type=radio name=src value=terminal onclick=pickSrc('terminal') style=width:auto> Terminal</label></div>"
 "<div class=row id=winrow><label style=width:auto;color:var(--muted)>Capture</label>"
 "<select id=win class=grow onchange=selWin()></select>"
 "<button onclick=loadWindows() title='Rescan windows/screens' style=width:auto>&#8635;</button></div>"
@@ -364,8 +365,18 @@ static const char PAGE[] =
 "<span id=camselR class=grow></span></div>"
 "<div class=hint id=camhint style=display:none>Stream a camera to the headset (and the cloud room). "
 "Stereo 3D uses two cameras side-by-side as a real stereo pair — mount them ~6&#160;cm apart, level.</div>"
+/* Terminal source: stream a shell to the headset (ideal on a headless box). Backend = pty (no X) or
+ * xvfb (private Xvfb+xterm). The command + pty grid are optional. Shown only in terminal mode. */
+"<div class=row id=termrow style=display:none><label style=width:auto;color:var(--muted)>Backend</label>"
+"<select id=termbk class=grow onchange=termSet()><option value=pty>PTY (headless, no X)</option><option value=xvfb>Xvfb + xterm (X, full mouse)</option></select></div>"
+"<div class=row id=termrow2 style=display:none><input id=termcmd class=grow placeholder='command to run (blank = your $SHELL)' onchange=termSrc()>"
+"<input id=termsz style=width:110px placeholder='120x36' onchange=termSet()></div>"
+"<div class=hint id=termhint style=display:none>Streams a shell/console to the headset with the Quest keyboard+mouse injected — works on a "
+"<b>headless</b> machine. <b>PTY</b> renders an in-process terminal (no X needed); <b>Xvfb</b> runs a private X server + xterm "
+"(needs <code>xvfb</code> + <code>xterm</code> installed). Size (cols&#215;rows) applies to the PTY backend. An in-VR bar gives EXIT&#8594;desktop.</div>"
 "<div class=row id=filerow><input id=path class=grow placeholder='/path/to/video.mp4, http(s)://… , rtsp://… , or playlist.txt' onchange=srcpath()>"
 "<button onclick=openBrowse() style=width:auto>Browse&#8230;</button>"
+"<label style='width:auto;font-weight:400'><input id=floop type=checkbox style=width:auto onchange=floopSet()> loop</label>"
 "<button id=pause class=danger onclick=togglePause()>Stop</button></div>"
 "<div class=hint>A video file, an <b>http/https/rtsp URL</b>, or a <b>.txt playlist</b> (one file "
 "or URL per line, streamed in a loop). An in-VR media bar gives play/pause, seek, volume and exit; "
@@ -570,11 +581,15 @@ static const char PAGE[] =
 "function botJoin(){botjoinbtn.disabled=true;botjoinbtn.textContent='Joining…';api('/api/bot/join',{}).then(r=>{botjoinbtn.disabled=false;botjoinbtn.textContent='Join my room';if(!r||!r.ok)alert('Bot room-join failed — check that your headset is in a room and the bot is logged in (see debug log).');})}"
 "function sel(ip){api('/api/select',{ip:ip})}"
 "let cams=[],camMode='desktop';"
-"function srcRows(m){let cam=(m==='webcam'||m==='webcam3d');"
+"function srcRows(m){let cam=(m==='webcam'||m==='webcam3d');let term=(m==='terminal');"
 "winrow.style.display=(m==='desktop')?'flex':'none';winhint.style.display=(m==='desktop')?'block':'none';filerow.style.display=(m==='file')?'flex':'none';"
-"camrow.style.display=cam?'flex':'none';camrowR.style.display=(m==='webcam3d')?'flex':'none';camhint.style.display=cam?'block':'none';}"
+"camrow.style.display=cam?'flex':'none';camrowR.style.display=(m==='webcam3d')?'flex':'none';camhint.style.display=cam?'block':'none';"
+"termrow.style.display=term?'flex':'none';termrow2.style.display=term?'flex':'none';termhint.style.display=term?'block':'none';}"
 "function pickSrc(m){camMode=m;srcRows(m);"
-"if(m==='webcam'||m==='webcam3d'){loadCams().then(pickCam);}else{api('/api/source',{mode:m,path:path.value});}}"
+"if(m==='webcam'||m==='webcam3d'){loadCams().then(pickCam);}else if(m==='terminal'){termSet();termSrc();}else{api('/api/source',{mode:m,path:path.value});}}"
+"function termParseSz(){let m=(termsz.value||'').match(/(\\d+)\\s*[x,]\\s*(\\d+)/);return m?{cols:+m[1],rows:+m[2]}:{cols:0,rows:0};}"
+"function termSet(){let s=termParseSz();api('/api/terminal',{backend:termbk.value,cols:s.cols,rows:s.rows});}"
+"function termSrc(){api('/api/source',{mode:'terminal',path:termcmd.value});}"
 "async function loadCams(){let r=await api('/api/webcams');cams=(r&&r.cams)||[];renderCams();}"
 "async function loadDeps(){let r=await api('/api/deps');let d=(r&&r.deps)||[];let card=document.getElementById('depcard');"
 "if(!d.length){card.style.display='none';return;}card.style.display='';let h='';"
@@ -588,6 +603,7 @@ static const char PAGE[] =
 "function renderCams(){camsel.innerHTML=camCtl('cam',window._cam||'');camselR.innerHTML=camCtl('camR',window._camR||'');}"
 "function pickCam(){let a=document.getElementById('cam'),b=document.getElementById('camR');let d=a?a.value:'',d2=b?b.value:'';window._cam=d;window._camR=d2;api('/api/source',{mode:camMode,path:d,dev2:d2});}"
 "function srcpath(){api('/api/source',{mode:'file',path:path.value})}"
+"function floopSet(){api('/api/fileloop',{on:floop.checked?1:0})}"
 "function blankToggle(){api('/api/blank',{on:blank.checked?1:0})}"
 "function pointerModeToggle(){api('/api/pointermode',{touch:ptouch.checked?1:0})}"
 "function bitrateSet(){api('/api/bitrate',{mbps:+brate.value||0})}"
@@ -752,6 +768,9 @@ static const char PAGE[] =
 "if(s.quests.length>1||s.selected)h='<div class=hint style=margin-top:8px>Choose a headset:</div>'+h;quests.innerHTML=h;"
 "for(const r of document.getElementsByName('src'))r.checked=(r.value===s.source.mode);"
 "if(document.activeElement!==path)path.value=(s.source.mode==='file'?(s.source.path||''):path.value);"
+"if(document.getElementById('floop')&&document.activeElement!==floop&&s.source.fileLoop!==undefined)floop.checked=!!s.source.fileLoop;"
+"if(document.getElementById('termbk')&&document.activeElement!==termbk&&s.source.termBackend)termbk.value=s.source.termBackend;"
+"if(document.getElementById('termsz')&&document.activeElement!==termsz&&s.source.termCols)termsz.placeholder=s.source.termCols+'x'+s.source.termRows;"
 /* reflect the persisted source: show the right rows, and populate the camera picker once */
 "{let m=s.source.mode;camMode=m;srcRows(m);"
 "if((m==='webcam'||m==='webcam3d')&&!camsel.firstChild){window._cam=s.source.path;window._camR=s.source.path2;loadCams();}}"
@@ -983,6 +1002,11 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         double on = 0; bsdr_json_get_double(body, "on", &on);
         bsdr_app_set_kmsgrab(a, on != 0);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/fileloop") == 0) {
+        /* Loop the file/playlist source continuously (also toggleable from the in-VR media bar). */
+        double on = 0; bsdr_json_get_double(body, "on", &on);
+        bsdr_app_set_file_loop(a, on != 0);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/encmode") == 0) {
         /* Encoder effort level: 0 quality (default) / 1 balanced / 2 performance. Persisted; applies on
          * the next stream (re)start. Accept legacy "perf" (0/1) too. */
@@ -1039,6 +1063,15 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         bsdr_app_set_source(a, mode[0] ? mode : NULL, p);
         if (bsdr_json_get_str(body, "dev2", dev2, sizeof(dev2)))   /* stereo: the right camera */
             bsdr_app_set_source_right(a, dev2);
+        respond(c, 200, "application/json", "{\"ok\":true}", 11);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/terminal") == 0) {
+        /* Terminal-source backend + pty grid (persisted). Does NOT switch the source itself — the UI
+         * calls /api/source {mode:terminal} for that. */
+        char bk[8] = ""; double cols = 0, rows = 0;
+        bsdr_json_get_str(body, "backend", bk, sizeof(bk));
+        bsdr_json_get_double(body, "cols", &cols);
+        bsdr_json_get_double(body, "rows", &rows);
+        bsdr_app_set_terminal(a, bk[0] ? bk : NULL, (int)cols, (int)rows);
         respond(c, 200, "application/json", "{\"ok\":true}", 11);
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/webcams") == 0) {
         /* Enumerate the platform's cameras for the source picker (Android does this in Kotlin). */

@@ -187,6 +187,10 @@ bsdr_pa *bsdr_pa_record_open(const char *source, int channels) {
 bsdr_pa *bsdr_pa_play_open(const char *sink, int channels) {
     return pa_open(sink, channels, false);
 }
+/* No noisy backend error to suppress here (the loopback device is persistent) -> same as _play_open. */
+bsdr_pa *bsdr_pa_play_open_quiet(const char *sink, int channels) {
+    return pa_open(sink, channels, false);
+}
 
 /* Convert one captured packet (mix format) -> interleaved S16 at target channels. */
 static void push_converted(bsdr_pa *pa, const BYTE *data, UINT32 frames) {

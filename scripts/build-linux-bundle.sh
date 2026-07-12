@@ -41,7 +41,7 @@ make clean >/dev/null 2>&1 || true
 # Explicit vars (not ./configure autodetect) so we pin OUR deps and set an rpath
 # that finds the bundled libs at $ORIGIN/../lib.
 BASE_CFLAGS="-std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -Ithird_party/miniz"
-MEDIA_SRC="src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/fileaudio.c src/capture_pipewire.c src/audio.c src/micsniff.c src/micsniff_capture.c"
+MEDIA_SRC="src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/fileaudio.c src/capture_pipewire.c src/term.c src/audio.c src/micsniff.c src/micsniff_capture.c"
 MEDIA_DEF="-DBSDR_ENABLE_SCTP=1 -DBSDR_ENABLE_VIDEO=1 -DBSDR_HAVE_CAPTURE=1 -DBSDR_ENABLE_AUDIO=1 -DBSDR_HAVE_AUDIO=1 -DBSDR_HAVE_PCAP=1"
 # Wayland desktop capture (xdg-desktop-portal + PipeWire). System libs in the build image; linuxdeploy
 # bundles them like the others. Absent -> capture_pipewire.c compiles as a stub (x11grab/kmsgrab only).
@@ -86,19 +86,38 @@ if command -v wayland-scanner >/dev/null 2>&1 && pkg-config --exists wayland-cli
   WAYLAND_GAMMA=1
   WLG_SRC="src/screenblank_wayland.c"
   MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_WAYLAND_GAMMA=1"
-  WLG_CFLAGS="$(pkg-config --cflags wayland-client)"
+  # screenblank_wayland.c includes the wayland-scanner-generated header the Makefile emits into the
+  # build dir (BUILD=build-bundle). The Makefile adds -I$(BUILD) itself, but our command-line CFLAGS
+  # override wins, so add it here too or the generated header isn't found.
+  WLG_CFLAGS="$(pkg-config --cflags wayland-client) -Ibuild-bundle"
   WLG_LIBS="$(pkg-config --libs wayland-client)"
   echo ">> Wayland privacy screen-blank = wlr-gamma-control"
 else
   echo ">> WARN: wayland-scanner/libwayland-client not in the build image — Wayland screen-blank stubbed (X11 xrandr only)"
 fi
 
-make all BUILD=build-bundle EXEEXT= BUILD_TESTS=no WAYLAND_GAMMA="$WAYLAND_GAMMA" \
+# Terminal source: PTY backend (vendored libvterm, no X) + XVFB backend (XTEST injection). term.c is
+# in MEDIA_SRC above (asserted); term_pty.c + the libvterm objects are passed separately (they are not
+# in the Makefile's canonical MEDIA_SRC_ALL, so they must not enter the drift assertion). libvterm is
+# vendored under third_party, so the PTY backend always builds; XTEST needs libXtst in the image.
+HAVE_VTERM=; VTERM_SRC=""; VTERM_LIBS=""
+if [ -f third_party/libvterm/src/vterm.c ]; then
+  HAVE_VTERM=1; VTERM_SRC="src/term_pty.c"; VTERM_LIBS="-lutil"
+  MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_VTERM=1 -Ithird_party/libvterm/include"
+  echo ">> terminal PTY backend = vendored libvterm 0.3.3"
+fi
+XTST_LIBS=""
+if pkg-config --exists xtst 2>/dev/null || [ -f /usr/include/X11/extensions/XTest.h ]; then
+  MEDIA_DEF="$MEDIA_DEF -DBSDR_HAVE_XTEST=1"; XTST_LIBS="$(pkg-config --libs xtst 2>/dev/null || echo -lXtst)"
+  echo ">> terminal XVFB backend / Unicode keys = X11 XTEST"
+fi
+
+make all BUILD=build-bundle EXEEXT= BUILD_TESTS=no WAYLAND_GAMMA="$WAYLAND_GAMMA" HAVE_VTERM="$HAVE_VTERM" \
   INJECT_SRC=src/inject_linux.c WINLIST_SRC=src/winlist.c \
-  MEDIA_SRC="$MEDIA_SRC $WLG_SRC" SCTP_SRC=src/sctp.c \
+  MEDIA_SRC="$MEDIA_SRC $WLG_SRC $VTERM_SRC" SCTP_SRC=src/sctp.c \
   CFLAGS="$BASE_CFLAGS $MEDIA_DEF $PW_CFLAGS $WLG_CFLAGS -I$BSDRX_DEPS/include" \
   LDFLAGS="-L$BSDRX_DEPS/lib -Wl,-rpath,\$\$ORIGIN/../lib -Wl,--disable-new-dtags" \
-  LDLIBS="$MEDIA_LIBS $WLG_LIBS"
+  LDLIBS="$MEDIA_LIBS $WLG_LIBS $VTERM_LIBS $XTST_LIBS"
 
 BIN="build-bundle/bsdr_agent"
 test -x "$BIN"
@@ -158,6 +177,36 @@ cat > "$APPDIR/usr/share/metainfo/$APPID.appdata.xml" <<EOF
 </component>
 EOF
 
+# Self-contained PipeWire (Wayland capture): linuxdeploy bundles libpipewire-0.3.so.0 (an ldd dep),
+# but at runtime that client dlopens its SPA plugins + protocol modules from a compiled-in path — on
+# the TARGET those would be a different PipeWire (maybe 1.x) and mismatch the bundled 0.3.x client. So
+# bundle the version-matched spa-0.2 + pipewire-0.3 trees and point libpipewire at them via an AppRun
+# hook (linuxdeploy's AppRun exports $APPDIR and sources apprun-hooks/*.sh). The client then stays
+# internally consistent and only talks to the target's daemon over the socket (protocol-stable).
+if [ -n "$PW_LIBS" ]; then
+  PW_MODDIR="$(pkg-config --variable=moduledir libpipewire-0.3 2>/dev/null)"
+  SPA_DIR="$([ -n "$PW_MODDIR" ] && echo "$(dirname "$PW_MODDIR")/spa-0.2")"
+  if [ -d "$PW_MODDIR" ] && [ -d "$SPA_DIR" ]; then
+    mkdir -p "$APPDIR/usr/lib/pipewire-0.3" "$APPDIR/usr/lib/spa-0.2" "$APPDIR/apprun-hooks"
+    cp -a "$PW_MODDIR"/. "$APPDIR/usr/lib/pipewire-0.3/"
+    cp -a "$SPA_DIR"/.   "$APPDIR/usr/lib/spa-0.2/"
+    # Bundle libpipewire-0.3.so.* itself too: it's a DT_NEEDED of the binary but linuxdeploy's
+    # excludelist skips it, which would leave the target's (maybe 1.x) client loading our 0.3.x
+    # plugins — a mismatch. Placing it in usr/lib (on the AppRun's LD_LIBRARY_PATH) keeps the whole
+    # PipeWire stack self-consistent at 0.3.x.
+    cp -a "$(dirname "$PW_MODDIR")"/libpipewire-0.3.so* "$APPDIR/usr/lib/" 2>/dev/null || \
+      echo ">> WARN: libpipewire-0.3.so not found next to $PW_MODDIR — client may fall back to the target's"
+    cat > "$APPDIR/apprun-hooks/pipewire.sh" <<'HOOK'
+# Point the bundled libpipewire at its OWN (version-matched) spa plugins + modules, not the target's.
+export SPA_PLUGIN_DIR="${APPDIR}/usr/lib/spa-0.2"
+export PIPEWIRE_MODULE_DIR="${APPDIR}/usr/lib/pipewire-0.3"
+HOOK
+    echo ">> bundled PipeWire self-contained (spa-0.2 + pipewire-0.3 modules + AppRun hook)"
+  else
+    echo ">> WARN: PipeWire plugin/module dirs not found ($PW_MODDIR / $SPA_DIR) — Wayland capture may fail on newer targets"
+  fi
+fi
+
 # linuxdeploy follows ldd (honoring LD_LIBRARY_PATH) and copies non-system libs,
 # skipping glibc / GPU-driver libs via its built-in exclude list. FUSE-less mode.
 export APPIMAGE_EXTRACT_AND_RUN=1
@@ -185,8 +234,18 @@ cp "$BIN" "$PKG/opt/bsdrX/bin/bsdr_agent"
 # bundled shared libs (everything linuxdeploy pulled in, minus the ELF loader)
 find "$APPDIR/usr/lib" -maxdepth 1 -type f -name '*.so*' -exec cp -a {} "$PKG/opt/bsdrX/lib/" \;
 find "$APPDIR/usr/lib" -maxdepth 1 -type l -name '*.so*' -exec cp -a {} "$PKG/opt/bsdrX/lib/" \;
+# self-contained PipeWire in the .deb too: copy the bundled spa-0.2 + pipewire-0.3 trees (mirrors the AppImage)
+for d in spa-0.2 pipewire-0.3; do [ -d "$APPDIR/usr/lib/$d" ] && cp -a "$APPDIR/usr/lib/$d" "$PKG/opt/bsdrX/lib/"; done
 patchelf --set-rpath '$ORIGIN/../lib' "$PKG/opt/bsdrX/bin/bsdr_agent"
-ln -sf /opt/bsdrX/bin/bsdr_agent "$PKG/usr/bin/bsdr_agent"
+# /usr/bin launcher: a wrapper (not a bare symlink) so it can point the bundled libpipewire at the
+# bundled plugin trees, matching the AppImage's AppRun hook. Falls through harmlessly if absent.
+cat > "$PKG/usr/bin/bsdr_agent" <<'WRAP'
+#!/bin/sh
+[ -d /opt/bsdrX/lib/spa-0.2 ]     && export SPA_PLUGIN_DIR=/opt/bsdrX/lib/spa-0.2
+[ -d /opt/bsdrX/lib/pipewire-0.3 ] && export PIPEWIRE_MODULE_DIR=/opt/bsdrX/lib/pipewire-0.3
+exec /opt/bsdrX/bin/bsdr_agent "$@"
+WRAP
+chmod +x "$PKG/usr/bin/bsdr_agent"
 
 cp assets/../docs/../README.md "$PKG/usr/share/doc/bsdr-agent/README.md" 2>/dev/null || cp README.md "$PKG/usr/share/doc/bsdr-agent/"
 cp LICENSE.md "$PKG/usr/share/doc/bsdr-agent/"

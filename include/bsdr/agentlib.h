@@ -37,6 +37,9 @@ typedef struct {
     bool lan_live;           /* --lan: live desktop over the BigSoup LAN wire format */
     const char *video_file;  /* --file: stream this H.264/container instead of the desktop */
     bool file_gpu;           /* --file-gpu: encode the file on NVENC (default: libx264, better at low bitrate) */
+    const char *terminal;    /* --terminal[=pty|xvfb]: stream a shell (headless console); NULL = off */
+    const char *terminal_cmd;/* --terminal-cmd: shell/program to run (NULL = $SHELL or /bin/bash / xterm default) */
+    int terminal_cols, terminal_rows; /* --terminal-size CxR: pty grid (0 = default 120x36) */
     const char *replay_file; /* --replay: replay captured 45002 frames verbatim (no DTLS) */
     const char *quest_ip;    /* pair only with this headset (NULL = any) */
     int fps, bitrate;        /* 0 = defaults (30 fps, 8 Mbps) */

@@ -81,6 +81,7 @@ bsdr_pa *bsdr_pa_record_open(const char *source, int channels);
 int bsdr_pa_read(bsdr_pa *pa, int16_t *pcm, int frames);     /* blocking */
 /* Play into `sink`; NULL = default. */
 bsdr_pa *bsdr_pa_play_open(const char *sink, int channels);
+bsdr_pa *bsdr_pa_play_open_quiet(const char *sink, int channels);   /* no ERROR log if the sink is absent */
 int bsdr_pa_write(bsdr_pa *pa, const int16_t *pcm, int frames);
 void bsdr_pa_close(bsdr_pa *pa);
 
@@ -89,6 +90,12 @@ void bsdr_pa_close(bsdr_pa *pa);
  * blocks the receive pump. */
 typedef struct bsdr_audio_player bsdr_audio_player;
 bsdr_audio_player *bsdr_audio_player_new(const char *sink, int channels);
+/* Like _new but silent if the sink isn't present (returns NULL, no ERROR log) — for lazy/optional
+ * opens such as the owner-mic sniffer polling for the session-scoped virtual mic sink. */
+bsdr_audio_player *bsdr_audio_player_new_quiet(const char *sink, int channels);
+/* True once the sink the player writes to has gone away (writes fail) — the caller should free and
+ * reopen it (the virtual mic sink is torn down when a streaming session ends). */
+int bsdr_audio_player_dead(const bsdr_audio_player *p);
 void bsdr_audio_player_push(bsdr_audio_player *p, const int16_t *pcm, int frames);
 void bsdr_audio_player_free(bsdr_audio_player *p);
 

@@ -29,6 +29,7 @@
 #include "bsdr/discovery.h"
 #include "bsdr/control.h"
 #include "bsdr/inject.h"
+#include "bsdr/term.h"
 #include "bsdr/udp_transport.h"
 #include "bsdr/capture.h"
 #include "bsdr/filesrc.h"
@@ -94,6 +95,9 @@ typedef struct {
      * threads). Edge-triggered seek via a generation counter so every owner applies it once. ---- */
     int file_gpu;                  /* --file-gpu: encode the file on NVENC instead of libx264 */
     volatile int file_mode;        /* streaming a video file (bar active) */
+    struct bsdr_term * volatile term;  /* active terminal source (headless console); NULL otherwise.
+                                        * Written by the video worker, read by the input thread. */
+    volatile int term_mode;        /* streaming a terminal source (exit bar active, input -> term) */
     /* play/pause, volume, and seek for the media bar live in bsdr_app (a->app->file_*) so the
      * LAN threads, the input thread, and the cloud audio sender all share one source of truth. */
 } agent_t;
@@ -476,20 +480,23 @@ static void lan_input_main(void *arg) {
                     if (ddx*ddx + ddy*ddy > 0.0004) balloon_moved = 1;   /* ~2% travel = a drag */
                     continue;
                 }
-            } else if (a->file_mode && ovl && bsdr_overlay_visible(ovl) &&
+            } else if ((a->file_mode || a->term_mode) && ovl && bsdr_overlay_visible(ovl) &&
                        e->kind == BSDR_EV_BUTTON && e->u.button.button == BSDR_BTN_LEFT) {
-                /* Media bar (file streaming): a click on the bar drives playback and is swallowed;
-                 * a click elsewhere falls through (injected) exactly as before. */
+                /* Exit bar: shown for every non-desktop source. A click on the bar is swallowed; a
+                 * click elsewhere falls through (injected / forwarded to the terminal). Playback
+                 * controls only mean anything for a file source; a terminal only uses EXIT. */
                 if (e->u.button.down) {
                     double val = 0;
                     bsdr_overlay_action act = bsdr_overlay_hit(ovl, last_x, last_y, &val);
-                    switch (act) {
+                    if (act == BSDR_OVL_EXIT) {   /* "exit" = back to the desktop source (make-before-break), not stop */
+                        if (a->app) bsdr_app_set_source(a->app, "desktop", NULL);
+                    } else if (a->file_mode) switch (act) {
                         case BSDR_OVL_PLAYPAUSE: a->app->file_paused = !a->app->file_paused; break;
                         case BSDR_OVL_SEEK:      a->app->file_seek_frac = val; a->app->file_seek_gen++; break;
+                        case BSDR_OVL_LOOP:      if (a->app) bsdr_app_set_file_loop(a->app, !a->app->file_loop); break;
                         case BSDR_OVL_VOL_DOWN:  { int v = a->app->file_volume - 10; a->app->file_volume = v < 0 ? 0 : v; } break;
                         case BSDR_OVL_VOL_UP:    { int v = val > 0 ? (int)(val * 100) : a->app->file_volume + 10;
                                                    a->app->file_volume = v < 0 ? 0 : v > 100 ? 100 : v; } break;
-                        case BSDR_OVL_EXIT:      a->stop = 1; break;
                         default: break;   /* NONE / VOICE: not on the bar */
                     }
                     if (act != BSDR_OVL_NONE) { swallow_up = 1; continue; }
@@ -523,7 +530,12 @@ static void lan_input_main(void *arg) {
                     }
                 }
             }
-            bsdr_injector_handle(inj, e); n_ev++;
+            /* Terminal source: forward to the terminal (XVFB -> XTEST, PTY -> pty bytes) instead of
+             * the machine's uinput. a->term is set by the video worker for the active session. */
+            struct bsdr_term *term = a->term;
+            if (term) bsdr_term_input(term, e);
+            else bsdr_injector_handle(inj, e);
+            n_ev++;
         }
         if (ne == 0) {   /* not an input message — controller telemetry, not mic */
             if (!op_seen[buf[0]]) {   /* first sighting of this leading byte */
@@ -649,41 +661,103 @@ static void lan_live_main(agent_t *a) {
     int qw=0,qh=0,qbr=0;                                /* live quality (headset PUT /device) */
     int w=0,h=0; const char *enc="h264";
     bsdr_capture *cap = NULL;
+    int termmode = 0;              /* 0 none, 1 xvfb (x11grab), 2 pty (in-process render) */
+    bsdr_term *term = NULL;        /* active terminal backend for this session */
     int filemode = (a->video_file != NULL);
     int pl_is = filemode && bsdr_path_is_playlist(a->video_file);   /* .txt = playlist */
     int pl_idx = 0;
     char curpath[512] = "";
     if (filemode) {                                    /* --file / web-UI file source (or .txt playlist) */
-        /* Decode+re-encode the file through the capture pipeline so the in-VR media bar composites
-         * onto the video (and, via the coupled cloud feed, onto the room stream too). A .txt source
-         * is a playlist: play each entry once (loop=0) and advance at EOF; a single file self-loops. */
+        /* Decode+re-encode the file through the capture pipeline (so ANY input codec / definition / fps
+         * is normalized to the H.264 the Quest needs) with the in-VR media bar composited on. A .txt
+         * source is a playlist; a single file plays once and returns to desktop unless loop is on. A file
+         * that can't be opened/decoded falls back to the desktop rather than black-screening the headset. */
         int pl_n = bsdr_playlist_entry(a->video_file, pl_idx, curpath, sizeof curpath);
-        if (pl_n == 0) { BSDR_ERROR("bsdr.agent", "LAN: empty/unreadable source %s", a->video_file);
-                         bsdr_udp_close(&udp); return; }
-        if (a->app) bsdr_app_get_quality(a->app, &qw, &qh, &qbr);
-        if (qbr > 0) cfg.bitrate = qbr;
-        cfg.out_width = qw > 0 ? qw : 0; cfg.out_height = qh > 0 ? qh : 0;
-        cfg.input_file = curpath; cfg.loop = pl_is ? 0 : 1;
-        /* Default to libx264 (better quality than NVENC at the low bitrates the Quest asks for);
-         * --file-gpu opts into NVENC (auto: nvenc then x264 fallback). Both composite the bar via
-         * the CPU-scale path (capture forces CPU scale in file mode). */
-        cfg.encoder = a->file_gpu ? NULL : "libx264";
-        cap = bsdr_capture_open(&cfg);
-        if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: cannot open video file %s", curpath);
-                    bsdr_udp_close(&udp); return; }
-        bsdr_capture_info(cap, &w, &h, &enc);
-        a->file_mode = 1; a->app->file_paused = 0;
-        if (a->app->file_volume <= 0) a->app->file_volume = 100;
-        if (a->overlay) {
-            bsdr_capture_set_overlay(cap, a->overlay);
-            bsdr_overlay_set_visible(a->overlay, true);
-            bsdr_overlay_set_playing(a->overlay, true);
-            bsdr_overlay_set_volume(a->overlay, a->app->file_volume);
+        if (pl_n == 0) {
+            BSDR_WARN("bsdr.agent", "LAN: empty/unreadable file %s -> desktop", a->video_file ? a->video_file : "");
+            filemode = 0; pl_is = 0; a->video_file = NULL; a->file_mode = 0;
+            if (a->app) bsdr_app_set_source(a->app, "desktop", NULL);
+        } else {
+            if (a->app) bsdr_app_get_quality(a->app, &qw, &qh, &qbr);
+            if (qbr > 0) cfg.bitrate = qbr;
+            cfg.out_width = qw > 0 ? qw : 0; cfg.out_height = qh > 0 ? qh : 0;
+            /* loop = the file_loop toggle (web UI / overlay): on -> continuous loop, off -> play once then
+             * return to desktop (single file) / advance then desktop (playlist). */
+            cfg.input_file = curpath; cfg.loop = (a->app && a->app->file_loop) ? 1 : 0;
+            /* Default to libx264 (better quality than NVENC at the low bitrates the Quest asks for);
+             * --file-gpu opts into NVENC. Both composite the bar via the CPU-scale path. */
+            cfg.encoder = a->file_gpu ? NULL : "libx264";
+            cap = bsdr_capture_open(&cfg);
+            if (!cap) {
+                BSDR_WARN("bsdr.agent", "LAN: cannot play file %s (bad codec/definition?) -> desktop", curpath);
+                filemode = 0; pl_is = 0; a->video_file = NULL; a->file_mode = 0;
+                if (a->app) bsdr_app_set_source(a->app, "desktop", NULL);
+            } else {
+                bsdr_capture_info(cap, &w, &h, &enc);
+                a->file_mode = 1; a->app->file_paused = 0;
+                if (a->app->file_volume <= 0) a->app->file_volume = 100;
+                if (a->overlay) {
+                    bsdr_capture_set_overlay(cap, a->overlay);
+                    bsdr_overlay_set_visible(a->overlay, true);
+                    bsdr_overlay_set_playing(a->overlay, true);
+                    bsdr_overlay_set_volume(a->overlay, a->app->file_volume);
+                }
+                BSDR_INFO("bsdr.agent", "LAN LIVE: %s%s %dx%d via %s (media bar) -> %s:%d (XOR-0x14)",
+                          pl_is ? "playlist entry " : "file ", curpath, w, h, enc?enc:"?",
+                          a->remote_ip, BSDR_REMOTE_DESKTOP_PORT);
+            }
         }
-        BSDR_INFO("bsdr.agent", "LAN LIVE: %s%s %dx%d via %s (media bar) -> %s:%d (XOR-0x14)",
-                  pl_is ? "playlist entry " : "file ", curpath, w, h, enc?enc:"?",
-                  a->remote_ip, BSDR_REMOTE_DESKTOP_PORT);
-    } else {
+    }
+    /* ---- Terminal source: stream a shell (great on a headless box). xvfb = private Xvfb + xterm
+     * captured via x11grab with XTEST input; pty = in-process libvterm rendered straight to video
+     * (no X). A failure to start/capture falls back to the desktop rather than black-screening. ---- */
+    if (!filemode && a->app) {
+        char smode[16] = ""; bsdr_app_get_source(a->app, smode, sizeof smode, NULL, 0);
+        if (strcmp(smode, "terminal") == 0) {
+            char tb[8] = ""; int tc = 0, tr = 0; bsdr_app_get_terminal(a->app, tb, sizeof tb, &tc, &tr);
+            char tcmd[512] = ""; bsdr_app_get_source(a->app, NULL, 0, tcmd, sizeof tcmd);
+            bsdr_app_get_quality(a->app, &qw, &qh, &qbr);
+            bsdr_term_config tcfg = { .backend = strcmp(tb, "xvfb") == 0 ? BSDR_TERM_XVFB : BSDR_TERM_PTY,
+                                      .cmd = tcmd[0] ? tcmd : NULL, .cols = tc, .rows = tr,
+                                      .width = qw > 0 ? qw : 1280, .height = qh > 0 ? qh : 720 };
+            term = bsdr_term_start(&tcfg);
+            if (!term) {
+                BSDR_WARN("bsdr.agent", "terminal source failed to start -> desktop");
+                bsdr_app_set_source(a->app, "desktop", NULL);
+            } else {
+                if (qbr > 0) cfg.bitrate = qbr;
+                if (bsdr_term_is_pty(term)) {
+                    int tw2 = 0, th2 = 0; bsdr_term_size(term, &tw2, &th2);
+                    cfg.cpu_only = 1; cfg.use_vaapi = 0; cfg.use_kmsgrab = 0; cfg.encoder = "libx264";
+                    cfg.raw_render = bsdr_term_render; cfg.raw_user = term; cfg.raw_w = tw2; cfg.raw_h = th2;
+                } else {
+                    cfg.display = bsdr_term_display(term); cfg.force_x11 = 1; cfg.force_pipewire = 0; cfg.use_kmsgrab = 0;
+                    cfg.out_width = qw > 0 ? qw : 0; cfg.out_height = qh > 0 ? qh : 0;
+                }
+                cap = bsdr_capture_open(&cfg);
+                if (!cap) {
+                    BSDR_WARN("bsdr.agent", "terminal capture open failed -> desktop");
+                    bsdr_term_stop(term); term = NULL;
+                    cfg.raw_render = NULL; cfg.raw_user = NULL; cfg.display = NULL;
+                    cfg.force_x11 = a->app->force_x11;   /* restore the operator's backend choice */
+                    bsdr_app_set_source(a->app, "desktop", NULL);
+                } else {
+                    termmode = bsdr_term_is_pty(term) ? 2 : 1;
+                    a->term = term; a->term_mode = 1;
+                    bsdr_capture_info(cap, &w, &h, &enc);
+                    if (a->overlay) {
+                        bsdr_capture_set_overlay(cap, a->overlay);
+                        bsdr_overlay_set_visible(a->overlay, true);
+                        bsdr_overlay_set_playing(a->overlay, true);
+                        bsdr_overlay_set_position(a->overlay, 0.0, false);   /* exit bar, no seek */
+                    }
+                    BSDR_INFO("bsdr.agent", "LAN LIVE: terminal(%s) %dx%d via %s -> %s:%d",
+                              termmode == 2 ? "pty" : "xvfb", w, h, enc ? enc : "?", a->remote_ip, BSDR_REMOTE_DESKTOP_PORT);
+                }
+            }
+        }
+    }
+    if (!filemode && !termmode) {
         int is_cam = webcam_cfg(a, &cfg);   /* webcam source -> sets cfg.webcam[_right]; else screen grab */
         if (a->app) bsdr_app_get_region(a->app, &rx, &ry, &rw, &rh);
         cfg.x = rx; cfg.y = ry; cfg.width = rw; cfg.height = rh;
@@ -694,7 +768,12 @@ static void lan_live_main(agent_t *a) {
         if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: %s capture/encode open failed",
                     is_cam ? "webcam" : "desktop");
                     bsdr_udp_close(&udp); return; }
-        if (a->overlay) bsdr_capture_set_overlay(cap, a->overlay);   /* voice-command balloon */
+        if (a->overlay) {
+            bsdr_capture_set_overlay(cap, a->overlay);   /* voice-command balloon; media bar if non-desktop */
+            /* a webcam/stereo source shows the bar so there's always an EXIT-to-desktop control */
+            bsdr_overlay_set_visible(a->overlay, is_cam ? true : false);
+            if (is_cam) { bsdr_overlay_set_playing(a->overlay, true); bsdr_overlay_set_position(a->overlay, 0.0, false); }
+        }
         bsdr_capture_info(cap, &w, &h, &enc);
         BSDR_INFO("bsdr.agent", "LAN LIVE: %s %dx%d via %s -> %s:%d (XOR-0x14, no DTLS)",
                   is_cam ? "webcam" : "desktop", w, h, enc?enc:"?", a->remote_ip, BSDR_REMOTE_DESKTOP_PORT);
@@ -729,10 +808,149 @@ static void lan_live_main(agent_t *a) {
     unsigned my_seek_gen = a->app->file_seek_gen;
     unsigned my_threed_gen = a->app->threed_gen;
     unsigned my_enc_gen = a->app ? a->app->encoder_gen : 0;
+    unsigned my_source_gen = a->app ? a->app->source_gen : 0;
+    int cur_loop = (a->app && a->app->file_loop) ? 1 : 0;   /* live "loop file" toggle (web UI / overlay) */
     int cur_cpu = user_cpu;   /* live encoder choice (web-UI CPU<->GPU toggle); user_cpu = the initial */
     if (cap) bsdr_capture_set_faceswap(cap, fs_engine);
     while (!a->stop) {
         if (cap) bsdr_capture_set_faceswap(cap, fs_engine);   /* re-attach across any reopen below */
+        /* SOURCE switch (web UI desktop<->file<->webcam), MAKE-BEFORE-BREAK: open the new source FIRST
+         * and only drop the current capture once the new one is ready, so the desktop keeps streaming
+         * until the file's first frame is decoded — no black gap while you pick a file. Same session id
+         * / input channel; a fresh keyframe is emitted. A single file's EOF sets the source back to
+         * "desktop" (below), which also lands here. */
+        if (a->app && a->app->source_gen != my_source_gen) {
+            my_source_gen = a->app->source_gen;
+            char nmode[16] = "", npath[512] = "", ncurpath[512] = "";
+            bsdr_app_get_source(a->app, nmode, sizeof nmode, npath, sizeof npath);
+            int nfile = (strcmp(nmode, "file") == 0 && npath[0] != '\0');
+            int npl = 0, ready = 1, td = threed_on(a), fson = (fs_engine != NULL);
+            bsdr_capture_config ncfg = cfg;
+            ncfg.input_file = NULL; ncfg.webcam = NULL; ncfg.webcam_right = NULL;
+            ncfg.x = ncfg.y = ncfg.width = ncfg.height = 0;
+            ncfg.raw_render = NULL; ncfg.raw_user = NULL; ncfg.raw_w = ncfg.raw_h = 0;  /* clear a prior pty source */
+            ncfg.display = NULL; ncfg.force_x11 = a->app->force_x11;                    /* clear a prior xvfb display */
+            int nterm_kind = (strcmp(nmode, "terminal") == 0);
+            bsdr_term *nterm = NULL;
+            if (nterm_kind) {
+                /* Switch TO a terminal source (make-before-break): start the backend, point ncfg at it. */
+                char tb[8] = ""; int tc = 0, tr = 0; bsdr_app_get_terminal(a->app, tb, sizeof tb, &tc, &tr);
+                char tcmd[512] = ""; bsdr_app_get_source(a->app, NULL, 0, tcmd, sizeof tcmd);
+                int nqw=0,nqh=0,nqbr=0; bsdr_app_get_quality(a->app, &nqw, &nqh, &nqbr);
+                bsdr_term_config tcfg = { .backend = strcmp(tb,"xvfb")==0?BSDR_TERM_XVFB:BSDR_TERM_PTY,
+                                          .cmd = tcmd[0]?tcmd:NULL, .cols = tc, .rows = tr,
+                                          .width = nqw>0?nqw:1280, .height = nqh>0?nqh:720 };
+                nterm = bsdr_term_start(&tcfg);
+                if (!nterm) { BSDR_WARN("bsdr.agent", "source switch: terminal failed to start -> desktop"); ready = 0; }
+                else if (bsdr_term_is_pty(nterm)) {
+                    int tw2=0,th2=0; bsdr_term_size(nterm, &tw2, &th2);
+                    ncfg.cpu_only = 1; ncfg.use_vaapi = 0; ncfg.use_kmsgrab = 0; ncfg.encoder = "libx264";
+                    ncfg.raw_render = bsdr_term_render; ncfg.raw_user = nterm; ncfg.raw_w = tw2; ncfg.raw_h = th2;
+                    if (nqbr>0) ncfg.bitrate = nqbr;
+                } else {
+                    ncfg.display = bsdr_term_display(nterm); ncfg.force_x11 = 1; ncfg.force_pipewire = 0; ncfg.use_kmsgrab = 0;
+                    ncfg.out_width = nqw>0?nqw:0; ncfg.out_height = nqh>0?nqh:0; if (nqbr>0) ncfg.bitrate = nqbr;
+                }
+            } else if (nfile) {
+                npl = bsdr_path_is_playlist(npath);
+                if (bsdr_playlist_entry(npath, 0, ncurpath, sizeof ncurpath) == 0) {
+                    BSDR_WARN("bsdr.agent", "source switch: unreadable file %s (keeping current)", npath); ready = 0;
+                } else {
+                    int nqw=0,nqh=0,nqbr=0; bsdr_app_get_quality(a->app, &nqw, &nqh, &nqbr);
+                    ncfg.out_width = nqw>0?nqw:0; ncfg.out_height = nqh>0?nqh:0; if (nqbr>0) ncfg.bitrate = nqbr;
+                    ncfg.input_file = ncurpath;
+                    ncfg.loop = (a->app->file_loop) ? 1 : 0;                    /* loop toggle; else play once -> desktop */
+                    ncfg.cpu_only = 1; ncfg.use_vaapi = 0; ncfg.use_kmsgrab = 0;/* file composites the bar on CPU */
+                    ncfg.encoder = a->file_gpu ? NULL : "libx264";
+                }
+            } else {
+                a->video_file = NULL;                                          /* treat as a live source */
+                webcam_cfg(a, &ncfg);                                          /* sets ncfg.webcam if webcam mode */
+                int nx=0,ny=0,nw=0,nh=0; bsdr_app_get_region(a->app, &nx, &ny, &nw, &nh);
+                ncfg.x = nx; ncfg.y = ny; ncfg.width = nw; ncfg.height = nh;
+                int nqw=0,nqh=0,nqbr=0; bsdr_app_get_quality(a->app, &nqw, &nqh, &nqbr);
+                ncfg.out_width = nqw>0?nqw:0; ncfg.out_height = nqh>0?nqh:0; if (nqbr>0) ncfg.bitrate = nqbr;
+                ncfg.cpu_only = cur_cpu || td || fson;
+                if (td || fson) { ncfg.use_vaapi = 0; ncfg.use_kmsgrab = 0; }
+                else { ncfg.use_vaapi = a->app->use_vaapi; ncfg.use_kmsgrab = a->app->use_kmsgrab; }
+                ncfg.encoder = ncfg.cpu_only ? "libx264" : NULL;
+            }
+            threed_cfg(a, &ncfg);
+            bsdr_capture *newcap = ready ? bsdr_capture_open(&ncfg) : NULL;
+            if (newcap) {
+                bsdr_capture_close(cap); cap = newcap;                          /* make-before-break: drop old now */
+                /* Old capture is gone (its render callback / display are no longer used) — now it's safe
+                 * to tear down the previous terminal backend and adopt the new one (or none). */
+                if (term) { a->term = NULL; a->term_mode = 0; bsdr_term_stop(term); term = NULL; termmode = 0; }
+                if (nterm_kind) {
+                    term = nterm; a->term = nterm; a->term_mode = 1;
+                    termmode = bsdr_term_is_pty(nterm) ? 2 : 1;
+                    if (bsdr_term_is_pty(nterm)) { snprintf(a->src_path, sizeof a->src_path, "%s", npath); ncfg.raw_user = nterm; }
+                }
+                if (nfile) { snprintf(curpath, sizeof curpath, "%s", ncurpath);
+                             snprintf(a->src_path, sizeof a->src_path, "%s", npath);
+                             ncfg.input_file = curpath; }                       /* point cfg at stable storage */
+                cfg = ncfg;
+                filemode = nfile; pl_is = nfile && npl; pl_idx = 0;
+                a->video_file = nfile ? a->src_path : NULL; a->file_mode = nfile ? 1 : 0;
+                if (nfile) { a->app->file_paused = 0; if (a->app->file_volume <= 0) a->app->file_volume = 100; }
+                if (a->overlay) {
+                    /* Any NON-desktop source (file/webcam/stereo) shows the media bar so there's always
+                     * an EXIT-to-desktop control on the LAN side; desktop hides it (voice balloon only). */
+                    int nondesktop = (strcmp(nmode, "desktop") != 0);
+                    bsdr_capture_set_overlay(cap, a->overlay);
+                    bsdr_overlay_set_visible(a->overlay, nondesktop ? true : false);
+                    if (nondesktop) {
+                        bsdr_overlay_set_playing(a->overlay, true);
+                        if (nfile) bsdr_overlay_set_volume(a->overlay, a->app->file_volume);
+                        else bsdr_overlay_set_position(a->overlay, 0.0, false);  /* live cam: exit bar, no seek */
+                    }
+                }
+                bsdr_capture_set_faceswap(cap, fs_engine);
+                bsdr_capture_info(cap, &w, &h, &enc);
+                tw = (uint16_t)((w+15)&~15); th = (uint16_t)((h+15)&~15);
+#ifdef BSDR_HAVE_AUDIO
+                if (athr) { actx.stop = 1; bsdr_thread_join(athr); athr = NULL; actx.stop = 0; }
+                if (audio_ok) {                                                /* audio udp is up; swap the source thread */
+                    if (!nfile && a->audio && !adev_ok) adev_ok = bsdr_audio_devices_create(&adev);
+                    actx.dev = adev_ok ? &adev : NULL;
+                    if (nfile || adev_ok) athr = bsdr_thread_start(nfile ? lan_file_audio_main : lan_audio_main, &actx);
+                    else BSDR_WARN("bsdr.agent", "source switch: no desktop audio devices");
+                }
+#endif
+                BSDR_INFO("bsdr.agent", "source switch -> %s %dx%d (make-before-break, fresh keyframe)",
+                          nfile ? "file" : (ncfg.webcam ? "webcam" : "desktop"), w, h);
+            } else {
+                /* A FILE that won't open (bad codec/definition/fps, unreadable, decode error) must never
+                 * black-screen the headset -> fall back to the desktop source. If desktop itself failed,
+                 * keep the current capture. */
+                if (nterm) bsdr_term_stop(nterm);   /* backend started but capture failed to open */
+                if (nterm_kind) { BSDR_WARN("bsdr.agent", "source switch: terminal failed to open -> desktop");
+                             if (a->app) bsdr_app_set_source(a->app, "desktop", NULL); }
+                else if (nfile) { BSDR_WARN("bsdr.agent", "source switch: file %s failed to play -> desktop", npath);
+                             if (a->app) bsdr_app_set_source(a->app, "desktop", NULL); }
+                else BSDR_WARN("bsdr.agent", "source switch: new source failed to open (keeping current)");
+            }
+        }
+        /* Terminal source: the shell exited (user typed `exit`, or the xterm/Xvfb died) -> go back to
+         * the desktop rather than freeze on the last frame. The switch above then tears the term down. */
+        if (termmode && term && bsdr_term_dead(term)) {
+            BSDR_INFO("bsdr.agent", "terminal exited -> desktop");
+            if (a->app) bsdr_app_set_source(a->app, "desktop", NULL);
+        }
+        /* "Loop file" toggled (web UI / overlay) while a single file plays: reopen with the new loop
+         * flag so it either self-loops or plays-once->desktop. (A playlist manages its own looping.) */
+        if (filemode && !pl_is && a->app && ((a->app->file_loop ? 1 : 0) != cur_loop)) {
+            cur_loop = a->app->file_loop ? 1 : 0;
+            cfg.loop = cur_loop;
+            bsdr_capture_close(cap); cap = bsdr_capture_open(&cfg);
+            if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: reopen for loop toggle failed"); break; }
+            if (a->overlay) bsdr_capture_set_overlay(cap, a->overlay);
+            bsdr_capture_set_faceswap(cap, fs_engine);
+            bsdr_capture_info(cap, &w, &h, &enc);
+            tw = (uint16_t)((w+15)&~15); th = (uint16_t)((h+15)&~15);
+            BSDR_INFO("bsdr.agent", "LAN file loop -> %s (reopen)", cur_loop ? "on" : "off");
+        }
         /* Face swap toggled/retuned from the web UI: reconcile the engine (reload model+source) and,
          * because it forces the CPU encode path, reopen the capture. */
         if (a->app && a->app->faceswap_gen != my_fs_gen) {
@@ -852,12 +1070,20 @@ static void lan_live_main(agent_t *a) {
             if (!cap) { BSDR_ERROR("bsdr.agent", "LAN playlist: no playable entries"); break; }
             continue;
         }
+        if (r < 0 && filemode && !pl_is) {
+            /* single file finished -> return to the desktop source automatically (the source-switch
+             * block above reopens make-before-break, so this is seamless). */
+            BSDR_INFO("bsdr.agent", "file playback ended -> returning to desktop");
+            if (a->app) bsdr_app_set_source(a->app, "desktop", NULL);
+            continue;
+        }
         if (r <= 0) { if (r < 0) break; bsdr_sleep_ms(2); continue; }
         /* Reflect playback state onto the bar (progress, play/pause icon, volume). */
         if (filemode && a->overlay) {
             int seekable = 0; double pos = bsdr_capture_position(cap, &seekable);
             bsdr_overlay_set_position(a->overlay, pos, seekable);
             bsdr_overlay_set_playing(a->overlay, !a->app->file_paused);
+            bsdr_overlay_set_loop(a->overlay, a->app->file_loop != 0);
             bsdr_overlay_set_volume(a->overlay, a->app->file_volume);
         }
         /* COUPLED cloud (default): hand this same encoded access unit to the relay sender, so the
@@ -897,10 +1123,11 @@ static void lan_live_main(agent_t *a) {
     if (audio_ok) bsdr_udp_close(&audio_udp);
     if (adev_ok) bsdr_audio_devices_destroy(&adev);
 #endif
-    if (ithr) { ictx.stop = 1; bsdr_thread_join(ithr); }
-    if (filemode && a->overlay) bsdr_overlay_set_visible(a->overlay, false);
-    a->file_mode = 0;
-    if (cap) bsdr_capture_close(cap);
+    if (ithr) { ictx.stop = 1; bsdr_thread_join(ithr); }   /* input thread stops reading a->term first */
+    if ((filemode || termmode) && a->overlay) bsdr_overlay_set_visible(a->overlay, false);
+    a->file_mode = 0; a->term_mode = 0;
+    if (cap) bsdr_capture_close(cap);   /* drop the capture before the terminal it renders from */
+    if (term) { a->term = NULL; bsdr_term_stop(term); term = NULL; }
     if (fs_engine) bsdr_faceswap_close(fs_engine);
     bsdr_udp_close(&udp);
     BSDR_INFO("bsdr.agent", "LAN live stopped (%u NALs sent)", frame_num);
@@ -973,8 +1200,10 @@ static void cb_stop(const bsdr_paired_device *dev, void *user)   {
 static void cb_unpair(const bsdr_paired_device *dev, void *user) {
     agent_t *a = (agent_t *)user;
     BSDR_DEBUG("bsdr.agent", "headset %s requested UNPAIR", dev->device_name);
-    if (a->app) { bsdr_app_set_paired(a->app, false, NULL, NULL);
-                  bsdr_app_set_internet_sharing(a->app, false); }
+    /* Tear down the LAN session, but hold the internet-share relay on a grace timer (set_paired(false)
+     * arms it) so a quick unpair/re-pair keeps the cloud stream — it's finalized by the main loop's
+     * bsdr_app_unpair_grace_expired() if no re-pair arrives. */
+    if (a->app) bsdr_app_set_paired(a->app, false, NULL, NULL);
     teardown_session(a);
 }
 
@@ -1117,6 +1346,15 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
 #endif
     if (opt->no_cloud_audio) app.cloud_no_audio = true;  /* default: audio ON (Opus + 8B trailer) */
     a.app = &app;
+    /* Seed the initial source from the CLI so a headset that pairs picks it up (the session worker
+     * reads app.source): --terminal streams a shell, --file a video file; otherwise the desktop. */
+    if (opt->terminal) {
+        bsdr_app_set_terminal(&app, opt->terminal, opt->terminal_cols, opt->terminal_rows);
+        bsdr_app_set_source(&app, "terminal", opt->terminal_cmd ? opt->terminal_cmd : "");
+        BSDR_INFO("bsdr.agent", "source: terminal (%s backend)", app.term_backend);
+    } else if (opt->video_file) {
+        bsdr_app_set_source(&app, "file", opt->video_file);
+    }
     /* Shared overlay handed to every session's capture + input thread: the voice-command balloon
      * (compctl) and the media control bar. It starts hidden; the bar is enabled only while a video
      * file is streaming (lan_live_main), the balloon only while compctl is armed. */
@@ -1271,22 +1509,11 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
         }
 
 #if !defined(BSDR_PLATFORM_ANDROID)
-        /* Source switched in the web UI (desktop <-> webcam <-> stereo <-> file): restart the live
-         * session so lan_live_main re-derives the source. Only if a session is actually running (a
-         * Quest is streaming); otherwise the next /start picks up the new source on its own. */
-        if (app.source_gen != my_source_gen) {
-            my_source_gen = app.source_gen;
-            bsdr_mutex_lock(a.lock);
-            int running = a.worker != NULL && a.remote_ip[0];
-            bsdr_mutex_unlock(a.lock);
-            if (running) {
-                BSDR_INFO("bsdr.agent", "source changed -> restarting live session");
-                teardown_session(&a);
-                bsdr_mutex_lock(a.lock);
-                spawn_worker_locked(&a);
-                bsdr_mutex_unlock(a.lock);
-            }
-        }
+        /* Source switches (desktop <-> webcam <-> stereo <-> file) are now handled IN-PLACE by
+         * lan_live_main (make-before-break, keeps the desktop streaming until the new source is ready)
+         * — NOT by a teardown/respawn here, which caused a black gap. When no session is running the
+         * next /start derives the source on its own, so there's nothing to do. Just consume the gen. */
+        if (app.source_gen != my_source_gen) my_source_gen = app.source_gen;
 #endif
 
 #if defined(BSDR_PLATFORM_ANDROID)
@@ -1549,10 +1776,11 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
             bsdr_control_force_unpair(ctl);
             if (dropped[0]) bsdr_app_block_quest(&app, dropped);  /* ignore until reselected */
             bsdr_app_set_paired(&app, false, NULL, NULL);
-            bsdr_app_set_internet_sharing(&app, false);   /* Quest gone → stop sharing */
+            bsdr_app_unpair_now(&app);   /* DELIBERATE disconnect → stop the relay now (no grace) */
             teardown_session(&a);
             BSDR_INFO("bsdr.agent", "disconnected from Quest %s (operator request)", dropped);
         }
+        bsdr_app_unpair_grace_expired(&app);      /* finalize a held relay once its grace timer lapses */
         if (tick % 5 == 0)                        /* ~1 s: reconcile internet sharing promptly */
             bsdr_app_cloud_tick(&app);            /* start/stop the relay stream to match desired */
         if (++follow_ctr >= 75) {                 /* ~15 s: follow the operator between rooms */
@@ -1562,8 +1790,9 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
         if (++tick >= 25) {                       /* ~5 s heartbeat-expiry check */
             tick = 0;
             if (bsdr_control_expire_stale(ctl)) {
+                /* heartbeat lost: tear down the LAN session but HOLD the relay on the grace timer —
+                 * a transient Wi-Fi gap / headset-off should not drop the internet share. */
                 bsdr_app_set_paired(&app, false, NULL, NULL);
-                bsdr_app_set_internet_sharing(&app, false);   /* heartbeat lost → stop sharing */
                 teardown_session(&a);
             }
         }
@@ -1623,6 +1852,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--no-audio") == 0) opt.audio = false;
         else if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) opt.video_file = argv[++i];
         else if (strcmp(argv[i], "--file-gpu") == 0) opt.file_gpu = true;
+        else if (strncmp(argv[i], "--terminal=", 11) == 0) opt.terminal = argv[i] + 11;   /* --terminal=pty|xvfb */
+        else if (strcmp(argv[i], "--terminal") == 0) opt.terminal = "pty";               /* bare = headless-native pty */
+        else if (strcmp(argv[i], "--terminal-cmd") == 0 && i + 1 < argc) opt.terminal_cmd = argv[++i];
+        else if (strcmp(argv[i], "--terminal-size") == 0 && i + 1 < argc) { int c=0,r=0; if (sscanf(argv[++i], "%dx%d", &c, &r) == 2) { opt.terminal_cols = c; opt.terminal_rows = r; } }
         else if (strcmp(argv[i], "--threed") == 0 && i + 1 < argc) opt.threed_mode = bsdr_threed_mode_parse(argv[++i]);
         else if (strcmp(argv[i], "--threed-deepness") == 0 && i + 1 < argc) opt.threed_deepness = atoi(argv[++i]);
         else if (strcmp(argv[i], "--threed-convergence") == 0 && i + 1 < argc) opt.threed_convergence = atoi(argv[++i]);
@@ -1697,6 +1930,14 @@ int main(int argc, char **argv) {
 "                       (default). libx264 usually looks better at the Quest's low bitrates;\n"
 "                       use this to offload the CPU.\n"
 "                       --file/--file-gpu also accept http/https/rtsp URLs.\n"
+"  --terminal[=BACKEND] Stream a shell/terminal to the headset (great on a HEADLESS box) with the\n"
+"                       Quest's keyboard+mouse injected. BACKEND = pty (default) or xvfb:\n"
+"                         pty  = in-process terminal (libvterm) rendered straight to video — NO X\n"
+"                                needed; keystrokes go to the pty, mouse when the app enables it.\n"
+"                         xvfb = a private Xvfb + xterm captured via x11grab, injected via XTEST\n"
+"                                (full graphical terminal + mouse; needs Xvfb + xterm installed).\n"
+"  --terminal-cmd CMD   Program to run in the terminal (default: $SHELL, else /bin/bash).\n"
+"  --terminal-size CxR  pty grid size in columns x rows (default 120x36).\n"
 "  --threed MODE        Real-time 2D->3D side-by-side. MODE = off|fast|ai. 'fast' is a\n"
 "                       light built-in depth heuristic (good on old laptops); 'ai' uses the\n"
 "                       external helper from --threed-ai. Forces the CPU-scale path. Set your\n"

@@ -124,6 +124,8 @@ void bsdr_app_init(bsdr_app *a) {
     memset(a, 0, sizeof(*a));
     a->lock = bsdr_mutex_new();
     snprintf(a->source, sizeof(a->source), "desktop");
+    snprintf(a->term_backend, sizeof(a->term_backend), "pty");   /* headless-native default */
+    a->term_cols = 120; a->term_rows = 36;
     a->file_volume = 100;   /* media bar default */
     a->sniff_wifi = -1;     /* unknown until first status build (then cached) */
 #if defined(__ANDROID__)
@@ -353,20 +355,63 @@ void bsdr_app_block_quest(bsdr_app *a, const char *ip) {
     BSDR_INFO("bsdr.app", "ignoring Quest %s until reselected", ip ? ip : "");
 }
 
+/* Grace window (ms) between an unpair / heartbeat loss and actually tearing the relay stream down, so a
+ * quick pair-cycle doesn't drop the internet share (and remote viewers don't have to re-share). */
+#define BSDR_UNPAIR_GRACE_MS 10000
+
 void bsdr_app_set_paired(bsdr_app *a, bool paired, const char *name, const char *ip) {
-    bsdr_cloud_stream *to_stop = NULL;
     bsdr_mutex_lock(a->lock);
     a->quest_paired = paired;
     if (paired) {
         snprintf(a->quest_name, sizeof(a->quest_name), "%s", name ? name : "");
         snprintf(a->quest_ip, sizeof(a->quest_ip), "%s", ip ? ip : "");
+        /* re-pair within the grace window: cancel any pending relay teardown, keep the stream */
+        if (a->unpair_pending) {
+            a->unpair_pending = false; a->unpair_deadline_ms = 0;
+            BSDR_INFO("bsdr.app", "re-paired within grace — keeping the internet-share stream");
+        }
     } else {
         a->quest_name[0] = a->quest_ip[0] = '\0';
         a->streaming = false;
-        a->internet_sharing = false;
-        /* unpair: the session is gone — fully tear down the kept-alive relay connection */
-        to_stop = a->cloud_stream; a->cloud_stream = NULL;
+        /* Do NOT stop the relay here — arm the grace timer instead (finalized by
+         * bsdr_app_unpair_grace_expired). internet_sharing stays set so a re-pair resumes seamlessly. */
+        if ((a->cloud_stream || a->internet_sharing) && !a->unpair_pending) {
+            a->unpair_pending = true;
+            a->unpair_deadline_ms = bsdr_now_ms() + BSDR_UNPAIR_GRACE_MS;
+            BSDR_INFO("bsdr.app", "unpair/heartbeat loss — internet share held for %d ms pending a re-pair",
+                      BSDR_UNPAIR_GRACE_MS);
+        }
     }
+    bsdr_mutex_unlock(a->lock);
+}
+
+/* Finalize the teardown (stop the relay, clear sharing + the pending flag). Lock must be held; returns
+ * the stream to stop OUTSIDE the lock (bsdr_cloud_stream_stop can block). */
+static bsdr_cloud_stream *unpair_finalize_locked(bsdr_app *a) {
+    bsdr_cloud_stream *to_stop = a->cloud_stream;
+    a->cloud_stream = NULL;
+    a->internet_sharing = false;
+    a->unpair_pending = false;
+    a->unpair_deadline_ms = 0;
+    return to_stop;
+}
+
+bool bsdr_app_unpair_grace_expired(bsdr_app *a) {
+    bsdr_cloud_stream *to_stop = NULL; bool fired = false;
+    bsdr_mutex_lock(a->lock);
+    if (a->unpair_pending && !a->quest_paired && bsdr_now_ms() >= a->unpair_deadline_ms) {
+        to_stop = unpair_finalize_locked(a);
+        fired = true;
+    }
+    bsdr_mutex_unlock(a->lock);
+    if (fired) BSDR_INFO("bsdr.app", "unpair grace expired (no re-pair) — stopping the internet-share stream");
+    if (to_stop) bsdr_cloud_stream_stop(to_stop);
+    return fired;
+}
+
+void bsdr_app_unpair_now(bsdr_app *a) {
+    bsdr_mutex_lock(a->lock);
+    bsdr_cloud_stream *to_stop = unpair_finalize_locked(a);
     bsdr_mutex_unlock(a->lock);
     if (to_stop) bsdr_cloud_stream_stop(to_stop);
 }
@@ -658,6 +703,9 @@ static void settings_save(bsdr_app *a) {
                "x264_threads=%d\nuse_vaapi=%d\nuse_kmsgrab=%d\n",
             cpu, bro, ptouch, smeth, sport, swant, bmode, bfollow, bloop, bsolo, encp, lan1x, fcap, wopt,
             x264t, vaapi, kms);
+    fprintf(f, "file_loop=%d\n", a->file_loop);   /* loop the file/playlist source continuously */
+    fprintf(f, "term_backend=%s\nterm_cols=%d\nterm_rows=%d\n",   /* terminal-source prefs */
+            a->term_backend[0] ? a->term_backend : "pty", a->term_cols, a->term_rows);
     /* voice changer: persist the master + every knob so presets/settings survive a restart */
     fprintf(f, "voice_fx=%d\nvoice_gender=%d\nvoice_formant=%d\nvoice_volume=%d\n"
                "voice_robot=%d\nvoice_echo=%d\nvoice_whisper=%d\nvoice_substitute=%d\n",
@@ -703,6 +751,10 @@ void bsdr_app_load_settings(bsdr_app *a) {
         else if (sscanf(line, "enc_level=%d", &v) == 1)        a->enc_level = v < 0 ? 0 : v > 2 ? 2 : v;
         else if (sscanf(line, "enc_perf=%d", &v) == 1)         a->enc_level = v ? 2 : 0;  /* legacy bool -> level */
         else if (sscanf(line, "x264_threads=%d", &v) == 1)     a->enc_x264_threads = v < 0 ? 0 : v > 32 ? 32 : v;
+        else if (sscanf(line, "file_loop=%d", &v) == 1)        a->file_loop = v ? 1 : 0;
+        else if (sscanf(line, "term_cols=%d", &v) == 1)        a->term_cols = (v >= 20 && v <= 400) ? v : 120;
+        else if (sscanf(line, "term_rows=%d", &v) == 1)        a->term_rows = (v >= 6 && v <= 120) ? v : 36;
+        else if (sscanf(line, "term_backend=%7[a-z]", a->term_backend) == 1) { if (strcmp(a->term_backend,"xvfb")) snprintf(a->term_backend, sizeof(a->term_backend), "pty"); }
         else if (sscanf(line, "use_vaapi=%d", &v) == 1)        a->use_vaapi = v ? true : false;
         else if (sscanf(line, "use_kmsgrab=%d", &v) == 1)      a->use_kmsgrab = v ? true : false;
         else if (sscanf(line, "lan_1x=%d", &v) == 1)           a->lan_1x = v ? true : false;
@@ -835,17 +887,29 @@ bool bsdr_app_restore_session(bsdr_app *a) {
     if (!access[0]) return false;
 
     char vname[128] = "";
-    bool valid = bsdr_cloud_account(bsdr_cloud_api_key(), access, vname, sizeof(vname));
+    int st = bsdr_cloud_account_status(bsdr_cloud_api_key(), access, vname, sizeof(vname));
+    bool valid = (st / 100 == 2);
+    bool reachable = (st != 0);
     if (!valid && refresh[0]) {
         BSDR_INFO("bsdr.app", "saved token expired — renewing");
-        bsdr_cloud_result rr;
+        bsdr_cloud_result rr; memset(&rr, 0, sizeof rr);
         if (bsdr_cloud_renew(bsdr_cloud_api_key(), refresh, &rr)) {
+            reachable = true;
             snprintf(access, sizeof(access), "%s", rr.access_token);
             if (rr.refresh_token[0]) snprintf(refresh, sizeof(refresh), "%s", rr.refresh_token);
-            valid = bsdr_cloud_account(bsdr_cloud_api_key(), access, vname, sizeof(vname));
+            st = bsdr_cloud_account_status(bsdr_cloud_api_key(), access, vname, sizeof(vname));
+            valid = (st / 100 == 2);
+        } else {
+            reachable = reachable || (rr.http_status != 0);   /* renew reached the server (rejected) */
         }
     }
-    if (!valid) { BSDR_INFO("bsdr.app", "saved session invalid; please log in again"); return false; }
+    if (!valid) {
+        /* Only DISCARD the session when the server actually rejected it. A network failure (unreachable)
+         * must NOT throw away a token we couldn't even check — keep it and let the live loop re-verify
+         * once the cloud is reachable, so a transient blip doesn't log the operator out. */
+        if (reachable) { BSDR_INFO("bsdr.app", "saved session invalid; please log in again"); return false; }
+        BSDR_WARN("bsdr.app", "cloud unreachable at startup — keeping the saved session (will re-verify when online)");
+    }
 
     bsdr_mutex_lock(a->lock);
     a->cloud_logged_in = true;
@@ -853,7 +917,7 @@ bool bsdr_app_restore_session(bsdr_app *a) {
     snprintf(a->refresh_token, sizeof(a->refresh_token), "%s", refresh);
     snprintf(a->cloud_email, sizeof(a->cloud_email), "%s", email);
     snprintf(a->cloud_name, sizeof(a->cloud_name), "%s", vname[0] ? vname : (name[0] ? name : email));
-    snprintf(a->cloud_msg, sizeof(a->cloud_msg), "logged in (restored)");
+    snprintf(a->cloud_msg, sizeof(a->cloud_msg), valid ? "logged in (restored)" : "restored (offline — re-verifying)");
     bsdr_mutex_unlock(a->lock);
 
     session_save(a);   /* persist any renewed token */
@@ -952,16 +1016,26 @@ void bsdr_app_bot_restore(bsdr_app *a) {
     if (!access[0]) return;
 
     char vname[128] = "";
-    bool valid = bsdr_cloud_account(bsdr_cloud_client_key(), access, vname, sizeof(vname));
+    int st = bsdr_cloud_account_status(bsdr_cloud_client_key(), access, vname, sizeof(vname));
+    bool valid = (st / 100 == 2);
+    bool reachable = (st != 0);
     if (!valid && refresh[0]) {
-        bsdr_cloud_result rr;
+        bsdr_cloud_result rr; memset(&rr, 0, sizeof rr);
         if (bsdr_cloud_renew(bsdr_cloud_client_key(), refresh, &rr)) {
+            reachable = true;
             snprintf(access, sizeof(access), "%s", rr.access_token);
             if (rr.refresh_token[0]) snprintf(refresh, sizeof(refresh), "%s", rr.refresh_token);
-            valid = bsdr_cloud_account(bsdr_cloud_client_key(), access, vname, sizeof(vname));
+            st = bsdr_cloud_account_status(bsdr_cloud_client_key(), access, vname, sizeof(vname));
+            valid = (st / 100 == 2);
+        } else {
+            reachable = reachable || (rr.http_status != 0);
         }
     }
-    if (!valid) { BSDR_INFO("bsdr.app", "saved bot session invalid; log the bot in again"); return; }
+    if (!valid) {
+        /* keep the bot session across a transient connect failure (see bsdr_app_restore_session) */
+        if (reachable) { BSDR_INFO("bsdr.app", "saved bot session invalid; log the bot in again"); return; }
+        BSDR_WARN("bsdr.app", "cloud unreachable — keeping the saved bot session (will re-verify when online)");
+    }
 
     bsdr_mutex_lock(a->lock);
     a->bot_logged_in = true;
@@ -1499,6 +1573,13 @@ void bsdr_app_set_source(bsdr_app *a, const char *mode, const char *path) {
     bsdr_mutex_unlock(a->lock);
 }
 
+void bsdr_app_set_file_loop(bsdr_app *a, int on) {
+    bsdr_mutex_lock(a->lock);
+    a->file_loop = on ? 1 : 0;
+    bsdr_mutex_unlock(a->lock);
+    settings_save(a);   /* persist the loop preference */
+}
+
 void bsdr_app_set_source_right(bsdr_app *a, const char *dev) {
     bsdr_mutex_lock(a->lock);
     if (dev) snprintf(a->source_path2, sizeof(a->source_path2), "%s", dev);
@@ -1594,6 +1675,24 @@ void bsdr_app_get_source(bsdr_app *a, char *mode, size_t ml, char *path, size_t 
     bsdr_mutex_unlock(a->lock);
 }
 
+void bsdr_app_set_terminal(bsdr_app *a, const char *backend, int cols, int rows) {
+    bsdr_mutex_lock(a->lock);
+    if (backend && backend[0])
+        snprintf(a->term_backend, sizeof(a->term_backend), "%s", strcmp(backend, "xvfb") == 0 ? "xvfb" : "pty");
+    if (cols > 0) a->term_cols = cols < 20 ? 20 : cols > 400 ? 400 : cols;
+    if (rows > 0) a->term_rows = rows < 6 ? 6 : rows > 120 ? 120 : rows;
+    bsdr_mutex_unlock(a->lock);
+    settings_save(a);
+}
+
+void bsdr_app_get_terminal(bsdr_app *a, char *backend, size_t bl, int *cols, int *rows) {
+    bsdr_mutex_lock(a->lock);
+    if (backend) snprintf(backend, bl, "%s", a->term_backend[0] ? a->term_backend : "pty");
+    if (cols) *cols = a->term_cols > 0 ? a->term_cols : 120;
+    if (rows) *rows = a->term_rows > 0 ? a->term_rows : 36;
+    bsdr_mutex_unlock(a->lock);
+}
+
 size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
     bsdr_mutex_lock(a->lock);
     char esc_name[160], esc_email[160], esc_msg[200], esc_sniff[200], esc_cc[200], esc_ai[400];
@@ -1615,7 +1714,8 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         "\"internetSharing\":%s},"
         "\"bot\":{\"loggedIn\":%s,\"email\":\"%s\",\"name\":\"%s\",\"msg\":\"%s\",\"joined\":%s,\"room\":\"%s\",\"mode\":\"%s\",\"stopped\":%s,\"follow\":%s,\"loopback\":%s,\"solo\":%s},"
         "\"quest\":{\"paired\":%s,\"name\":\"%s\",\"ip\":\"%s\",\"streaming\":%s,\"paused\":%s},"
-        "\"source\":{\"mode\":\"%s\",\"path\":\"%s\",\"path2\":\"%s\",\"audio\":%s},"
+        "\"source\":{\"mode\":\"%s\",\"path\":\"%s\",\"path2\":\"%s\",\"audio\":%s,\"fileLoop\":%s,"
+        "\"termBackend\":\"%s\",\"termCols\":%d,\"termRows\":%d},"
         "\"blank\":%s,\"pointerTouch\":%s,\"cloudMic\":%s,\"ownerMicLocal\":%s,\"roomMic\":%s,\"tlsInsecure\":%s,"
         "\"threed\":{\"mode\":%d,\"deepness\":%d,\"convergence\":%d,\"swap\":%s,\"full\":%s,\"tier\":%d,\"ai\":\"%s\"},"
         "\"quality\":{\"w\":%d,\"h\":%d,\"bitrate\":%d,\"brOverride\":%d,\"gpuEncode\":%s,\"encLevel\":%d,\"x264Threads\":%d,\"vaapi\":%s,\"kmsgrab\":%s,\"lan1x\":%s,\"fpsCap\":%d,\"wifiOpt\":%s},"
@@ -1633,7 +1733,8 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         a->bot_loopback ? "true" : "false", a->bot_solo_owner ? "true" : "false",
         a->quest_paired ? "true" : "false", a->quest_name, a->quest_ip,
         a->streaming ? "true" : "false", a->paused ? "true" : "false",
-        a->source, a->source_path, a->source_path2, a->audio ? "true" : "false",
+        a->source, a->source_path, a->source_path2, a->audio ? "true" : "false", a->file_loop ? "true" : "false",
+        a->term_backend[0] ? a->term_backend : "pty", a->term_cols, a->term_rows,
         a->blank_want ? "true" : "false", a->pointer_touch ? "true" : "false", a->cloud_mic_fallback ? "true" : "false",
         a->owner_mic_local ? "true" : "false", a->room_mic_want ? "true" : "false",
         bsdr_tls_is_insecure() ? "true" : "false",
