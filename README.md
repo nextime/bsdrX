@@ -1,6 +1,6 @@
 # bsdrX — cast any screen into a Bigscreen VR headset
 
-**Version 0.1.0** · Linux · Windows · macOS · Android
+**Version 0.1.1** · Linux · Windows · macOS · Android
 
 **bsdrX** is a clean-room **Bigscreen Remote Desktop** agent. It turns a PC — or an
 Android device — into a Bigscreen Remote Desktop *host*: it casts your **screen and
@@ -901,6 +901,14 @@ sniffer via **Npcap**, and cloud voice **substitution** via bundled **WinDivert*
 run the agent as **Administrator** for the sniffer/MITM. `make windows` ==
 `make windows-media` (full media-capable build; picks up WinDivert automatically when
 `WIN_DEPS` contains the SDK).
+
+`scripts/build-win-bundle.sh` (run by `./distribute.sh windows`) packages `dist/bsdrX-win.zip`
+with **both** a self-contained **`bsdrX-Setup-<ver>.exe`** installer (built with NSIS —
+Start-Menu shortcut, uninstaller, and a components step that opens the **Npcap** and
+**VB-CABLE** download pages) and the portable folder for unzip-and-run. The agent **starts
+without Npcap** — the relay, remote desktop and the bundled-WinDivert sniff fallback all work;
+only the pcap owner-mic **sniffer/MITM** needs Npcap (`wpcap.dll` is loaded at runtime, and the
+sniffer prompts to install it when absent). The installer's Npcap step is the one-click way in.
 
 ### Android
 

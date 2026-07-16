@@ -430,8 +430,10 @@ WIN_WINDIVERT_DEF  = $(if $(wildcard $(WIN_DEPS)/include/windivert.h),-DBSDR_HAV
 WIN_WINDIVERT_LIBS = $(if $(wildcard $(WIN_DEPS)/include/windivert.h),-lWinDivert,)
 WIN_MEDIA_DEF := -DBSDR_ENABLE_SCTP=1 -DBSDR_ENABLE_VIDEO=1 -DBSDR_HAVE_CAPTURE=1 \
                  -DBSDR_ENABLE_AUDIO=1 -DBSDR_HAVE_AUDIO=1 -DBSDR_HAVE_PCAP=1 $(WIN_WINDIVERT_DEF)
+                  # NOTE: wpcap/Packet are NOT linked — micsniff_capture.c LoadLibrary's wpcap.dll at
+                  # runtime so the agent starts without Npcap (relay + core + WinDivert sniff still work).
 WIN_MEDIA_LIBS := -lavdevice -lavfilter -lavformat -lavcodec -lswscale -lswresample -lavutil \
-                  -lopus -lsrtp2 -lusrsctp -lssl -lcrypto -lwpcap -lPacket $(WIN_WINDIVERT_LIBS) \
+                  -lopus -lsrtp2 -lusrsctp -lssl -lcrypto $(WIN_WINDIVERT_LIBS) \
                   -lpthread -lws2_32 -liphlpapi -luser32 -lbcrypt -lcrypt32 -lgdi32 \
                   -lole32 -loleaut32 -luuid -lstrmiids -lwinmm -lksuser -lavrt -lmfplat -lmfuuid \
                   -lurlmon -lshell32 -lm

@@ -3,6 +3,7 @@
 #   * bsdr_agent.exe (media build), symbols stripped
 #   * the FFmpeg DLLs it needs + the mingw runtime (libwinpthread-1.dll)
 #   * README.md, LICENSE.md and an INSTALL note (Npcap / VB-CABLE / Administrator)
+#   * an NSIS Setup.exe (installer that also facilitates Npcap + VB-CABLE)
 #   * all zipped as bsdrX-win.zip
 #
 # Cross-built from Linux with the MinGW-w64 toolchain against WIN_DEPS (the mingw
@@ -65,9 +66,11 @@ with a Bigscreen VR headset over the LAN.
 Run it AS ADMINISTRATOR — desktop capture, the virtual microphone, and the
 owner-mic sniffer all need elevation.
 
-Runtime prerequisites (install once):
-  * Npcap  - https://npcap.com  (provides wpcap.dll for the owner-mic sniffer;
-             install with "WinPcap API-compatible mode").
+The agent runs WITHOUT any of the below — remote desktop, the router-companion RELAY
+owner mic, and the WinDivert-based sniff fallback all work out of the box. These enable
+the extra owner-mic paths and are installed once, on demand (the control panel prompts):
+  * Npcap  - https://npcap.com  (wpcap.dll for the promiscuous owner-mic SNIFFER + ARP MITM;
+             loaded at runtime, so it's optional — install with "WinPcap API-compatible mode").
   * VB-CABLE - https://vb-audio.com/Cable/  (virtual microphone for headset audio
              and voice computer-control; the installer names the device "BSRD_Mic").
 
@@ -81,13 +84,28 @@ The bundled DLLs (FFmpeg av*/sw* + libwinpthread-1.dll + WinDivert) must stay ne
 to bsdr_agent.exe. Windows 10 or later is required (Universal CRT).
 EOF
 
-# ---- 4. zip ------------------------------------------------------------------
-( cd "$(dirname "$STAGE")" && zip -q -r "$OUT/bsdrX-win.zip" "bsdrX" )
+# ---- 4. NSIS installer (self-contained; facilitates Npcap + VB-CABLE) --------------------------
+# Build a Setup .exe from the same staged payload and ship it INSIDE the zip alongside the portable
+# folder, so users can either run the installer or unzip-and-run. No-op if makensis isn't installed.
+SETUP=""
+if command -v makensis >/dev/null 2>&1; then
+  SETUP="$(dirname "$STAGE")/bsdrX-Setup-$VERSION.exe"
+  if makensis -V2 -DVERSION="$VERSION" -DPAYLOAD="$STAGE" -DOUTFILE="$SETUP" "$SRC/scripts/bsdrx-installer.nsi"; then
+    echo ">> built installer $(basename "$SETUP")"
+  else
+    echo "   (warn: makensis failed — shipping the portable folder only)"; SETUP=""
+  fi
+else
+  echo "   (makensis not installed — no Setup.exe; shipping the portable folder only)"
+fi
+
+# ---- 5. zip (portable folder + the Setup.exe) --------------------------------------------------
+( cd "$(dirname "$STAGE")" && zip -q -r "$OUT/bsdrX-win.zip" "bsdrX" ${SETUP:+"$(basename "$SETUP")"} )
 echo ">> bundle -> $OUT/bsdrX-win.zip"
 ( cd "$OUT" && ls -la bsdrX-win.zip )
 rm -rf "$(dirname "$STAGE")"
 
-# ---- 5. loadable plugins (private; NOT inside the bundle) — one .dll zip per plugin --------------
+# ---- 6. loadable plugins (private; NOT inside the bundle) — one .dll zip per plugin --------------
 # The bundle above ships NO plugin; here we cross-build each plugins/<name>/ with the same MinGW
 # toolchain into a Windows .dll and package it on its own. No-op if there's no plugins/ tree.
 SRC="$SRC" OUT="$OUT" VERSION="$VERSION" PLATFORM=windows ARCH=x86_64 \

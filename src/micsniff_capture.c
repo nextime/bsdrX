@@ -19,6 +19,69 @@
 
 #include <pcap.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+/* Runtime-load wpcap.dll instead of importing it, so the agent STARTS with no Npcap installed — the relay,
+ * remote desktop, and the WinDivert sniff fallback all keep working; only the pcap engine (passive
+ * promiscuous sniff + ARP MITM) needs Npcap, and it stays disabled with a clear prompt until it's there.
+ * The exe used to hard-import wpcap.dll (via -lwpcap), which made Windows refuse to launch it without
+ * Npcap. Resolve the handful of pcap entry points we call from wpcap.dll on first use. */
+typedef pcap_t *(*pf_create)(const char *, char *);
+typedef int   (*pf_pi)(pcap_t *, int);
+typedef int   (*pf_activate)(pcap_t *);
+typedef char *(*pf_geterr)(pcap_t *);
+typedef void  (*pf_close)(pcap_t *);
+typedef int   (*pf_compile)(pcap_t *, struct bpf_program *, const char *, int, bpf_u_int32);
+typedef int   (*pf_setfilter)(pcap_t *, struct bpf_program *);
+typedef void  (*pf_freecode)(struct bpf_program *);
+typedef int   (*pf_datalink)(pcap_t *);
+typedef int   (*pf_next_ex)(pcap_t *, struct pcap_pkthdr **, const u_char **);
+typedef int   (*pf_sendpacket)(pcap_t *, const u_char *, int);
+static struct { pf_create create; pf_pi set_snaplen, set_promisc, set_timeout, set_immediate_mode;
+                pf_activate activate; pf_geterr geterr; pf_close close; pf_compile compile;
+                pf_setfilter setfilter; pf_freecode freecode; pf_datalink datalink;
+                pf_next_ex next_ex; pf_sendpacket sendpacket; } WP;
+static int wp_state = -1;   /* -1 untried, 0 absent, 1 ready */
+static int wp_load(void) {
+    if (wp_state >= 0) return wp_state;
+    HMODULE h = LoadLibraryA("wpcap.dll");
+    if (!h) { wp_state = 0; return 0; }
+    WP.create=(pf_create)(void*)GetProcAddress(h,"pcap_create");
+    WP.set_snaplen=(pf_pi)(void*)GetProcAddress(h,"pcap_set_snaplen");
+    WP.set_promisc=(pf_pi)(void*)GetProcAddress(h,"pcap_set_promisc");
+    WP.set_timeout=(pf_pi)(void*)GetProcAddress(h,"pcap_set_timeout");
+    WP.set_immediate_mode=(pf_pi)(void*)GetProcAddress(h,"pcap_set_immediate_mode");
+    WP.activate=(pf_activate)(void*)GetProcAddress(h,"pcap_activate");
+    WP.geterr=(pf_geterr)(void*)GetProcAddress(h,"pcap_geterr");
+    WP.close=(pf_close)(void*)GetProcAddress(h,"pcap_close");
+    WP.compile=(pf_compile)(void*)GetProcAddress(h,"pcap_compile");
+    WP.setfilter=(pf_setfilter)(void*)GetProcAddress(h,"pcap_setfilter");
+    WP.freecode=(pf_freecode)(void*)GetProcAddress(h,"pcap_freecode");
+    WP.datalink=(pf_datalink)(void*)GetProcAddress(h,"pcap_datalink");
+    WP.next_ex=(pf_next_ex)(void*)GetProcAddress(h,"pcap_next_ex");
+    WP.sendpacket=(pf_sendpacket)(void*)GetProcAddress(h,"pcap_sendpacket");
+    wp_state = (WP.create&&WP.set_snaplen&&WP.set_promisc&&WP.set_timeout&&WP.set_immediate_mode&&
+                WP.activate&&WP.geterr&&WP.close&&WP.compile&&WP.setfilter&&WP.freecode&&
+                WP.datalink&&WP.next_ex&&WP.sendpacket) ? 1 : 0;
+    return wp_state;
+}
+/* Route the calls below through the loaded pointers (the pcap.h prototypes above are already parsed). */
+#define pcap_create             WP.create
+#define pcap_set_snaplen        WP.set_snaplen
+#define pcap_set_promisc        WP.set_promisc
+#define pcap_set_timeout        WP.set_timeout
+#define pcap_set_immediate_mode WP.set_immediate_mode
+#define pcap_activate           WP.activate
+#define pcap_geterr             WP.geterr
+#define pcap_close              WP.close
+#define pcap_compile            WP.compile
+#define pcap_setfilter          WP.setfilter
+#define pcap_freecode           WP.freecode
+#define pcap_datalink           WP.datalink
+#define pcap_next_ex            WP.next_ex
+#define pcap_sendpacket         WP.sendpacket
+#endif /* _WIN32 */
+
 /* Windows: when Npcap is absent we can still SNIFF (capture-only) via the bundled WinDivert — it hands
  * us forwarded IPv4 packets at the NETWORK_FORWARD layer, so a passive sniff works when this PC is the
  * headset's gateway/in-path (no Npcap needed). It can't ARP-inject (L2), so MITM still needs Npcap. */
@@ -63,19 +126,30 @@ static int l2_offset(int dlt, const unsigned char *d, int caplen) {
 
 mc_cap *mc_cap_open(const char *iface, const char *quest_ip, char *err, size_t errlen) {
     char eb[PCAP_ERRBUF_SIZE] = "";
-    pcap_t *pd = pcap_create(iface, eb);
-    if (pd) {
-        pcap_set_snaplen(pd, 2048);
-        pcap_set_promisc(pd, 1);
-        pcap_set_timeout(pd, 300);
-        pcap_set_immediate_mode(pd, 1);                 /* deliver ASAP — low latency for audio */
-        int act = pcap_activate(pd);
-        if (act < 0) {
-            snprintf(err, errlen, "pcap_activate(%s): %s", iface, pcap_geterr(pd));
-            pcap_close(pd); pd = NULL;                   /* fall through to WinDivert on Windows */
+    pcap_t *pd = NULL;
+#if defined(_WIN32)
+    /* No Npcap? Don't touch pcap at all — leave pd NULL and let the WinDivert fallback (or the error) take
+     * over. The relay path never reaches here, so it keeps working regardless. */
+    if (!wp_load())
+        snprintf(err, errlen, "Npcap is not installed (wpcap.dll not found) — install it from "
+                              "https://npcap.com to enable the owner-mic sniffer/MITM");
+    else
+#endif
+    {
+        pd = pcap_create(iface, eb);
+        if (pd) {
+            pcap_set_snaplen(pd, 2048);
+            pcap_set_promisc(pd, 1);
+            pcap_set_timeout(pd, 300);
+            pcap_set_immediate_mode(pd, 1);             /* deliver ASAP — low latency for audio */
+            int act = pcap_activate(pd);
+            if (act < 0) {
+                snprintf(err, errlen, "pcap_activate(%s): %s", iface, pcap_geterr(pd));
+                pcap_close(pd); pd = NULL;               /* fall through to WinDivert on Windows */
+            }
+        } else {
+            snprintf(err, errlen, "pcap_create(%s): %s", iface, eb);
         }
-    } else {
-        snprintf(err, errlen, "pcap_create(%s): %s", iface, eb);
     }
     if (pd) {
         struct bpf_program fp;
