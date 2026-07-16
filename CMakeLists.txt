@@ -54,6 +54,11 @@ set(BSDR_CORE_SRC
   src/cloud_stream.c
   src/app.c
   src/webui.c
+  src/plugin.c            # loadable-plugin manager (dlopen); referenced by app.c/webui.c/botmic.c/agent.c
+  src/plugstore.c         # in-app plugin-store client (account/catalog/buy/download/enable)
+  src/toolregistry.c      # bot host-service: tool registry plugins register into (ABI 4)
+  src/botsense.c          # bot host-service: per-SSRC VAD + utterance delivery worker (ABI 4)
+  src/mediafx.c           # media-effect registry (voice-changer / 2D->3D plugins)
   src/overlay.c
   src/httpc.c
   src/tls.c
@@ -102,7 +107,7 @@ if(WIN32)
   target_link_libraries(bsdr_core PUBLIC ws2_32 user32 bcrypt crypt32)
 else()
   find_package(Threads REQUIRED)
-  target_link_libraries(bsdr_core PUBLIC Threads::Threads)
+  target_link_libraries(bsdr_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})   # ${CMAKE_DL_LIBS}=dl: plugin.c dlopen()
 endif()
 if(APPLE)
   target_link_libraries(bsdr_core PUBLIC "-framework CoreGraphics" "-framework CoreFoundation")

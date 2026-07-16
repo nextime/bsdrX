@@ -44,3 +44,9 @@ __pycache__/
 *.log
 /.gh-publish/
 android/app/src/main/jniLibs/
+
+# private plugin-store upload credentials (never commit / never publish)
+.plugstore.env
+# in-flight plan docs — working notes, deliberately untracked
+/PLAN-media-plugins.md
+/PLAN-bot-plugin.md

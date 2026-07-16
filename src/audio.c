@@ -56,6 +56,9 @@ struct bsdr_audio_sender {
     int gain;          /* 0..100 */
     int cloud_trailer; /* append the 8-byte BigSoup cloud trailer [u32 ssrc LE][u32 frame_id LE] */
     uint32_t cloud_frame_id;
+    int dup;           /* send each packet this many times (1=default). Real Bigscreen room mic sends
+                        * 2× — identical payload+trailer, fresh RTP seq per copy; receiver dedups by
+                        * the trailer frame_id (BigMicStream::Broadcast disasm). Plain-RTP path only. */
     int16_t scaled[BSDR_OPUS_FRAME * 2];
     uint8_t pkt[RTP_HDR + 1500 + SRTP_MAX_TRAILER_LEN];
 };
@@ -65,6 +68,11 @@ struct bsdr_audio_sender {
  * reads the last 8 Opus bytes as SSRC (=0 on quiet frames), registers a phantom user, and double-frees
  * its audio sink -> SIGABRT. ssrc must equal the RTP/video SSRC (djb2(userSessionId)); NO XOR. */
 void bsdr_audio_sender_enable_cloud_trailer(bsdr_audio_sender *s) { s->cloud_trailer = 1; }
+
+/* Send each packet N times (identical payload + trailer, fresh RTP seq per copy). Matches the real
+ * Bigscreen room mic (BigMicStream sends 2×). Plain-RTP only — SRTP encrypts the buffer in place, so a
+ * copy can't be re-sent; harmless to set, just ignored on the SRTP path. */
+void bsdr_audio_sender_set_dup(bsdr_audio_sender *s, int n) { if (s && n >= 1) s->dup = n; }
 
 void bsdr_audio_sender_set_gain(bsdr_audio_sender *s, int vol) {
     s->gain = vol < 0 ? 0 : vol > 100 ? 100 : vol;
@@ -83,6 +91,7 @@ bsdr_audio_sender *bsdr_audio_sender_new(bsdr_udp *udp, const bsdr_srtp_keys *ke
     s->channels = channels;
     s->first = 1;
     s->gain = 100;
+    s->dup = 1;
     /* RFC 3550 / match the official host: start seq + timestamp at random values. A producer
      * whose RTP starts at seq 0 / ts 0 can be mishandled by mediasoup (we already do this for
      * video; the audio sender was starting at 0/0, unlike the official client which starts high). */
@@ -130,13 +139,21 @@ int bsdr_audio_send_pcm(bsdr_audio_sender *s, const int16_t *pcm, int frames) {
     p[0] = 0x80;
     p[1] = (uint8_t)(s->pt & 0x7f);   /* marker always 0 — matches the official host's audio */
     s->first = 0;
-    wr16(p + 2, s->seq++);
     wr32(p + 4, s->ts);
     wr32(p + 8, s->ssrc);
-    s->ts += (uint32_t)frames;
-    int len = RTP_HDR + n;
-    if (!s->plain && srtp_protect(s->srtp, p, &len) != srtp_err_status_ok) return -1;
-    return bsdr_udp_send(s->udp, p, (size_t)len) < 0 ? -1 : 0;
+    s->ts += (uint32_t)frames;         /* one timestamp step per frame, shared by any duplicate copies */
+    /* Optional packet duplication (real Bigscreen room mic sends 2×): identical payload + trailer, a
+     * fresh RTP seq per copy; the receiver dedups by the trailer frame_id. Plain-RTP only — srtp_protect
+     * rewrites the buffer in place, so a sent SRTP packet can't be re-sent. */
+    int reps = (s->plain && s->dup > 1) ? s->dup : 1;
+    int rc = 0, len = RTP_HDR + n;
+    for (int i = 0; i < reps; i++) {
+        wr16(p + 2, s->seq++);         /* each copy: new seq, same ts + same frame_id */
+        int slen = len;
+        if (!s->plain && srtp_protect(s->srtp, p, &slen) != srtp_err_status_ok) return -1;
+        if (bsdr_udp_send(s->udp, p, (size_t)slen) < 0) rc = -1;
+    }
+    return rc;
 }
 
 void bsdr_audio_sender_free(bsdr_audio_sender *s) {
@@ -179,6 +196,8 @@ typedef struct {
     float        energy;                /* smoothed loudness (for the voice-activity duck) */
 } bsdr_mic_stream;
 
+struct bsdr_ssrc_gain { uint32_t ssrc; float gain; };   /* per-SSRC volume-policy entry */
+
 struct bsdr_audio_recv {
     srtp_t srtp;
     int plain;         /* NULL keys => plain RTP */
@@ -192,9 +211,25 @@ struct bsdr_audio_recv {
     volatile uint32_t solo_ssrc; /* if non-zero, mix ONLY this SSRC (identity solo: "listen only to
                         * <that participant>", e.g. the room owner) — mute every other stream. */
     int cloud_trailer; /* strip the 8-byte BigSoup trailer [u32 ssrc][u32 frame_id] before decode */
+    /* Per-SSRC volume policy (bot room-audio): scale each stream by a gain keyed to the speaker's
+     * access level. Off until set_gain* is called (unity for everyone), so other consumers are
+     * unaffected. Snapshotted under gain_lock at the top of playout so the audio thread never tears. */
+    bsdr_mutex *gain_lock;
+    int         gain_active;
+    float       gain_default;
+    int         ngains;
+    struct bsdr_ssrc_gain gains[16];
+    bsdr_ssrc_pcm_cb tap; void *tap_user;   /* per-SSRC PCM tap (audible streams only) */
     bsdr_mic_stream streams[BSDR_MIC_STREAMS];
     int16_t pcm[BSDR_OPUS_FRAME * 2];   /* one mixed 20 ms frame (interleaved) */
 };
+
+/* Gain for an SSRC given a snapshot of the table (caller holds no lock — snapshot is a local copy). */
+static float gain_lookup(int active, float dflt, int ng, const struct bsdr_ssrc_gain *tab, uint32_t ssrc) {
+    if (!active) return 1.0f;
+    for (int i = 0; i < ng; i++) if (tab[i].ssrc == ssrc) return tab[i].gain;
+    return dflt;
+}
 
 /* Find or create the per-SSRC stream (evicting the LRU one if full). */
 static bsdr_mic_stream *mic_stream_for(bsdr_audio_recv *r, uint32_t ssrc) {
@@ -233,6 +268,8 @@ bsdr_audio_recv *bsdr_audio_recv_new(const bsdr_srtp_keys *keys, uint8_t pt,
     r->pt = pt ? pt : BSDR_AUDIO_PT_DEFAULT;
     r->channels = channels;
     r->cb = cb; r->user = user;
+    r->gain_lock = bsdr_mutex_new();
+    r->gain_default = 1.0f;
     /* decoders + jitter buffers are created lazily per incoming SSRC (mic_stream_for) */
     r->plain = plain;
     if (!r->plain &&
@@ -290,6 +327,14 @@ int bsdr_audio_recv_playout(bsdr_audio_recv *r) {
     int32_t mix[BSDR_OPUS_FRAME * 2] = {0};
     int16_t tmp[BSDR_OPUS_FRAME * 2];
     bool any = false;
+    /* Snapshot the volume-policy gain table once (audio thread never reads it torn). */
+    int g_active, g_ng; float g_dflt;
+    struct bsdr_ssrc_gain g_tab[16];
+    if (r->gain_lock) bsdr_mutex_lock(r->gain_lock);
+    g_active = r->gain_active; g_dflt = r->gain_default; g_ng = r->ngains;
+    for (int i = 0; i < g_ng; i++) g_tab[i] = r->gains[i];
+    bsdr_ssrc_pcm_cb tap = r->tap; void *tap_user = r->tap_user;
+    if (r->gain_lock) bsdr_mutex_unlock(r->gain_lock);
     /* Voice-activity duck: pick the loudest active stream (the person speaking = the owner giving a
      * command) from the previous tick's energies; mix only it and mute the rest. ~1 frame of lag to
      * lock on, imperceptible for a command. */
@@ -343,8 +388,13 @@ int bsdr_audio_recv_playout(bsdr_audio_recv *r) {
             /* solo: include only the chosen SSRC; duck: include only the loudest; else mix all. */
             bool include = (!r->duck || st == speaker);
             if (r->solo_ssrc && st->ssrc != r->solo_ssrc) include = false;
-            if (include) {
-                for (int i = 0; i < n; i++) mix[i] += tmp[i];
+            float g = gain_lookup(g_active, g_dflt, g_ng, g_tab, st->ssrc);
+            /* Per-SSRC tap: hand roomcmd the raw speech of every AUDIBLE speaker (gain > 0), so it can
+             * run per-speaker VAD/STT. Muted strangers (gain 0) are neither mixed nor tapped. */
+            if (tap && g > 0.0f) tap(st->ssrc, tmp, frames, r->channels, tap_user);
+            if (include && g > 0.0f) {
+                if (g == 1.0f) for (int i = 0; i < n; i++) mix[i] += tmp[i];
+                else           for (int i = 0; i < n; i++) mix[i] += (int32_t)((float)tmp[i] * g);
                 any = true;
             }
         }
@@ -364,6 +414,36 @@ void bsdr_audio_recv_set_duck(bsdr_audio_recv *r, int on) {
 void bsdr_audio_recv_set_solo(bsdr_audio_recv *r, uint32_t ssrc) {
     if (r) r->solo_ssrc = ssrc;   /* 0 = mix everyone; else mix only this SSRC */
 }
+void bsdr_audio_recv_set_gain(bsdr_audio_recv *r, uint32_t ssrc, float gain) {
+    if (!r || !ssrc) return;
+    if (gain < 0.0f) gain = 0.0f;
+    bsdr_mutex_lock(r->gain_lock);
+    r->gain_active = 1;
+    int i = 0;
+    for (; i < r->ngains; i++) if (r->gains[i].ssrc == ssrc) { r->gains[i].gain = gain; break; }
+    if (i == r->ngains && r->ngains < (int)(sizeof r->gains / sizeof r->gains[0]))
+        { r->gains[r->ngains].ssrc = ssrc; r->gains[r->ngains].gain = gain; r->ngains++; }
+    bsdr_mutex_unlock(r->gain_lock);
+}
+void bsdr_audio_recv_set_gain_default(bsdr_audio_recv *r, float gain) {
+    if (!r) return;
+    if (gain < 0.0f) gain = 0.0f;
+    bsdr_mutex_lock(r->gain_lock);
+    r->gain_active = 1; r->gain_default = gain;
+    bsdr_mutex_unlock(r->gain_lock);
+}
+void bsdr_audio_recv_clear_gains(bsdr_audio_recv *r) {
+    if (!r) return;
+    bsdr_mutex_lock(r->gain_lock);
+    r->gain_active = 0; r->ngains = 0; r->gain_default = 1.0f;
+    bsdr_mutex_unlock(r->gain_lock);
+}
+void bsdr_audio_recv_set_tap(bsdr_audio_recv *r, bsdr_ssrc_pcm_cb cb, void *user) {
+    if (!r) return;
+    bsdr_mutex_lock(r->gain_lock);
+    r->tap = cb; r->tap_user = user;
+    bsdr_mutex_unlock(r->gain_lock);
+}
 void bsdr_audio_recv_enable_cloud_trailer(bsdr_audio_recv *r) {
     if (r) r->cloud_trailer = 1;
 }
@@ -375,6 +455,7 @@ void bsdr_audio_recv_free(bsdr_audio_recv *r) {
         if (r->streams[i].dec) opus_decoder_destroy(r->streams[i].dec);
         free(r->streams[i].jb);
     }
+    if (r->gain_lock) bsdr_mutex_free(r->gain_lock);
     free(r);
 }
 
@@ -554,9 +635,16 @@ static void pactl_unload(int module) {
     if (system(cmd) != 0) { /* best effort */ }
 }
 
+/* The BSDR_QuestMic mic device (null-sink + remap-source) is a PROCESS-LIFETIME singleton, NOT part of
+ * the per-streaming-session devices — recording apps bind to it once, so it must not be torn down and
+ * recreated on every session (which loses the app's selection and shows a "new" device). These hold its
+ * modules; -1 = not ours (either not up, or a pre-existing one we reuse). */
+static int g_qmic_sink = -1, g_qmic_src = -1;
+
 /* Unload any leftover bsdr_* virtual devices from a previous run that didn't clean up (killed,
  * Ctrl-C force-quit, or crashed). PulseAudio keeps them loaded forever otherwise, so they pile up
- * and apps may latch a stale, dead BSDR_QuestMic. Self-healing: run this before (re)creating. */
+ * and apps may latch a stale, dead BSDR_QuestMic. Self-healing: run this before (re)creating.
+ * Preserves the persistent BSDR_QuestMic we currently own — a per-session (re)create must not nuke it. */
 static void pactl_unload_stale(void) {
     FILE *f = popen("pactl list short modules 2>/dev/null", "r");
     if (!f) return;
@@ -566,7 +654,7 @@ static void pactl_unload_stale(void) {
         if (strstr(line, "bsdr_speaker") || strstr(line, "bsdr_micsink") ||
             strstr(line, "bsdr_quest_mic")) {
             int id = atoi(line);   /* module id = first column */
-            if (id > 0) ids[n++] = id;
+            if (id > 0 && id != g_qmic_sink && id != g_qmic_src) ids[n++] = id;
         }
     }
     pclose(f);
@@ -574,7 +662,42 @@ static void pactl_unload_stale(void) {
     if (n) BSDR_INFO("bsdr.audio", "cleaned up %d leftover virtual-device module(s)", n);
 }
 
-void bsdr_audio_cleanup_stale_devices(void) { pactl_unload_stale(); }
+/* Create the persistent BSDR_QuestMic device on demand (idempotent). Recording apps bind to it once and
+ * keep it across streaming sessions; see g_qmic_sink above. Called by the streaming-session bring-up and
+ * by the owner-mic relay — whoever needs the mic first brings it up. */
+void bsdr_audio_questmic_ensure(void) {
+    if (g_qmic_sink >= 0 || bsdr_audio_sink_exists("bsdr_micsink")) return;   /* already up */
+    g_qmic_sink = pactl_load("module-null-sink sink_name=bsdr_micsink "
+                             "sink_properties=device.description=BSDR_QuestMicSink");
+    if (g_qmic_sink < 0) {
+        BSDR_WARN("bsdr.audio", "BSDR_QuestMic sink (bsdr_micsink) failed to load — the headset mic device "
+                                "will be absent; owner-mic relay/room-mic have nowhere to land");
+        return;
+    }
+    g_qmic_src = pactl_load("module-remap-source master=bsdr_micsink.monitor source_name=bsdr_quest_mic "
+                            "source_properties=device.description=BSDR_QuestMic");
+    BSDR_INFO("bsdr.audio", "BSDR_QuestMic device up (persistent) — apps record from it across sessions");
+}
+
+void bsdr_audio_cleanup_stale_devices(void) { g_qmic_sink = g_qmic_src = -1; pactl_unload_stale(); }
+
+int bsdr_audio_sink_exists(const char *sink_name) {
+    if (!sink_name || !sink_name[0]) return 0;
+    FILE *f = popen("pactl list short sinks 2>/dev/null", "r");
+    if (!f) return 0;
+    char line[512]; int found = 0;
+    size_t nl = strlen(sink_name);
+    while (fgets(line, sizeof line, f)) {
+        /* short-sink columns are tab-separated: <id>\t<name>\t… — match the name column exactly. */
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        char *name = tab + 1;
+        if (strncmp(name, sink_name, nl) == 0 && (name[nl] == '\t' || name[nl] == '\0'))
+            { found = 1; break; }
+    }
+    pclose(f);
+    return found;
+}
 
 bool bsdr_audio_devices_create(bsdr_audio_devices *d) {
     memset(d, 0, sizeof(*d));
@@ -594,17 +717,11 @@ bool bsdr_audio_devices_create(bsdr_audio_devices *d) {
     if (system("pactl set-default-sink bsdr_speaker 2>/dev/null") != 0) { /* ok */ }
     snprintf(d->monitor_source, sizeof(d->monitor_source), "bsdr_speaker.monitor");
 
-    /* The single Quest mic. A null-sink (bsdr_micsink) that the owner-mic sniffer plays the decoded
-     * headset voice into, exposed as a capture source apps record as "BSDR_QuestMic". Created with
-     * the session so the device stays visible/selectable the whole time (it's silent until the owner
-     * mic is started); the cloud room-audio path can also feed the same sink. */
-    d->mic_sink_module = pactl_load(
-        "module-null-sink sink_name=bsdr_micsink "
-        "sink_properties=device.description=BSDR_QuestMicSink");
+    /* The single Quest mic (BSDR_QuestMic) is a PERSISTENT device, not owned by this session — bring it up
+     * if it isn't already, but leave d->mic_*_module = -1 so devices_destroy never tears it down. That way
+     * a recording app keeps its selection across session restarts. */
+    bsdr_audio_questmic_ensure();
     snprintf(d->mic_sink, sizeof(d->mic_sink), "bsdr_micsink");
-    d->mic_source_module = pactl_load(
-        "module-remap-source master=bsdr_micsink.monitor source_name=bsdr_quest_mic "
-        "source_properties=device.description=BSDR_QuestMic");
 
     d->active = true;
     BSDR_INFO("bsdr.audio", "virtual devices: capture %s, mic %s (apps see BSDR_QuestMic)",
@@ -646,8 +763,9 @@ void bsdr_audio_devices_destroy(bsdr_audio_devices *d) {
         snprintf(cmd, sizeof(cmd), "pactl set-default-sink %s 2>/dev/null", d->prev_default_sink);
         if (system(cmd) != 0) { /* best effort */ }
     }
-    pactl_unload(d->mic_source_module);
-    pactl_unload(d->mic_sink_module);
+    /* Only the speaker is per-session. The BSDR_QuestMic mic device is a persistent singleton this session
+     * doesn't own (d->mic_*_module stay -1) — leave it up so recording apps keep their selection. It's
+     * torn down only at process exit, by bsdr_audio_cleanup_stale_devices(). */
     pactl_unload(d->speaker_module);
     d->active = false;
 }

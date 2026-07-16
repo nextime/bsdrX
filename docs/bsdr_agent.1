@@ -182,6 +182,17 @@ Auto-cancel the in-VR Send/Cancel prompt after this long (default 60).
 .BI \-\-ui\-port " N"
 Port for the local control panel (default 8088).
 .TP
+.BI \-\-web\-bind " ADDR"
+Listen address for the control panel (default \fB127.0.0.1\fR, loopback only). Use
+\fB0.0.0.0\fR for all interfaces or a specific IP to reach the panel from another device
+(e.g. a phone as a remote control). Binding off\-loopback exposes an \fBunauthenticated\fR
+panel \(em firewall it or place it behind a reverse proxy that adds authentication.
+.TP
+.BI \-\-web\-allow " HOSTS"
+Extra \fBHost\fR/\fBOrigin\fR values the CSRF/DNS\-rebinding guard accepts beyond loopback,
+comma\-separated: a LAN IP, or your reverse\-proxy hostname (\fBserver_name\fR) when behind
+nginx. \fB*\fR accepts any Host/Origin (use only behind an authenticating proxy).
+.TP
 .B \-\-no\-ui
 Disable the web control panel.
 .TP
@@ -239,6 +250,12 @@ Encode on the iGPU via VAAPI instead of NVENC.
 .B \-\-kmsgrab
 Capture via DRM/KMS instead of x11grab (zero-copy with \fB\-\-vaapi\fR). Note: the
 computer-control balloon is not composited on this zero-copy path.
+.TP
+.B \-\-cloud\-rtcp\-pli
+For internet sharing: read RTCP on the cloud video socket and force an encoder keyframe
+(IDR) whenever the SFU sends a PLI/FIR keyframe request. Off by default \(em a new
+joiner already triggers a keyframe via the room roster; enable this only on SFU
+deployments that feed RTCP back to the producer.
 .TP
 .B \-\-sendmmsg
 Batch each NAL's UDP fragments into one syscall.

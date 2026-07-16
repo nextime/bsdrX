@@ -30,6 +30,18 @@
 
 typedef struct bsdr_botroom bsdr_botroom;
 
+/* Live state of the avatar data plane, polled by the UI so a join shows real progress instead of a
+ * premature "avatar up" (the SCTP association completes seconds after the thread starts, or fails). */
+typedef enum {
+    BSDR_AVATAR_OFF        = 0,   /* no presence thread (audio-only / stopped / not built) */
+    BSDR_AVATAR_CONNECTING = 1,   /* SCTP INIT sent, retrying to associate with the relay */
+    BSDR_AVATAR_UP         = 2,   /* associated; broadcasting UserState + pose (avatar renders) */
+    BSDR_AVATAR_GHOST      = 3    /* gave up associating — userlist ghost, no avatar */
+} bsdr_avatar_state;
+
+/* Current avatar-plane state (NULL-safe -> BSDR_AVATAR_OFF). */
+bsdr_avatar_state bsdr_botroom_avatar_state(const bsdr_botroom *b);
+
 /* Start the avatar presence for a joined room. relay_ip:data_port is the bot's own MediaPeer from the
  * room-join response; legacy_user_id = the bot's room legacyUserId ("userNNN") — the exact string the
  * Quest keys remote avatars by, so it MUST match the roster (an empty/wrong id renders nothing);

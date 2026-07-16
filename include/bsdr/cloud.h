@@ -73,6 +73,8 @@ typedef struct {
     char session_id[200];              /* mediaPeer.userSessionId */
     char legacy_user_id[64];           /* RoomUser.legacyUserId ("userNNN") — the data-channel prefix
                                         * the Quest keys remote avatars by (empty if not in the JSON) */
+    int  seat_index;                   /* LocalUser.seatIndex — the bot's assigned seat; the avatar
+                                        * renders/positions by it. -1 = not in the JSON (unknown). */
     char user_type[24];                /* room adminSettings.preferredUserType (Anyone/VerifiedUsersOnly/
                                         * FriendsOnly/AdminsOnly) — drives the bot-join decision tree */
     int  http_status;                  /* GET /rooms HTTP status (401/403 => token expired) */
@@ -123,6 +125,22 @@ bool bsdr_cloud_poll_room_id(const char *access_token, char *out, size_t cap);
  * GET /room/{id}). Fills out->media_ip + out->mic_port from the localUser peer. Returns true on a
  * 2xx that yields a usable mic peer. */
 bool bsdr_cloud_get_room(const char *access_token, const char *room_id, bsdr_cloud_screen *out);
+
+/* GET /room/{id} and parse the FULL participant roster (not just our own peer) into `out`.
+ * self_session_id (may be NULL) marks the bot's own entry. Returns the participant count (0 on
+ * failure). Defined in cloud.c; the schema-robust parse lives in roster.c. */
+struct bsdr_roster;
+int bsdr_cloud_get_participants(const char *access_token, const char *room_id,
+                               struct bsdr_roster *out, const char *self_session_id);
+
+/* Kick a user (by their userSessionId) from a room the bot moderates: POST /room/{id}/users/{sid}/kick
+ * (authoritative path). Returns the HTTP status (2xx = kicked), or -1 on a connection error. */
+int bsdr_cloud_kick(const char *access_token, const char *room_id, const char *user_session_id);
+
+/* A pending incoming friend request (from GET /social/notifications, notificationType FriendRequest). */
+typedef struct { char notif_id[96]; char username[64]; char social_id[80]; } bsdr_friend_req;
+/* List pending FriendRequest notifications for the account. Returns the count (fills up to cap). */
+int bsdr_cloud_list_friend_requests(const char *access_token, bsdr_friend_req *out, int cap);
 
 /* --- second-account "bot" room-join helpers (invite -> accept -> join; see bsdrx-bot-join-room-policy) --- */
 /* GET /auth/account -> the caller's own socialId (needed to invite it). Returns true + fills out. */

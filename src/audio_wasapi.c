@@ -306,6 +306,10 @@ void bsdr_audio_devices_destroy(bsdr_audio_devices *d) {
 }
 
 void bsdr_audio_cleanup_stale_devices(void) { /* no virtual modules on Windows */ }
+/* Windows: VB-CABLE is the persistent mic device (the user installs it), so there is nothing to ensure
+ * and no PulseAudio sink to query — parity no-ops for the Linux persistent-QuestMic helpers. */
+void bsdr_audio_questmic_ensure(void) {}
+int  bsdr_audio_sink_exists(const char *sink_name) { (void)sink_name; return 0; }
 
 /* Standalone virtual mic for the owner-mic sniffer. On Windows the virtual mic is VB-CABLE
  * (user-installed, renamed BSRD_Mic by the installer) — we don't create it, just verify it's

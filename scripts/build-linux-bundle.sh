@@ -40,7 +40,7 @@ make clean >/dev/null 2>&1 || true
 # ---- 1. build bsdrX (full media) against the private minimal-ffmpeg prefix ----
 # Explicit vars (not ./configure autodetect) so we pin OUR deps and set an rpath
 # that finds the bundled libs at $ORIGIN/../lib.
-BASE_CFLAGS="-std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -Ithird_party/miniz"
+BASE_CFLAGS="-std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -Ithird_party/miniz -Ithird_party/minimp3 -Ithird_party/cjson"
 MEDIA_SRC="src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/fileaudio.c src/capture_pipewire.c src/term.c src/audio.c src/micsniff.c src/micsniff_capture.c"
 MEDIA_DEF="-DBSDR_ENABLE_SCTP=1 -DBSDR_ENABLE_VIDEO=1 -DBSDR_HAVE_CAPTURE=1 -DBSDR_ENABLE_AUDIO=1 -DBSDR_HAVE_AUDIO=1 -DBSDR_HAVE_PCAP=1"
 # Wayland desktop capture (xdg-desktop-portal + PipeWire). System libs in the build image; linuxdeploy
@@ -117,7 +117,7 @@ make all BUILD=build-bundle EXEEXT= BUILD_TESTS=no WAYLAND_GAMMA="$WAYLAND_GAMMA
   MEDIA_SRC="$MEDIA_SRC $WLG_SRC $VTERM_SRC" SCTP_SRC=src/sctp.c \
   CFLAGS="$BASE_CFLAGS $MEDIA_DEF $PW_CFLAGS $WLG_CFLAGS -I$BSDRX_DEPS/include" \
   LDFLAGS="-L$BSDRX_DEPS/lib -Wl,-rpath,\$\$ORIGIN/../lib -Wl,--disable-new-dtags" \
-  LDLIBS="$MEDIA_LIBS $WLG_LIBS $VTERM_LIBS $XTST_LIBS"
+  LDLIBS="$MEDIA_LIBS $WLG_LIBS $VTERM_LIBS $XTST_LIBS -ldl"   # -ldl: src/plugin.c dlopen()s plugins (older glibc keeps it in libdl)
 
 BIN="build-bundle/bsdr_agent"
 test -x "$BIN"
@@ -294,4 +294,11 @@ cp "$SRC/README.md" "$SRC/LICENSE.md" "$ZIPTMP/"
 ( cd "$ZIPTMP" && zip -q -r "$OUT/bsdrX.zip" . )
 echo ">> bundle -> $OUT/bsdrX.zip"
 ( cd "$OUT" && ls -la bsdrX.zip bsdrX-${ARCH}.AppImage bsdr-agent_*_${DEBARCH}.deb )
+
+# ---- 5. loadable plugins (private; NOT inside the bundle) — packaged on their own, per platform ----
+# The AppImage/.deb above intentionally ship NO plugin; here we build each plugins/<name>/ with the
+# container's native toolchain (Linux/$ARCH) and emit one zip per plugin. No-op if there's no plugins/.
+SRC="$WORK/bsdrX" OUT="$OUT" VERSION="$VERSION" PLATFORM=linux ARCH="$ARCH" PLUGIN_CC=cc \
+  bash "$WORK/bsdrX/scripts/build-plugins.sh" || echo ">> WARN: plugin packaging failed (non-fatal)"
+
 rm -rf "$WORK"

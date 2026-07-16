@@ -30,6 +30,7 @@
 #include "bsdr/dtls.h"
 #include "bsdr/sctp.h"
 #include "bsdr/input_decode.h"
+#include <usrsctp.h>   /* usrsctp_crc32c — recompute the checksum the LAN path deliberately zeroes */
 
 #include <stdio.h>
 #include <string.h>
@@ -60,6 +61,19 @@ static void headset_handshake(void *arg) {
 static void put_i32(uint8_t *p, int32_t v) {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
     p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+/* The agent's conn_output (src/sctp.c) zeroes the SCTP CRC32c on the LAN/DTLS path — correct for the
+ * real Quest, which ignores it per RFC 8261. But BOTH ends of THIS test are usrsctp instances with
+ * checksum validation on (offload is deliberately off so the cloud path gets a real CRC), so a
+ * csum-0 packet is dropped as corrupt and the association never forms. Recompute the checksum on each
+ * received packet before feeding it in — modeling the Quest accepting the packet. Test-only; the
+ * production code is unchanged. */
+static void fix_sctp_csum(uint8_t *pkt, int len) {
+    if (len < 12) return;
+    memset(pkt + 8, 0, 4);                       /* checksum field must be 0 for the computation */
+    uint32_t c = usrsctp_crc32c(pkt, (size_t)len);
+    memcpy(pkt + 8, &c, 4);                       /* usrsctp returns it in wire form */
 }
 
 int main(void) {
@@ -98,9 +112,9 @@ int main(void) {
     uint8_t buf[2048];
     while (!g_got && bsdr_now_ms() - t0 < 8000) {
         int na = bsdr_dtls_recv(da, buf, sizeof(buf), 20);
-        if (na > 0) bsdr_sctp_feed(sa, buf, (size_t)na);
+        if (na > 0) { fix_sctp_csum(buf, na); bsdr_sctp_feed(sa, buf, (size_t)na); }
         int nh = bsdr_dtls_recv(dh, buf, sizeof(buf), 20);
-        if (nh > 0) bsdr_sctp_feed(sh, buf, (size_t)nh);
+        if (nh > 0) { fix_sctp_csum(buf, nh); bsdr_sctp_feed(sh, buf, (size_t)nh); }
 
         uint64_t now = bsdr_now_ms();
         bsdr_sctp_handle_timers((uint32_t)(now - last));

@@ -28,7 +28,7 @@
 CONFIG_MK := $(wildcard config.mk)
 
 MAKEFLAGS += --no-print-directory
-BASE_CFLAGS := -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -Ithird_party/miniz
+BASE_CFLAGS := -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -Ithird_party/miniz -Ithird_party/minimp3 -Ithird_party/cjson
 # roomstate.c + botroom.c + the flatcc runtime need these includes in EVERY config. They are added
 # straight to the compile recipes (not just CFLAGS) so a bundle/cross script that passes its own
 # CFLAGS= on the make command line — which would defeat a plain `CFLAGS +=` — still gets them.
@@ -41,7 +41,7 @@ ifeq ($(UNAME_S),Darwin)
   HOST_PLATLIBS := -framework CoreGraphics -framework CoreFoundation
 else
   HOST_INJECT   := src/inject_linux.c
-  HOST_PLATLIBS := -lpthread -lm
+  HOST_PLATLIBS := -lpthread -lm -ldl   # -ldl: plugin.c dlopen()s loadable plugins
 endif
 HOST_OSSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
 HOST_OSSL_LIBS   := $(shell pkg-config --libs openssl 2>/dev/null)
@@ -60,11 +60,12 @@ HOST_ONNX_DEF  :=
 HOST_ONNX_LIBS :=
 ifneq ($(strip $(ONNX_PREFIX)),)
   HOST_ONNX_DEF  := -DBSDR_HAVE_ONNX=1 -I$(ONNX_PREFIX)/include
-  # rpath must be ABSOLUTE (a relative rpath resolves against the process cwd, so the agent only
-  # finds libonnxruntime.so.1 when launched from the build dir). Also add $ORIGIN/../lib so an
-  # installed tree (bin/ + lib/) is relocatable and finds the copy that `make install` drops in libdir.
+  # rpath ORDER matters (the loader takes the first that resolves). $ORIGIN/../lib comes FIRST so an
+  # INSTALLED agent (bin/ + lib/) uses the copy `make install` drops in libdir, NOT the source tree. The
+  # ABSOLUTE build-dir lib comes LAST as the fallback for running straight from build/ (where $ORIGIN
+  # resolves to build/, and build/../lib doesn't exist).
   HOST_ONNX_LIBS := -L$(ONNX_PREFIX)/lib -lonnxruntime \
-                    -Wl,-rpath,$(abspath $(ONNX_PREFIX)/lib) -Wl,-rpath,'$$ORIGIN/../lib'
+                    -Wl,-rpath,'$$ORIGIN/../lib' -Wl,-rpath,$(abspath $(ONNX_PREFIX)/lib)
   # lib dir `make install` copies into libdir (a bundled ORT ships next to the agent). config.mk
   # overrides this for a ./configure build (empty there for a system ORT — nothing to copy).
   ONNX_LIB_INSTALL ?= $(abspath $(ONNX_PREFIX)/lib)
@@ -79,9 +80,9 @@ ONNX_LIB_INSTALL ?=
 # emits $(sort $(MEDIA_SRC_ALL)) and scripts/build-linux-bundle.sh asserts its
 # hardcoded MEDIA_SRC against it.
 MEDIA_SRC_SCTP  := src/sctp.c
-# NB: threed.c is in CORE_SRC, not here — agent.c's main() calls bsdr_threed_mode_parse
-# unconditionally, so it must link in core-only builds too (the SBS transform it also
-# provides is only *applied* on the BSDR_HAVE_CAPTURE path).
+# NB: threed_mode.c (the mode/tier <-> string glue) is in CORE_SRC, not here — agent.c's
+# main() calls bsdr_threed_mode_parse unconditionally, so it must link in core-only builds
+# too. The 2D->3D synthesis engine (threed.c + depth_onnx.c) moved to the 2d-3d plugin.
 MEDIA_SRC_VIDEO := src/srtp_util.c src/video.c src/capture.c src/filesrc.c src/fileaudio.c src/capture_pipewire.c src/term.c
 MEDIA_SRC_AUDIO := src/audio.c src/micsniff.c src/micsniff_capture.c
 MEDIA_SRC_ALL   := $(MEDIA_SRC_SCTP) $(MEDIA_SRC_VIDEO) $(MEDIA_SRC_AUDIO)
@@ -208,15 +209,18 @@ OSX_AR     ?= $(OSX_TARGET)-ar
 CORE_SRC := src/log.c src/net.c src/json.c src/input_decode.c \
             src/discovery.c src/control.c src/udp_transport.c \
             src/dtls.c src/cloud.c src/cloud_stream.c src/app.c src/webui.c \
-            src/overlay.c src/httpc.c src/tls.c src/stt.c src/llm.c \
-            src/compcontrol.c src/voice.c src/screenshot.c src/threed.c \
-            src/depth_onnx.c src/model_store.c src/webcam.c src/voicefx.c src/faceswap.c src/micsub.c src/deps.c src/screenblank.c \
-            src/roomstate.c src/botroom.c src/botaudio.c src/voicestore.c src/voiceai.c \
+            src/overlay.c src/httpc.c src/tls.c src/stt.c src/llm.c src/tts.c \
+            src/compcontrol.c src/voice.c src/screenshot.c src/threed_mode.c \
+            src/model_store.c src/webcam.c src/micsub.c src/deps.c src/screenblank.c \
+            src/roomstate.c src/botroom.c src/botaudio.c src/botmic.c src/voicestore.c \
+            src/acl.c src/roster.c src/roomcmd.c src/botprompt.c src/llmctx.c src/updatecheck.c src/browserctl.c \
+            src/plugin.c src/plugstore.c src/toolregistry.c src/botsense.c src/mediafx.c \
             $(INJECT_SRC) $(WINLIST_SRC) $(SCTP_SRC) $(MEDIA_SRC)
 # miniz (vendored, third_party) backs model_store.c's zip import; built in every config.
 # flatcc runtime (vendored) backs roomstate.c's FlatBuffers avatar/room-state codec (bot Plane-2).
 # Map both .c and .m (macOS AVFoundation shims) sources to objects.
 CORE_OBJ := $(patsubst src/%.m,$(BUILD)/%.o,$(patsubst src/%.c,$(BUILD)/%.o,$(CORE_SRC))) $(BUILD)/miniz.o \
+            $(BUILD)/minimp3.o $(BUILD)/cJSON.o \
             $(BUILD)/flatcc_builder.o $(BUILD)/flatcc_emitter.o $(BUILD)/flatcc_refmap.o
 
 # Wayland privacy screen-blank: configure sets WAYLAND_GAMMA=1 (libwayland-client + wayland-scanner
@@ -256,7 +260,11 @@ endif
 endif
 TESTS := $(BUILD)/test_input_decode$(EXEEXT) $(BUILD)/test_protocol$(EXEEXT) \
          $(BUILD)/test_transport$(EXEEXT) $(BUILD)/test_overlay$(EXEEXT) \
-         $(BUILD)/test_compcontrol$(EXEEXT) $(BUILD)/test_voice$(EXEEXT)
+         $(BUILD)/test_compcontrol$(EXEEXT) $(BUILD)/test_voice$(EXEEXT) \
+         $(BUILD)/test_acl$(EXEEXT) $(BUILD)/test_roster$(EXEEXT) $(BUILD)/test_audio_policy$(EXEEXT) \
+         $(BUILD)/test_tools$(EXEEXT) $(BUILD)/test_moderation$(EXEEXT) \
+         $(BUILD)/test_botprompt$(EXEEXT) $(BUILD)/test_llmctx$(EXEEXT) \
+         $(BUILD)/test_updatecheck$(EXEEXT) $(BUILD)/test_toolregistry$(EXEEXT) $(BUILD)/test_botsense$(EXEEXT) $(BUILD)/test_mediafx$(EXEEXT)
 ifneq ($(strip $(SCTP_SRC)),)
   TESTS += $(BUILD)/test_datachannel$(EXEEXT)
 endif
@@ -269,7 +277,7 @@ else
   ALL_TESTS :=
 endif
 
-.PHONY: native all require-full-media linux windows windows-media osx osxcross check install uninstall clean distclean print-media-src
+.PHONY: native all plugins require-full-media linux windows windows-media osx osxcross check install install_plugins uninstall clean distclean print-media-src
 
 # Default target: build from config.mk. `make` does NOT run ./configure — configure is the separate,
 # required readiness gate (run it first, and again after 'make distclean' or when deps/linking change).
@@ -284,7 +292,7 @@ native:
 	  exit 1; }
 	+$(MAKE) all
 
-all: require-full-media $(AGENT) $(TOOLS) $(ALL_TESTS)
+all: require-full-media $(AGENT) plugins $(TOOLS) $(ALL_TESTS)
 	@echo "bsdrX built -> $(BUILD)/  (CC=$(CC))"
 
 # Full-feature guard: bsdrX is a remote-desktop agent, so desktop capture is
@@ -312,13 +320,19 @@ print-media-src:
 $(BUILD):
 	mkdir -p $(BUILD)
 
+# -MMD -MP emits a per-object .d file listing the headers it included, pulled in via -include below;
+# so editing a shared header (e.g. a struct in include/bsdr/app.h) recompiles every dependent object
+# instead of leaving stale ones with the old layout (an ABI mismatch that silently corrupts reads).
 $(BUILD)/%.o: src/%.c $(CONFIG_MK) | $(BUILD)
-	$(CC) $(CFLAGS) $(FLATCC_INC) -c $< -o $@
+	$(CC) $(CFLAGS) $(FLATCC_INC) -MMD -MP -c $< -o $@
 
 # Obj-C (.m) units — macOS only (webcam_macos.m). clang selects the Obj-C frontend by extension;
 # the AVFoundation/Foundation frameworks it needs are already in OSX_MEDIA_LIBS.
 $(BUILD)/%.o: src/%.m $(CONFIG_MK) | $(BUILD)
-	$(CC) $(CFLAGS) $(FLATCC_INC) -c $< -o $@
+	$(CC) $(CFLAGS) $(FLATCC_INC) -MMD -MP -c $< -o $@
+
+# Pull in the generated header-dependency files (present after the first build).
+-include $(wildcard $(BUILD)/*.d)
 
 # vendored miniz (third-party): compile warning-free (-w), no bsdr includes needed.
 # _LARGEFILE64_SOURCE makes glibc define __USE_LARGEFILE64, so miniz takes its
@@ -331,6 +345,14 @@ $(BUILD)/flatcc_%.o: third_party/flatcc/runtime/%.c | $(BUILD)
 $(BUILD)/miniz.o: third_party/miniz/miniz.c | $(BUILD)
 	$(CC) $(CFLAGS) -D_LARGEFILE64_SOURCE=1 -w -c $< -o $@
 
+$(BUILD)/minimp3.o: third_party/minimp3/minimp3.c | $(BUILD)
+	$(CC) $(CFLAGS) -w -c $< -o $@
+
+# cJSON (vendored, third_party, MIT — stock upstream): array-capable JSON parser for the room
+# roster + social notifications + the access-control store. Compile warning-free like the others.
+$(BUILD)/cJSON.o: third_party/cjson/cJSON.c | $(BUILD)
+	$(CC) $(CFLAGS) -w -c $< -o $@
+
 $(LIB): $(CORE_OBJ)
 	rm -f $@
 	$(AR) rcs $@ $^
@@ -338,13 +360,37 @@ $(LIB): $(CORE_OBJ)
 $(AGENT): src/agent.c $(LIB) $(WINRES) | $(BUILD)
 	$(CC) $(CFLAGS) $< -o $@ $(LIB) $(WINRES) $(LDFLAGS) $(LDLIBS)
 
+# ---- loadable plugins ------------------------------------------------------
+# Every plugins/<name>/ (each a self-contained set of .c files) builds into build/plugins/<name>.so,
+# which the agent dlopen()s at startup (see src/plugin.c). Plugins link nothing from the host — they
+# call back only through the bsdr_plugin_host vtable — so no $(LDLIBS) here. Absent on a fresh github
+# snapshot (scripts/publish-github.sh strips the private plugins/ tree), where this is simply a no-op.
+# Match only sub-DIRECTORIES (trailing-slash wildcard), so loose files like plugins/PLUGIN-AUTHORING.md
+# aren't mistaken for plugins.
+PLUGIN_DIRS := $(patsubst %/,%,$(wildcard plugins/*/))
+PLUGIN_SOS  := $(patsubst plugins/%,$(BUILD)/plugins/%.so,$(PLUGIN_DIRS))
+
+$(BUILD)/plugins:
+	mkdir -p $@
+
+define PLUGIN_RULE
+$(BUILD)/plugins/$(notdir $(1)).so: $(wildcard $(1)/*.c) $(wildcard $(1)/*.h) $(wildcard $(1)/build.conf) include/bsdr/plugin.h | $(BUILD)/plugins
+	cf=""; lb=""; if [ -f "$(1)/build.conf" ]; then ONNX_PREFIX='$(ONNX_PREFIX)'; PLUGIN_CC='$(CC)'; . "$(1)/build.conf"; cf="$$$$PLUGIN_BUILD_CFLAGS"; lb="$$$$PLUGIN_BUILD_LIBS"; fi; \
+	$$(CC) $$(CFLAGS) $$$$cf -fPIC -shared $(wildcard $(1)/*.c) $$$$lb -o $$@
+endef
+$(foreach d,$(PLUGIN_DIRS),$(eval $(call PLUGIN_RULE,$(d))))
+
+.PHONY: plugins
+plugins: $(PLUGIN_SOS)
+	@[ -z "$(strip $(PLUGIN_SOS))" ] || echo "plugins built -> $(BUILD)/plugins/  ($(words $(PLUGIN_SOS)))"
+
 # Windows resource (icon + version info); WINRES is set only by the win targets.
 $(BUILD)/bsdrx_res.o: assets/bsdrx.rc assets/bsdrx.ico | $(BUILD)
 	$(WINDRES) $< -O coff -o $@
 $(BUILD)/%$(EXEEXT): tools/%.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $< -o $@ $(LIB) $(LDFLAGS) $(LDLIBS)
 $(BUILD)/%$(EXEEXT): tests/%.c $(LIB) | $(BUILD)
-	$(CC) $(CFLAGS) $< -o $@ $(LIB) $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -MMD -MP $< -o $@ $(LIB) $(LDFLAGS) $(LDLIBS)
 
 # Router-side owner-mic relay: minimal deps (libpcap only) so it cross-compiles for OpenWRT etc.
 # This specific rule overrides the generic tools pattern above so it does NOT link the core lib.
@@ -392,10 +438,11 @@ WIN_MEDIA_LIBS := -lavdevice -lavfilter -lavformat -lavcodec -lswscale -lswresam
 windows-media:
 	@test -n "$(WIN_DEPS)" || { \
 	  echo "usage: make windows-media WIN_DEPS=/path/to/win-deps  (run scripts/build-win-deps.sh first)"; exit 1; }
-	$(MAKE) all BUILD=build-windows-media EXEEXT=.exe WAYLAND_GAMMA= \
+	$(MAKE) all BUILD=build-windows-media EXEEXT=.exe WAYLAND_GAMMA= BUILD_TESTS=no \
 	  CC=$(WIN_HOST)-gcc AR=$(WIN_HOST)-ar INJECT_SRC=src/inject_win.c \
 	  WINRES=build-windows-media/bsdrx_res.o WINDRES=$(WIN_HOST)-windres \
 	  SCTP_SRC= WINLIST_SRC=src/winlist_win.c MEDIA_SRC="$(WIN_MEDIA_SRC)" \
+	  ONNX_PREFIX="$(if $(wildcard $(WIN_DEPS)/include/onnxruntime_c_api.h),$(WIN_DEPS),)" \
 	  CFLAGS="$(BASE_CFLAGS) -I$(WIN_DEPS)/include $(WIN_MEDIA_DEF) $(WIN_ONNX_DEF)" \
 	  LDFLAGS="-static-libgcc -L$(WIN_DEPS)/lib" \
 	  LDLIBS="-L$(WIN_DEPS)/lib $(WIN_MEDIA_LIBS) $(WIN_ONNX_LIBS)"
@@ -423,6 +470,7 @@ osxcross:
 	$(MAKE) all BUILD=$(OSX_BUILD) EXEEXT= WAYLAND_GAMMA= \
 	  MEDIA_SRC="$(OSX_MEDIA_SRC)" SCTP_SRC=src/sctp.c WINLIST_SRC=src/winlist_macos.c \
 	  CC=$(OSX_HOST)-clang AR="$(OSX_AR)" INJECT_SRC=src/inject_macos.c \
+	  ONNX_PREFIX="$(if $(wildcard $(OSX_DEPS)/include/onnxruntime_c_api.h),$(OSX_DEPS),)" \
 	  CFLAGS="$(BASE_CFLAGS) $(OSX_MEDIA_DEF) $(OSX_ONNX_DEF) -I$(OSX_DEPS)/include" \
 	  LDLIBS="-L$(OSX_DEPS)/lib $(OSX_MEDIA_LIBS) $(OSX_ONNX_LIBS) -lssl -lcrypto -framework CoreGraphics -framework CoreFoundation"
 
@@ -450,6 +498,17 @@ install: all
 	cp -p include/bsdr/*.h "$(DESTDIR)$(includedir)/bsdr/"
 	cp -p docs/bsdr_agent.1 docs/bsdr_micrelay.1 "$(DESTDIR)$(mandir)/man1/"
 	@echo "installed to $(DESTDIR)$(prefix)"
+	@echo "plugins NOT installed — run 'make install_plugins' to install the loadable plugins"
+
+# Loadable plugins are installed SEPARATELY from the core agent (a plugin is optional and often sold
+# through the store), so `make install` never touches them. This target builds them and copies them to
+# libdir/bsdrX/plugins, where the agent's $ORIGIN/../lib search path finds them after install (see
+# resolve_plugin_dir in src/plugin.c).
+install_plugins: plugins
+	@if [ -z "$(strip $(PLUGIN_SOS))" ]; then echo "no plugins built — nothing to install"; exit 0; fi
+	mkdir -p "$(DESTDIR)$(libdir)/bsdrX/plugins"
+	cp -p $(PLUGIN_SOS) "$(DESTDIR)$(libdir)/bsdrX/plugins/"
+	@echo "installed plugins to $(DESTDIR)$(libdir)/bsdrX/plugins"
 
 uninstall:
 	rm -f "$(DESTDIR)$(bindir)/bsdr_agent$(EXEEXT)" \
@@ -459,6 +518,7 @@ uninstall:
 	      "$(DESTDIR)$(mandir)/man1/bsdr_agent.1" \
 	      "$(DESTDIR)$(mandir)/man1/bsdr_micrelay.1"
 	rm -f "$(DESTDIR)$(libdir)"/libonnxruntime.so* "$(DESTDIR)$(libdir)/libonnxruntime_providers_shared.so"
+	rm -rf "$(DESTDIR)$(libdir)/bsdrX/plugins"
 	rm -rf "$(DESTDIR)$(includedir)/bsdr"
 
 clean:

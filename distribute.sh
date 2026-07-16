@@ -12,6 +12,12 @@
 #   SKIP=osx ./distribute.sh        # build all except osx
 #   ./distribute.sh --no-cache osx  # force a from-scratch rebuild of the docker image(s)
 #   ./distribute.sh --debug android # build the Android APK as debug (default is release)
+#   ./distribute.sh --push-plugins  # after building, upload the packaged plugin zips to the store
+#                                   # (opt-in; needs PLUGSTORE_URL/PLUGSTORE_TOKEN or .plugstore.env)
+#   ./distribute.sh plugins         # build ONLY the loadable plugins for THIS (native) platform
+#   ./distribute.sh --plugin legacy-mic   # build only that one plugin (implies plugins-only)
+#   ./distribute.sh plugins --push-plugins        # build native plugins and upload them
+#   ./distribute.sh --plugin legacy-mic --push-plugins   # build+upload a single plugin
 #
 # Key env overrides:
 #   WIN_DEPS   mingw dep prefix (default: ../win-deps or ./win-deps if present)
@@ -64,16 +70,26 @@ vmv(){ [ -f "$DIST/$1" ] && mv -f "$DIST/$1" "$DIST/$2" && ok "packaged $2"; }
 # Extract --no-cache (leaving the positional platform args intact). Also honored
 # via NO_CACHE=1 in the environment.
 NO_CACHE="${NO_CACHE:-0}"
+PUSH_PLUGINS=0
+PLUGINS_ONLY=0            # build only the loadable plugins (native platform), skip the app bundles
+PLUGIN_ONLY=""           # restrict to a single plugin (implies PLUGINS_ONLY)
 ARGS=()
+PENDING=""
 for a in "$@"; do
+  if [ -n "$PENDING" ]; then printf -v "$PENDING" '%s' "$a"; PENDING=""; PLUGINS_ONLY=1; continue; fi
   case "$a" in
     --no-cache) NO_CACHE=1 ;;
     --debug)    ANDROID_VARIANT=debug ;;
     --release)  ANDROID_VARIANT=release ;;
+    --push-plugins) PUSH_PLUGINS=1 ;;
+    --plugins-only|plugins) PLUGINS_ONLY=1 ;;
+    --plugin)   PENDING=PLUGIN_ONLY ;;       # next arg is the plugin name
+    --plugin=*) PLUGIN_ONLY="${a#*=}"; PLUGINS_ONLY=1 ;;
     *) ARGS+=("$a") ;;
   esac
 done
 set -- ${ARGS[@]+"${ARGS[@]}"}
+export PLUGIN_ONLY
 # docker build flag + a message tag; when set we also FORCE a rebuild of an
 # already-tagged image (below) so --no-cache actually takes effect.
 NC=""; [ "$NO_CACHE" = 1 ] && NC="--no-cache"
@@ -82,14 +98,19 @@ NC=""; [ "$NO_CACHE" = 1 ] && NC="--no-cache"
 ALL=(linux windows osx android relay)
 SEL=("$@"); [ ${#SEL[@]} -gt 0 ] || SEL=("${ALL[@]}")
 declare -A WANT
-for p in "${SEL[@]}"; do WANT["$p"]=1; done
-IFS=',' read -ra SKIPS <<< "${SKIP:-}"; for s in "${SKIPS[@]}"; do unset 'WANT[$s]'; done
-# count phases: clean + each wanted platform
+# In plugins-only mode no app bundle is built (just the native loadable plugins).
+if [ "$PLUGINS_ONLY" = 1 ]; then WANT=(); else
+  for p in "${SEL[@]}"; do WANT["$p"]=1; done
+  IFS=',' read -ra SKIPS <<< "${SKIP:-}"; for s in "${SKIPS[@]}"; do unset 'WANT[$s]'; done
+fi
+# count phases: clean + each wanted platform (+ native plugins + push)
 [ "${NO_CLEAN:-0}" = 1 ] || TOTAL=$((TOTAL+1))
 for p in "${ALL[@]}"; do [ -n "${WANT[$p]:-}" ] && TOTAL=$((TOTAL+1)); done
+[ "$PLUGINS_ONLY" = 1 ] && TOTAL=$((TOTAL+1))
+[ "$PUSH_PLUGINS" = 1 ] && TOTAL=$((TOTAL+1))
 
 log "${B}bsdrX distribute${Z}  version=${C}$VERSION${Z}"
-log "  targets : ${!WANT[*]}"
+if [ "$PLUGINS_ONLY" = 1 ]; then log "  targets : plugins${PLUGIN_ONLY:+ ($PLUGIN_ONLY)}"; else log "  targets : ${!WANT[*]}"; fi
 log "  dist    : $DIST"
 
 # ---- 0. clean ----------------------------------------------------------------
@@ -289,7 +310,62 @@ build_android(){
   if ( cd "$ROOT/android" && ANDROID_HOME="$ANDROID_HOME" ANDROID_SDK_ROOT="$ANDROID_HOME" PATH="$JAVA_HOME/bin:$PATH" ./gradlew --no-daemon "$task" ); then
     if [ -f "$apk" ]; then cp -f "$apk" "$DIST/bsdrX-android-$VERSION.apk"; ok "packaged bsdrX-android-$VERSION.apk"; record android OK "$(secs $((SECONDS-t0)))";
     else err "APK not produced at $apk"; record android FAIL "no apk"; fi
+    android_plugins   # loadable plugins per ABI (NOT inside the APK) — one .so zip per plugin per ABI
   else err "gradle $task failed"; record android FAIL "gradle"; fi
+}
+
+# Build each loadable plugin for the Android ABIs the app ships (from app/build.gradle abiFilters),
+# with the NDK's clang, and package each on its own — one zip per plugin per ABI. The APK itself
+# bundles NO plugin (plugin.c is compiled into the JNI lib; there is no standalone .so in the APK).
+android_plugins(){
+  local pdirs=("$ROOT"/plugins/*/); [ -e "${pdirs[0]}" ] || return 0
+  # NDK: prefer the version pinned in build.gradle, else the highest installed.
+  local ndkver ndk
+  ndkver="$(sed -n "s/.*ndkVersion[[:space:]]*'\([^']*\)'.*/\1/p" "$ROOT/android/app/build.gradle" | head -1)"
+  ndk="$ANDROID_HOME/ndk/$ndkver"
+  [ -d "$ndk" ] || ndk="$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)"
+  local clang="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+  if [ ! -x "$clang" ]; then warn "NDK clang not found ($clang) — skipping Android plugin builds"; return 0; fi
+  local api; api="$(sed -n 's/.*minSdk[[:space:]]*\([0-9]\+\).*/\1/p' "$ROOT/android/app/build.gradle" | head -1)"; api="${api:-29}"
+  # ABIs the APK ships (abiFilters); default to arm64-v8a.
+  local abis; abis="$(sed -n "s/.*abiFilters[[:space:]]*//p" "$ROOT/android/app/build.gradle" | grep -oE "'[a-z0-9-]+'" | tr -d "'" | tr '\n' ' ')"
+  [ -n "$abis" ] || abis="arm64-v8a"
+  local abi triple
+  for abi in $abis; do
+    case "$abi" in
+      arm64-v8a)   triple="aarch64-linux-android$api" ;;
+      armeabi-v7a) triple="armv7a-linux-androideabi$api" ;;
+      x86_64)      triple="x86_64-linux-android$api" ;;
+      x86)         triple="i686-linux-android$api" ;;
+      *)           warn "unknown ABI $abi — skipped"; continue ;;
+    esac
+    log "  building Android plugins for $abi ($triple)…"
+    # Media plugins (build.conf) link ONNX — point ONNX_PREFIX at the per-ABI Android deps so they link
+    # the Android libonnxruntime.so (resolved from the APK's jniLibs at runtime), not the host's linux-x64.
+    SRC="$ROOT" OUT="$DIST" VERSION="$VERSION" PLATFORM=android ARCH="$abi" \
+      ONNX_PREFIX="$ROOT/android/deps/$abi" \
+      PLUGIN_CC="$clang" PLUGIN_CFLAGS="--target=$triple" PLUGIN_EXT=.so \
+      bash "$ROOT/scripts/build-plugins.sh" || warn "Android plugin packaging failed for $abi (non-fatal)"
+  done
+}
+
+# =============================================================================
+# Plugins (native) : build the loadable plugins for THIS machine only, no app bundle.
+# =============================================================================
+build_plugins_native(){
+  local plat arch mach
+  case "$(uname -s)" in Darwin) plat=macos;; *) plat=linux;; esac
+  mach="$(uname -m)"; case "$mach" in x86_64|amd64) arch=x86_64;; aarch64|arm64) arch=aarch64;; *) arch="$mach";; esac
+  banner "Plugins (native $plat/$arch)  ->  dist/bsdrX-plugin-*.zip"
+  local t0=$SECONDS
+  if [ ! -d "$ROOT/plugins" ]; then err "no plugins/ tree present"; record plugins SKIP "no plugins"; return; fi
+  [ -n "$PLUGIN_ONLY" ] && log "  single plugin: ${C}$PLUGIN_ONLY${Z}"
+  # Native toolchain (cc); build-plugins.sh packages one zip per plugin into dist/. Upload happens in
+  # the separate --push-plugins phase (host-side push-plugins.sh, which also honours PLUGIN_ONLY).
+  if SRC="$ROOT" OUT="$DIST" VERSION="$VERSION" PLATFORM="$plat" ARCH="$arch" \
+     PLUGIN_CC="${CC:-cc}" PLUGIN_EXT=.so bash "$ROOT/scripts/build-plugins.sh"; then
+    record plugins OK "$(secs $((SECONDS-t0)))"
+  else err "build-plugins.sh failed"; record plugins FAIL "plugins"; fi
 }
 
 # =============================================================================
@@ -305,6 +381,11 @@ build_relay(){
     record relay OK "$(secs $((SECONDS-t0)))"
   else err "build-micrelay.sh failed"; record relay FAIL "relay script"; fi
 }
+
+# NB: loadable plugins are NOT a standalone target — each is built with its own platform's toolchain
+# INSIDE that platform's step (build_linux/windows/osx via scripts/build-plugins.sh; build_android via
+# android_plugins) and packaged one zip per plugin per platform: bsdrX-plugin-<name>-<platform>-<arch>-
+# <version>.zip. So a plugin ships for exactly the platforms you actually build, never inside the app.
 
 # ---- depth model zips (opt-in: heavy ~2GB download; NOT in the default set) ---
 # Produces dist/bsdrX-model-{cpu,gpu,hi}.zip + bsdrX-models.zip that users import via the web UI
@@ -325,6 +406,17 @@ build_models(){
 [ -n "${WANT[android]:-}" ] && build_android
 [ -n "${WANT[relay]:-}"   ] && build_relay
 [ -n "${WANT[models]:-}"  ] && build_models
+# plugins-only mode: build just the native loadable plugins (no app bundle)
+[ "$PLUGINS_ONLY" = 1 ]     && build_plugins_native
+
+# ---- optional: push packaged plugins to the store (--push-plugins) -----------
+# Host-side, after the (possibly containerised) builds have dropped their plugin zips into dist/.
+if [ "$PUSH_PLUGINS" = 1 ]; then
+  banner "Push plugins  ->  bsdrX plugin store"
+  if OUT="$DIST" SRC="$ROOT" VERSION="$VERSION" bash "$ROOT/scripts/push-plugins.sh"; then
+    record plugins OK "pushed"
+  else err "push-plugins.sh failed"; record plugins FAIL "upload"; fi
+fi
 
 # ---- summary -----------------------------------------------------------------
 printf '\n%s========================================================================%s\n' "$C" "$Z"
@@ -342,5 +434,9 @@ done
 printf '\n%sArtifacts in %s:%s\n' "$B" "$DIST" "$Z"
 for f in "bsdrX-$VERSION.zip" "bsdrX-win-$VERSION.zip" "bsdrX-osx-$VERSION.zip" "bsdrX-android-$VERSION.apk" "bsdrX-$VERSION-x86_64.AppImage" bsdr-agent_"${VERSION#v}"_amd64.deb bsdrX_relay.zip; do
   [ -f "$DIST/$f" ] && printf '  %-28s %s\n' "$f" "$(du -h "$DIST/$f" | cut -f1)"
+done
+# per-plugin packages (one each; names are dynamic)
+for f in "$DIST"/bsdrX-plugin-*-"$VERSION".zip; do
+  [ -f "$f" ] && printf '  %-28s %s\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)"
 done
 exit $fail

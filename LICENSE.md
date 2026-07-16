@@ -11,6 +11,16 @@ This program is distributed in the hope that it will be useful, but WITHOUT
 ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
 FOR A PARTICULAR PURPOSE. See the full license text below.
 
+## Additional permission: bsdrX Plugin Exception
+
+As an **additional permission under section 7 of the GPLv3**, a separate
+plugin that is loaded by bsdrX at run time and interacts with it **only**
+through the public Plugin API (declared in `include/bsdr/plugin.h`) may be
+distributed under license terms of your choice — including proprietary terms
+— without becoming subject to the GPL. bsdrX itself, and any plugin that uses
+more of bsdrX than that header, remain under the GPLv3. The full terms are in
+[COPYING.PLUGIN-EXCEPTION](COPYING.PLUGIN-EXCEPTION).
+
 ```
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007

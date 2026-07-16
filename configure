@@ -96,10 +96,10 @@ case "$target" in
         PLAT_LIBS="-framework CoreGraphics -framework CoreFoundation -lm" ;;
     linux)
         INJECT_SRC=src/inject_linux.c
-        PLAT_LIBS="-lpthread -lm" ;;
+        PLAT_LIBS="-lpthread -lm -ldl" ;;   # -ldl: src/plugin.c dlopen()s loadable plugins
     *)
         INJECT_SRC=src/inject_null.c
-        PLAT_LIBS="-lpthread -lm" ;;
+        PLAT_LIBS="-lpthread -lm -ldl" ;;
 esac
 
 # --- static linking (Linux) ------------------------------------------------
@@ -385,7 +385,9 @@ if [ -n "$onnx_prefix" ] && [ -f "$onnx_prefix/include/onnxruntime_c_api.h" ]; t
     # keep the shell from expanding $ORIGIN at link time.)
     onnx_abs=$(cd "$onnx_prefix/lib" 2>/dev/null && pwd)
     [ -n "$onnx_abs" ] || onnx_abs="$onnx_prefix/lib"
-    ONNX_LIBS="-L$onnx_prefix/lib -lonnxruntime -Wl,-rpath,$onnx_abs -Wl,-rpath,'\$\$ORIGIN/../lib'"
+    # rpath ORDER matters — $ORIGIN/../lib FIRST so an installed tree uses the copy `make install` drops in
+    # libdir, the absolute build-dir lib LAST as the run-from-build fallback (see the Makefile HOST_ONNX_LIBS).
+    ONNX_LIBS="-L$onnx_prefix/lib -lonnxruntime -Wl,-rpath,'\$\$ORIGIN/../lib' -Wl,-rpath,$onnx_abs"
     ONNX_LIB_INSTALL="$onnx_abs"
     echo "configure: in-process depth + face swap = ONNX Runtime at $onnx_prefix (rpath $onnx_abs + \$ORIGIN/../lib)"
 elif [ -n "$onnx_system" ]; then
@@ -406,7 +408,7 @@ else
 fi
 
 # Final flag strings (used both for the smoke test below and the emitted config.mk).
-CFLAGS_OUT="-std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -Ithird_party/miniz $OSSL_CFLAGS $SCTP_DEF $MEDIA_DEF $MEDIA_CFLAGS $ONNX_DEF $CFLAGS"
+CFLAGS_OUT="-std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -Ithird_party/miniz -Ithird_party/minimp3 -Ithird_party/cjson $OSSL_CFLAGS $SCTP_DEF $MEDIA_DEF $MEDIA_CFLAGS $ONNX_DEF $CFLAGS"
 LDFLAGS_OUT="$LDFLAGS_EXTRA $LDFLAGS"
 LDLIBS_OUT="$OSSL_LIBS $PLAT_LIBS $SCTP_LIBS $MEDIA_LIBS $ONNX_LIBS"
 
@@ -463,6 +465,11 @@ CFLAGS  = $CFLAGS_OUT
 LDFLAGS = $LDFLAGS_OUT
 LDLIBS  = $LDLIBS_OUT
 ONNX_LIB_INSTALL = $ONNX_LIB_INSTALL
+# The ONNX prefix the CORE linked against, handed to the loadable plugins (voice-changer bundles the RVC
+# engine) so they build with the SAME ONNX as configure chose — otherwise the core would have ONNX and
+# the plugin would silently stub out. Empty for a system ORT: the plugin's build.conf falls back to
+# pkg-config in that case.
+ONNX_PREFIX = $onnx_prefix
 EOF
 
 if [ -f config.mk ] && cmp -s config.mk.new config.mk; then

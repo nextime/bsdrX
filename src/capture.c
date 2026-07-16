@@ -18,8 +18,7 @@
 #include "bsdr/capture.h"
 #include "bsdr/protocol.h"
 #include "bsdr/overlay.h"
-#include "bsdr/threed.h"
-#include "bsdr/faceswap.h"
+#include "bsdr/mediafx.h"
 #include "bsdr/platform.h"
 #include "bsdr/log.h"
 #include "bsdr/capture_pipewire.h"   /* Wayland desktop capture (portal + PipeWire); Linux only */
@@ -40,6 +39,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <unistd.h>          /* access() — VAAPI render-node auto-detect */
+#endif
 
 #if defined(__APPLE__)
 #include <CoreGraphics/CoreGraphics.h>
@@ -100,9 +102,11 @@ struct bsdr_capture {
      * crop_w == 0 means no crop (the full frame is scaled). */
     int crop_x, crop_y, crop_w, crop_h;
     int64_t frame_index;
+    volatile int force_key;    /* set by bsdr_capture_force_keyframe: next encoded frame is an IDR */
     const char *enc_name;
     struct bsdr_overlay *overlay;
-    struct bsdr_threed *threed;    /* 2D->3D SBS synthesis (NULL = off); applied on the NV12 frame */
+    int use_vsrc;                  /* the 2d-3d plugin owns the 2D->3D transform (via mediafx video-src);
+                                    * c->src holds the 2D frame, c->yuv the SBS output */
     /* GPU path: x11grab(CPU) -> hwupload_cuda -> scale_cuda(NV12) -> nvenc(CUDA frames). Moves the
      * BGRA->NV12 convert + resize off the CPU. use_gpu=0 => the CPU sws_scale path above. */
     int use_gpu;
@@ -119,10 +123,6 @@ struct bsdr_capture {
                                      renegotiates to a smaller geometry than the encode pipeline (else NULL) */
     size_t   pw_fallback_cap;
     /* ---- file-source playback (cfg.input_file) ---- */
-    /* realtime face swap (borrowed engine, CPU path): NV12 <-> RGB24 scratch + scalers */
-    struct bsdr_faceswap *faceswap;
-    struct SwsContext *fs_to_rgb, *fs_from_rgb;
-    uint8_t *fs_rgb;
     int is_file;                /* decoding a file rather than grabbing the screen */
     int is_webcam;              /* capturing a camera (live, like screen; CPU scale path) */
     /* ---- raw in-process frame source (terminal PTY): frames pulled from a render callback ---- */
@@ -152,12 +152,21 @@ struct bsdr_capture {
     double seek_frac;
 };
 
-void bsdr_capture_set_overlay(bsdr_capture *c, struct bsdr_overlay *ov) {
-    c->overlay = ov;
+/* Force the next encoded frame to be a keyframe (IDR). Cheap + thread-safe (single flag); consumed by
+ * maybe_force_key just before the frame is handed to the encoder. Used to serve an on-demand keyframe
+ * to a newly-joined cloud consumer (which otherwise waits for the next scheduled GOP IDR). */
+void bsdr_capture_force_keyframe(bsdr_capture *c) { if (c) c->force_key = 1; }
+
+/* Apply a pending force-keyframe request to the frame about to be encoded, then clear it. Reused
+ * AVFrames keep their pict_type between calls, so we must reset to NONE when not forcing. */
+static void maybe_force_key(struct bsdr_capture *c, AVFrame *f) {
+    if (!f) return;
+    if (c->force_key) { f->pict_type = AV_PICTURE_TYPE_I; c->force_key = 0; }
+    else              { f->pict_type = AV_PICTURE_TYPE_NONE; }
 }
 
-void bsdr_capture_set_faceswap(bsdr_capture *c, struct bsdr_faceswap *fs) {
-    if (c) c->faceswap = fs;
+void bsdr_capture_set_overlay(bsdr_capture *c, struct bsdr_overlay *ov) {
+    c->overlay = ov;
 }
 
 int bsdr_capture_decode_image_rgb(const char *path, uint8_t **rgb, int *w, int *h) {
@@ -196,24 +205,28 @@ done:
     return rc;
 }
 
-/* Face swap on the pre-encode NV12 frame (CPU path): NV12 -> RGB24 -> swap in place -> NV12. Scalers
- * are built lazily at the frame size. A no-op until a source identity is set. */
-static void apply_faceswap(bsdr_capture *c, AVFrame *f) {
-    if (!c->faceswap || !bsdr_faceswap_ready(c->faceswap)) return;
-    int w = f->width, h = f->height;
-    if (!c->fs_rgb) {
-        c->fs_to_rgb   = sws_getContext(w,h,AV_PIX_FMT_NV12, w,h,AV_PIX_FMT_RGB24, SWS_BILINEAR,NULL,NULL,NULL);
-        c->fs_from_rgb = sws_getContext(w,h,AV_PIX_FMT_RGB24, w,h,AV_PIX_FMT_NV12, SWS_BILINEAR,NULL,NULL,NULL);
-        c->fs_rgb = malloc((size_t)w*h*3);
-        if (!c->fs_to_rgb || !c->fs_from_rgb || !c->fs_rgb) return;
+/* Run any plugin same-dimensions video-effect chain (face-swap plugin, etc.) over the NV12 encoder
+ * frame in place. No-op (cheap fast-path in mediafx) when no plugin is registered. Applied on the
+ * fully-composed, overlay-drawn frame. The face-swap engine itself is a plugin (see plugins/faceswap). */
+static void apply_video_fx(AVFrame *f) {
+    bsdr_mediafx_apply_video(f->data[0], f->linesize[0], f->data[1], f->linesize[1], f->width, f->height);
+}
+
+/* Run the active 2D->3D SBS transform — a plugin video-source (the 2d-3d plugin, via mediafx) — reading
+ * the 2D frame from c->src and writing the SBS output into c->yuv. No-op when no plugin is registered
+ * (c->use_vsrc is 0 and this isn't called). The synthesis engine itself is a plugin (see plugins/2d_3d). */
+static void apply_2d3d(bsdr_capture *c) {
+    if (c->use_vsrc) {
+        if (!bsdr_mediafx_apply_video_src(c->src->data[0], c->src->linesize[0],
+                                          c->src->data[1], c->src->linesize[1], c->src->width, c->src->height,
+                                          c->yuv->data[0], c->yuv->linesize[0],
+                                          c->yuv->data[1], c->yuv->linesize[1], c->yuv->width, c->yuv->height)) {
+            /* Plugin vanished mid-capture (cleared under lock while a pending recapture reopens to plain
+             * 2D); fill black so the encoder never sees uninitialized SBS pixels for those few frames. */
+            memset(c->yuv->data[0], 16,  (size_t)c->yuv->linesize[0] * c->yuv->height);
+            memset(c->yuv->data[1], 128, (size_t)c->yuv->linesize[1] * ((c->yuv->height + 1) / 2));
+        }
     }
-    uint8_t *rgb[1] = { c->fs_rgb }; int rs[1] = { w*3 };
-    sws_scale(c->fs_to_rgb, (const uint8_t *const *)f->data, f->linesize, 0, h, rgb, rs);
-    /* Only write the swapped pixels back if a face was actually swapped. On a desktop stream no face
-     * is present most of the time -> skip the RGB->NV12 back-convert entirely. As a bonus this also
-     * avoids the lossy NV12->RGB->NV12 round-trip on those frames (the original c->yuv is untouched). */
-    if (bsdr_faceswap_process_rgb(c->faceswap, c->fs_rgb, w, h) > 0)
-        sws_scale(c->fs_from_rgb, (const uint8_t *const *)rgb, rs, 0, h, f->data, f->linesize);
 }
 
 static int open_encoder(bsdr_capture *c, const bsdr_capture_config *cfg,
@@ -469,32 +482,73 @@ static int open_encoder_vaapi(bsdr_capture *c, const bsdr_capture_config *cfg,
                               int w, int h, AVBufferRef *hw_frames) {
     const AVCodec *codec = avcodec_find_encoder_by_name("h264_vaapi");
     if (!codec) return -1;
-    AVCodecContext *enc = avcodec_alloc_context3(codec);
-    if (!enc) return -1;
-    enc->width = w; enc->height = h;
-    enc->pix_fmt = AV_PIX_FMT_VAAPI;
-    enc->hw_frames_ctx = av_buffer_ref(hw_frames);
-    enc->time_base = (AVRational){ 1, cfg->fps };
-    enc->framerate = (AVRational){ cfg->fps, 1 };
-    enc->bit_rate = cfg->bitrate;
-    enc->gop_size = cfg->fps;
-    enc->max_b_frames = 0;
-    enc->profile = AV_PROFILE_H264_HIGH;
-    /* VBR with 2x headroom (was 1s CBR): CBR pads near-static desktop frames and a tight buffer caps
-     * the IDR, leaving keyframe text soft while the uncapped x264 path overshoots and stays sharp.
-     * VBR + rc_max_rate = 2x target lets VAAPI spend the same actual bits on complex frames (VBR also
-     * genuinely needs maxrate > bitrate). Mirrors the NVENC paths; --max-bitrate caps a thin uplink. */
-    enc->rc_max_rate = (int64_t)cfg->bitrate * 2;
-    enc->rc_buffer_size = (int64_t)cfg->bitrate * 2;
-    av_opt_set(enc->priv_data, "rc_mode", "VBR", 0);
-    av_opt_set_int(enc->priv_data, "low_power", 1, 0);   /* VCN low-latency path; ignored if unsupported */
-    if (avcodec_open2(enc, codec, NULL) != 0) {
-        av_opt_set_int(enc->priv_data, "low_power", 0, 0);
-        if (avcodec_open2(enc, codec, NULL) != 0) { avcodec_free_context(&enc); return -1; }
+    /* Try the low-power (LP) entrypoint first (Intel + newer AMD VCN), then the regular EncSlice
+     * entrypoint. AMD Picasso/Raven (VCN 1) has ONLY regular EncSlice — low_power=1 there fails with
+     * "No usable encoding entrypoint for VAProfileH264High". A failed avcodec_open2 also unrefs
+     * hw_frames_ctx ("A hardware frames reference is required" on any reused context), so re-create the
+     * context fresh AND re-ref hw_frames for each attempt rather than retrying in place. */
+    for (int lp = 1; lp >= 0; lp--) {
+        AVCodecContext *enc = avcodec_alloc_context3(codec);
+        if (!enc) return -1;
+        enc->width = w; enc->height = h;
+        enc->pix_fmt = AV_PIX_FMT_VAAPI;
+        enc->hw_frames_ctx = av_buffer_ref(hw_frames);
+        enc->time_base = (AVRational){ 1, cfg->fps };
+        enc->framerate = (AVRational){ cfg->fps, 1 };
+        enc->bit_rate = cfg->bitrate;
+        enc->gop_size = cfg->fps;
+        enc->max_b_frames = 0;
+        enc->profile = AV_PROFILE_H264_HIGH;
+        /* VBR with 2x headroom (was 1s CBR): CBR pads near-static desktop frames and a tight buffer caps
+         * the IDR, leaving keyframe text soft while the uncapped x264 path overshoots and stays sharp.
+         * VBR + rc_max_rate = 2x target lets VAAPI spend the same actual bits on complex frames (VBR also
+         * genuinely needs maxrate > bitrate). Mirrors the NVENC paths; --max-bitrate caps a thin uplink. */
+        enc->rc_max_rate = (int64_t)cfg->bitrate * 2;
+        enc->rc_buffer_size = (int64_t)cfg->bitrate * 2;
+        av_opt_set(enc->priv_data, "rc_mode", "VBR", 0);
+        av_opt_set_int(enc->priv_data, "low_power", lp, 0);   /* VCN LP path; absent on older AMD -> fall back */
+        if (avcodec_open2(enc, codec, NULL) == 0) {
+            c->enc = enc; c->enc_name = "h264_vaapi";
+            BSDR_INFO("bsdr.capture", "h264_vaapi opened (low_power=%d)", lp);
+            return 0;
+        }
+        avcodec_free_context(&enc);   /* dirty after a failed open — next attempt starts clean */
     }
-    c->enc = enc; c->enc_name = "h264_vaapi";
-    return 0;
+    return -1;
 }
+
+/* Auto-detect a VAAPI-capable render node and its correct libva driver, so a stray/wrong
+ * LIBVA_DRIVER_NAME (e.g. a leftover 'iHD' Intel value on an AMD/NVIDIA box) can't silently break
+ * hw encode. Scans /dev/dri/renderD128.. for a node whose KERNEL driver maps to an INSTALLED VA
+ * driver .so; skips nvidia (no VAAPI encode). On success writes the node path to out_node and returns
+ * the VA driver name (static string); NULL if none found. Linux-only. */
+#if !defined(_WIN32)
+static const char *vaapi_detect_node(char *out_node, size_t n) {
+    static const char *dri_dirs[] = { "/usr/lib/x86_64-linux-gnu/dri", "/usr/lib/dri",
+                                      "/usr/lib64/dri", "/usr/lib/aarch64-linux-gnu/dri" };
+    for (int idx = 128; idx <= 135; idx++) {
+        char node[32]; snprintf(node, sizeof node, "/dev/dri/renderD%d", idx);
+        if (access(node, R_OK | W_OK) != 0) continue;
+        char uev[80]; snprintf(uev, sizeof uev, "/sys/class/drm/renderD%d/device/uevent", idx);
+        FILE *f = fopen(uev, "r"); if (!f) continue;
+        char kdrv[32] = "", line[128];
+        while (fgets(line, sizeof line, f)) if (sscanf(line, "DRIVER=%31s", kdrv) == 1) break;
+        fclose(f);
+        /* kernel driver -> candidate VA driver names (first with an installed .so wins) */
+        const char *cands[2] = { NULL, NULL };
+        if      (!strcmp(kdrv, "amdgpu") || !strcmp(kdrv, "radeon")) { cands[0] = "radeonsi"; cands[1] = "r600"; }
+        else if (!strcmp(kdrv, "i915")   || !strcmp(kdrv, "xe"))     { cands[0] = "iHD";      cands[1] = "i965"; }
+        else if (!strcmp(kdrv, "nouveau"))                          { cands[0] = "nouveau"; }
+        else continue;   /* nvidia (proprietary) + unknowns: no VAAPI encode path */
+        for (int ci = 0; ci < 2 && cands[ci]; ci++)
+            for (size_t di = 0; di < sizeof dri_dirs / sizeof dri_dirs[0]; di++) {
+                char so[256]; snprintf(so, sizeof so, "%s/%s_drv_video.so", dri_dirs[di], cands[ci]);
+                if (access(so, R_OK) == 0) { snprintf(out_node, n, "%s", node); return cands[ci]; }
+            }
+    }
+    return NULL;
+}
+#endif
 
 /* Build a VAAPI pipeline on the iGPU and open h264_vaapi. Two inputs:
  *  - x11grab (bgr0 sw frames): buffer -> hwupload -> scale_vaapi(nv12) -> buffersink
@@ -503,12 +557,22 @@ static int open_encoder_vaapi(bsdr_capture *c, const bsdr_capture_config *cfg,
  * the radeonsi VA driver; default it if the user hasn't. Validated with a dummy frame -> CPU fallback
  * on any failure. */
 static int setup_vaapi(bsdr_capture *c, const bsdr_capture_config *cfg, int ow, int oh) {
+    const char *node = "/dev/dri/renderD128";
 #if !defined(_WIN32)
-    setenv("LIBVA_DRIVER_NAME", "radeonsi", 0);   /* AMD VCN; respects an existing value (Linux VAAPI only) */
+    char detn[32];
+    const char *vadrv = vaapi_detect_node(detn, sizeof detn);
+    if (vadrv) {
+        node = detn;
+        setenv("LIBVA_DRIVER_NAME", vadrv, 1);   /* FORCE: overrides a stray/wrong value (e.g. iHD on AMD) */
+        BSDR_INFO("bsdr.capture", "VAAPI: auto-detected %s -> driver '%s'", node, vadrv);
+    } else {
+        setenv("LIBVA_DRIVER_NAME", "radeonsi", 0);   /* fallback: AMD default, respect an existing value */
+        BSDR_WARN("bsdr.capture", "VAAPI: no VA-capable render node auto-detected; trying %s", node);
+    }
 #endif
     int hw_in = (c->dec->hw_frames_ctx != NULL) || (c->dec->pix_fmt == AV_PIX_FMT_DRM_PRIME);
-    if (av_hwdevice_ctx_create(&c->hw_device, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128", NULL, 0) < 0) {
-        BSDR_WARN("bsdr.capture", "VAAPI: no device on /dev/dri/renderD128 (install mesa-va-drivers?)");
+    if (av_hwdevice_ctx_create(&c->hw_device, AV_HWDEVICE_TYPE_VAAPI, node, NULL, 0) < 0) {
+        BSDR_WARN("bsdr.capture", "VAAPI: no device on %s (install mesa-va-drivers?)", node);
         return -1;
     }
     c->fg = avfilter_graph_alloc();
@@ -897,20 +961,21 @@ have_input_pw:;   /* PipeWire + raw-render paths join here: fmt/dec already set 
             c->eye_w = (ow / 2) & ~1; c->eye_h = oh & ~1;
         }
         enc_w = c->eye_w * 2; enc_h = c->eye_h;
-    } else if (cfg.threed_mode) {
-        bsdr_threed_config tc = { .mode = cfg.threed_mode, .deepness = cfg.threed_deepness,
-                                  .convergence = cfg.threed_convergence, .swap = cfg.threed_swap,
-                                  .tier = cfg.threed_tier };
-        snprintf(tc.ai_cmd, sizeof tc.ai_cmd, "%s", cfg.threed_ai_cmd);
-        c->threed = bsdr_threed_create(ow, oh, &tc);
-        if (c->threed) enc_w = bsdr_threed_out_width(c->threed);
+    } else if (cfg.threed_mode && bsdr_mediafx_video_src_dims(ow, oh, &enc_w, &enc_h)) {
+        /* A plugin owns the 2D->3D transform: it declared the SBS output size (enc_w x enc_h). The core
+         * sizes the encoder to it and routes each frame through the plugin (below), same buffer layout as
+         * the built-in threed (2D in c->src -> SBS in c->yuv). Forces the CPU scale path like threed. */
+        c->use_vsrc = 1;
+        enc_w &= ~1; enc_h &= ~1;
     }
+    /* When 3D is requested but no 2d-3d plugin claimed the dims (video_src_dims returned 0 above), the
+     * stream falls through to plain 2D — the synthesis engine is a plugin now (see plugins/2d_3d). */
 
     /* Encode pipeline, in preference order, each falling back to the next:
      *  --vaapi  -> iGPU VAAPI (frees the dGPU; the only path that pairs with --kmsgrab)
      *  default  -> CUDA/NVENC GPU (scale/convert off the CPU)
      *  --cpu / any failure / 3D -> CPU sws_scale + nvenc/x264 */
-    if (cfg.use_vaapi && !c->threed) {
+    if (cfg.use_vaapi && !c->use_vsrc) {
         if (setup_vaapi(c, &cfg, ow, oh) == 0) { c->use_gpu = 1; return c; }
         gpu_teardown(c);
         BSDR_WARN("bsdr.capture", "VAAPI pipeline unavailable -> CPU scale/convert");
@@ -924,7 +989,7 @@ have_input_pw:;   /* PipeWire + raw-render paths join here: fmt/dec already set 
             goto fail;
         }
 #endif
-    } else if (!cfg.cpu_only && !c->threed) {
+    } else if (!cfg.cpu_only && !c->use_vsrc) {
         if (setup_gpu(c, &cfg, ow, oh) == 0) { c->use_gpu = 1; return c; }
         gpu_teardown(c);
         BSDR_WARN("bsdr.capture", "CUDA pipeline unavailable -> CPU scale/convert");
@@ -949,7 +1014,7 @@ have_input_pw:;   /* PipeWire + raw-render paths join here: fmt/dec already set 
     if (!c->sws || !c->yuv) { BSDR_ERROR("bsdr.capture", "sws/frame alloc failed"); goto fail; }
     c->yuv->format = AV_PIX_FMT_NV12; c->yuv->width = enc_w; c->yuv->height = enc_h;
     if (av_frame_get_buffer(c->yuv, 32) < 0) { BSDR_ERROR("bsdr.capture", "yuv buffer alloc failed"); goto fail; }
-    if (c->threed) {
+    if (c->use_vsrc) {
         /* the desktop is scaled into c->src (ow x oh); the SBS transform writes c->yuv (enc_w) */
         c->src = av_frame_alloc();
         if (!c->src) goto fail;
@@ -991,18 +1056,15 @@ static void cap_pace(bsdr_capture *c, int64_t pts) {
 static int cap_encode_yuv(bsdr_capture *c, const uint8_t **au, size_t *len, uint32_t *rtp_ts) {
     /* With 3D the overlay draws on the source (c->src), which the SBS then duplicates into both eyes;
      * otherwise it draws directly on the encoder frame. */
-    AVFrame *pre = c->threed ? c->src : c->yuv;
+    AVFrame *pre = c->use_vsrc ? c->src : c->yuv;
     if (c->overlay)
         bsdr_overlay_render_nv12(c->overlay, pre->data[0], pre->linesize[0],
                                  pre->data[1], pre->linesize[1],
                                  pre->width, pre->height);
-    if (c->threed)
-        bsdr_threed_apply_nv12(c->threed, c->src->data[0], c->src->linesize[0],
-                               c->src->data[1], c->src->linesize[1],
-                               c->yuv->data[0], c->yuv->linesize[0],
-                               c->yuv->data[1], c->yuv->linesize[1]);
+    apply_2d3d(c);
     c->yuv->pts = c->frame_index;
-    apply_faceswap(c, c->yuv);
+    apply_video_fx(c->yuv);
+    maybe_force_key(c, c->yuv);
     if (avcodec_send_frame(c->enc, c->yuv) < 0) return 0;
     if (avcodec_receive_packet(c->enc, c->opkt) == 0) {
         *au = c->opkt->data; *len = c->opkt->size;
@@ -1058,7 +1120,8 @@ int bsdr_capture_frame(bsdr_capture *c, const uint8_t **au, size_t *len,
                                      c->yuv->width, c->yuv->height);
         c->yuv->pts = c->frame_index;
         c->have_frame = 1;
-        apply_faceswap(c, c->yuv);
+        apply_video_fx(c->yuv);
+        maybe_force_key(c, c->yuv);
         if (avcodec_send_frame(c->enc, c->yuv) < 0) return 0;
         if (avcodec_receive_packet(c->enc, c->opkt) == 0) {
             *au = c->opkt->data; *len = c->opkt->size;
@@ -1111,6 +1174,7 @@ int bsdr_capture_frame(bsdr_capture *c, const uint8_t **au, size_t *len,
         av_frame_unref(c->gpu);
         if (av_buffersink_get_frame(c->fg_sink, c->gpu) < 0) return 0;
         c->gpu->pts = c->frame_index;
+        maybe_force_key(c, c->gpu);
         if (avcodec_send_frame(c->enc, c->gpu) < 0) { av_frame_unref(c->gpu); return 0; }
         av_frame_unref(c->gpu);
         r = avcodec_receive_packet(c->enc, c->opkt);
@@ -1206,7 +1270,7 @@ have_raw:;   /* jump target for the PipeWire / raw-render fast-paths above (both
     } else {
         /* Scale into the source buffer (c->src for 3D, else c->yuv directly), composite the overlay
          * on it, then for 3D synthesise the packed SBS frame into c->yuv. */
-        AVFrame *pre = c->threed ? c->src : c->yuv;
+        AVFrame *pre = c->use_vsrc ? c->src : c->yuv;
         if (c->crop_w) {
             /* Software crop (macOS window/region): scale only the sub-rect by offsetting the source
              * plane pointers to the crop origin and feeding the crop height as the slice height. */
@@ -1221,17 +1285,14 @@ have_raw:;   /* jump target for the PipeWire / raw-render fast-paths above (both
             bsdr_overlay_render_nv12(c->overlay, pre->data[0], pre->linesize[0],
                                      pre->data[1], pre->linesize[1],
                                      pre->width, pre->height);
-        if (c->threed)
-            bsdr_threed_apply_nv12(c->threed, c->src->data[0], c->src->linesize[0],
-                                   c->src->data[1], c->src->linesize[1],
-                                   c->yuv->data[0], c->yuv->linesize[0],
-                                   c->yuv->data[1], c->yuv->linesize[1]);
+        apply_2d3d(c);
         c->yuv->pts = c->frame_index;   /* monotonic */
         c->have_frame = 1;              /* c->yuv/src now hold a frame we can re-encode while paused */
         av_frame_unref(c->raw);
-        apply_faceswap(c, c->yuv);      /* deepfake the encoder frame (CPU path only) */
+        apply_video_fx(c->yuv);         /* plugin same-dims video-fx chain (faceswap plugin, etc.) */
         enc_in = c->yuv;
     }
+    maybe_force_key(c, enc_in);
     if (avcodec_send_frame(c->enc, enc_in) < 0) return 0;
     if (c->use_gpu) av_frame_unref(c->gpu);
 
@@ -1291,9 +1352,6 @@ void bsdr_capture_close(bsdr_capture *c) {
     if (c->gpu) av_frame_free(&c->gpu);
     if (c->sws) sws_freeContext(c->sws);
     if (c->sws2) sws_freeContext(c->sws2);
-    if (c->fs_to_rgb) sws_freeContext(c->fs_to_rgb);
-    if (c->fs_from_rgb) sws_freeContext(c->fs_from_rgb);
-    free(c->fs_rgb);
     if (c->enc) avcodec_free_context(&c->enc);
     if (c->fg) avfilter_graph_free(&c->fg);
     if (c->hw_device) av_buffer_unref(&c->hw_device);
@@ -1301,6 +1359,5 @@ void bsdr_capture_close(bsdr_capture *c) {
     if (c->dec2) avcodec_free_context(&c->dec2);
     if (c->fmt) avformat_close_input(&c->fmt);
     if (c->fmt2) avformat_close_input(&c->fmt2);
-    if (c->threed) bsdr_threed_close(c->threed);
     free(c);
 }

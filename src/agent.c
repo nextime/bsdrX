@@ -45,17 +45,21 @@
 #include "bsdr/app.h"
 #include "bsdr/tls.h"
 #include "bsdr/webui.h"
+#include "bsdr/plugin.h"
 #include "bsdr/agentlib.h"
 #include "bsdr/micsniff.h"
 #include "bsdr/overlay.h"
 #include "bsdr/threed.h"
 #include "bsdr/depth.h"
 #include "bsdr/model_store.h"
-#include "bsdr/faceswap.h"
 #include "bsdr/micsub.h"
 #include "bsdr/voicestore.h"
 #include "bsdr/voiceai.h"
 #include "bsdr/voice.h"
+#include "bsdr/botprompt.h"
+#include "bsdr/updatecheck.h"
+#include "bsdr/roomcmd.h"
+#include "bsdr/httpc.h"
 #if defined(BSDR_PLATFORM_ANDROID)
 #include "bsdr_android.h"          /* device-mic voice bridge (no sniffer on Android) */
 #endif
@@ -137,26 +141,14 @@ void bsdr_agent_stop(void) { g_running = 0; }
 /* System prompt handed to the LLM for spoken desktop commands. The tool schema
  * (type_text/key/click/scroll/open_app) lives in llm.c; this tells the model how
  * to use it. */
-static const char COMPCTL_SYSTEM_PROMPT[] =
-    "You control a Linux desktop on behalf of a user speaking through a VR headset. "
-    "The user's words arrive transcribed from speech, so expect informal phrasing and "
-    "occasional transcription errors — infer intent. Carry out the request by calling the "
-    "provided tools: type_text to type, key for key combos (e.g. \"ctrl+t\", \"alt+F4\", "
-    "\"enter\"), click with normalized x,y in [0,1], scroll by an amount, and open_app to "
-    "launch a program by command name. Prefer keyboard shortcuts over clicking when reliable. "
-    "Take the fewest actions that accomplish the goal, then reply with one short sentence "
-    "describing what you did. If the request is unclear or unsafe, do nothing and say so.";
-
-/* Appended to the prompt only when vision is enabled. */
-static const char COMPCTL_VISION_NOTE[] =
-    " You cannot see the screen by default. When the task needs you to look at the desktop "
-    "(to find a UI element, read what's shown, or decide where to click), call the "
-    "take_screenshot tool first — it attaches the current screen as an image — then act on it. "
-    "Don't take a screenshot when the request doesn't require seeing the screen.";
-
 /* micsniff PCM tap -> voice capture buffer (runs on the sniffer thread). */
 static void voice_pcm_sink(void *user, const int16_t *pcm, int frames, int channels) {
     bsdr_voice_push_pcm((bsdr_voice *)user, pcm, frames, channels);
+}
+
+/* computer-control "speak" tool -> TTS (routed to the cloud room mic or desktop audio). */
+static void agent_tts_speak(void *user, const char *text) {
+    bsdr_app_tts_say((bsdr_app *)user, text);
 }
 
 #if !defined(BSDR_PLATFORM_ANDROID)
@@ -598,31 +590,18 @@ static int webcam_cfg(agent_t *a, bsdr_capture_config *cfg) {
     return cfg->webcam != NULL;
 }
 
-/* Open/close the face-swap engine to match the app state, (re)loading the source image on enable.
- * Models live in <model cache>/faceswap (det_10g/w600k_r50/inswapper_128, user-supplied). Closes
- * `cur` first; returns the new engine (or NULL when off/unavailable). */
-static bsdr_faceswap *faceswap_reconcile(agent_t *a, bsdr_faceswap *cur) {
-    if (cur) bsdr_faceswap_close(cur);
-    if (!a->app) return NULL;
+/* 1 if the face-swap effect is enabled. The engine itself is now the faceswap PLUGIN (it registers a
+ * video-fx and processes each NV12 frame); the core keeps only the config + the encode-path policy —
+ * because the plugin's per-frame pixel transform runs on the CPU NV12 frame, so an enabled face swap
+ * forces the CPU encode path (like 2D->3D). Android applies face swap in its own GL pipeline, not here. */
+static int faceswap_on(agent_t *a) {
 #if defined(BSDR_PLATFORM_ANDROID)
-    return NULL;   /* Android applies face swap in the Kotlin GL pipeline, not this C capture path */
+    (void)a; return 0;
 #else
-    bool on=false; int tier=0; char src[512]="";
-    bsdr_app_get_faceswap(a->app, &on, &tier, src, sizeof src);
-    if (!on) { bsdr_app_set_faceswap_status(a->app, "off"); return NULL; }
-    char dir[768], fsdir[900];
-    bsdr_model_dir(dir, sizeof dir);
-    snprintf(fsdir, sizeof fsdir, "%s/faceswap", dir);
-    bsdr_faceswap *fs = bsdr_faceswap_open(fsdir, tier >= 2);
-    if (!fs) { bsdr_app_set_faceswap_status(a->app, "models missing — put det_10g/w600k_r50/inswapper_128 in the faceswap dir"); return NULL; }
-    bsdr_faceswap_set_detect_every(fs, a->app->faceswap_detect_every);   /* opt-in P4.5 cadence */
-    if (!src[0]) { bsdr_app_set_faceswap_status(a->app, "set a source image"); return fs; }
-    uint8_t *rgb=NULL; int w=0,h=0;
-    if (bsdr_capture_decode_image_rgb(src, &rgb, &w, &h) != 0) { bsdr_app_set_faceswap_status(a->app, "cannot read source image"); return fs; }
-    int r = bsdr_faceswap_set_source_rgb(fs, rgb, w, h);
-    free(rgb);
-    bsdr_app_set_faceswap_status(a->app, r == 0 ? bsdr_faceswap_status(fs) : "no face found in source image");
-    return fs;
+    if (!a->app) return 0;
+    bool on = false;
+    bsdr_app_get_faceswap(a->app, &on, NULL, NULL, 0);
+    return on ? 1 : 0;
 #endif
 }
 
@@ -653,10 +632,10 @@ static void lan_live_main(agent_t *a) {
      * auto-picks NVENC (2-pass, p7) even when 3D forced the CPU-scale path above. */
     if (user_cpu) cfg.encoder = "libx264";
     threed_cfg(a, &cfg);   /* capture builds the SBS transform from these cfg fields */
-    /* face swap runs on the CPU NV12 frame (like 3D) -> force the CPU scale path when it's on. */
-    bsdr_faceswap *fs_engine = faceswap_reconcile(a, NULL);
+    /* face swap runs on the CPU NV12 frame (like 3D) -> force the CPU scale path when it's on. The
+     * processing itself is the faceswap plugin (via the video-fx hook); the core only sets the policy. */
     unsigned my_fs_gen = a->app ? a->app->faceswap_gen : 0;
-    if (fs_engine) { cfg.cpu_only = 1; cfg.use_vaapi = 0; cfg.use_kmsgrab = 0; }
+    if (faceswap_on(a)) { cfg.cpu_only = 1; cfg.use_vaapi = 0; cfg.use_kmsgrab = 0; }
     int rx=0,ry=0,rw=0,rh=0;                           /* capture region; 0s = whole desktop */
     int qw=0,qh=0,qbr=0;                                /* live quality (headset PUT /device) */
     int w=0,h=0; const char *enc="h264";
@@ -761,6 +740,19 @@ static void lan_live_main(agent_t *a) {
         int is_cam = webcam_cfg(a, &cfg);   /* webcam source -> sets cfg.webcam[_right]; else screen grab */
         if (a->app) bsdr_app_get_region(a->app, &rx, &ry, &rw, &rh);
         cfg.x = rx; cfg.y = ry; cfg.width = rw; cfg.height = rh;
+        /* Desktop only: wait briefly for the headset's first PUT /device (its target resolution) before
+         * the first frame, so we encode straight at e.g. 1080 instead of streaming our 720p default and
+         * then rebuilding the encoder when /device arrives. That mid-stream resolution change forces the
+         * Quest to tear down + recreate its decode swapchain, which can crash its compositor (ASW re-init).
+         * Bounded so a headset that never sends /device still starts promptly at the default. */
+        if (!is_cam && a->app) {
+            int waited = 0;
+            while (waited < 2500 && g_running && bsdr_app_await_device_pending(a->app)) {
+                bsdr_sleep_ms(50); waited += 50;
+            }
+            if (bsdr_app_await_device_pending(a->app))
+                BSDR_INFO("bsdr.agent", "no headset /device in %dms — streaming at the default resolution", waited);
+        }
         if (a->app) bsdr_app_get_quality(a->app, &qw, &qh, &qbr);
         if (qbr > 0) cfg.bitrate = qbr;
         cfg.out_width = qw > 0 ? qw : 0; cfg.out_height = qh > 0 ? qh : 0;
@@ -788,6 +780,7 @@ static void lan_live_main(agent_t *a) {
     if (sessid == 0) sessid = 0x2a8a3c48;
     uint32_t frame_num = 0; long pkts = 0;
     uint64_t prev = bsdr_now_ms();
+    unsigned lan_kf_gen = a->app ? a->app->keyframe_gen : 0;   /* on-demand keyframe generation served */
 #ifdef BSDR_HAVE_AUDIO
     /* Desktop audio needs the PulseAudio monitor (adev); a video file streams its own track and
      * needs no virtual devices. Both go out on 45003 (separate from video 45002). */
@@ -811,9 +804,7 @@ static void lan_live_main(agent_t *a) {
     unsigned my_source_gen = a->app ? a->app->source_gen : 0;
     int cur_loop = (a->app && a->app->file_loop) ? 1 : 0;   /* live "loop file" toggle (web UI / overlay) */
     int cur_cpu = user_cpu;   /* live encoder choice (web-UI CPU<->GPU toggle); user_cpu = the initial */
-    if (cap) bsdr_capture_set_faceswap(cap, fs_engine);
     while (!a->stop) {
-        if (cap) bsdr_capture_set_faceswap(cap, fs_engine);   /* re-attach across any reopen below */
         /* SOURCE switch (web UI desktop<->file<->webcam), MAKE-BEFORE-BREAK: open the new source FIRST
          * and only drop the current capture once the new one is ready, so the desktop keeps streaming
          * until the file's first frame is decoded — no black gap while you pick a file. Same session id
@@ -824,7 +815,7 @@ static void lan_live_main(agent_t *a) {
             char nmode[16] = "", npath[512] = "", ncurpath[512] = "";
             bsdr_app_get_source(a->app, nmode, sizeof nmode, npath, sizeof npath);
             int nfile = (strcmp(nmode, "file") == 0 && npath[0] != '\0');
-            int npl = 0, ready = 1, td = threed_on(a), fson = (fs_engine != NULL);
+            int npl = 0, ready = 1, td = threed_on(a), fson = faceswap_on(a);
             bsdr_capture_config ncfg = cfg;
             ncfg.input_file = NULL; ncfg.webcam = NULL; ncfg.webcam_right = NULL;
             ncfg.x = ncfg.y = ncfg.width = ncfg.height = 0;
@@ -906,7 +897,6 @@ static void lan_live_main(agent_t *a) {
                         else bsdr_overlay_set_position(a->overlay, 0.0, false);  /* live cam: exit bar, no seek */
                     }
                 }
-                bsdr_capture_set_faceswap(cap, fs_engine);
                 bsdr_capture_info(cap, &w, &h, &enc);
                 tw = (uint16_t)((w+15)&~15); th = (uint16_t)((h+15)&~15);
 #ifdef BSDR_HAVE_AUDIO
@@ -946,17 +936,18 @@ static void lan_live_main(agent_t *a) {
             bsdr_capture_close(cap); cap = bsdr_capture_open(&cfg);
             if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: reopen for loop toggle failed"); break; }
             if (a->overlay) bsdr_capture_set_overlay(cap, a->overlay);
-            bsdr_capture_set_faceswap(cap, fs_engine);
             bsdr_capture_info(cap, &w, &h, &enc);
             tw = (uint16_t)((w+15)&~15); th = (uint16_t)((h+15)&~15);
             BSDR_INFO("bsdr.agent", "LAN file loop -> %s (reopen)", cur_loop ? "on" : "off");
         }
         /* Face swap toggled/retuned from the web UI: reconcile the engine (reload model+source) and,
          * because it forces the CPU encode path, reopen the capture. */
+        /* Face swap toggled/retuned from the web UI: it forces the CPU encode path (the faceswap plugin's
+         * per-frame transform runs on the CPU NV12 frame), so reopen the capture to switch CPU/GPU. The
+         * plugin picks up the new enable/source/tier from the core config on its own next refresh. */
         if (a->app && a->app->faceswap_gen != my_fs_gen) {
             my_fs_gen = a->app->faceswap_gen;
-            fs_engine = faceswap_reconcile(a, fs_engine);
-            int fs_on = fs_engine != NULL, td = threed_on(a);
+            int fs_on = faceswap_on(a), td = threed_on(a);
             cfg.cpu_only = fs_on || td || cur_cpu;
             if (fs_on || td) { cfg.use_vaapi = 0; cfg.use_kmsgrab = 0; }
             else { cfg.use_vaapi = a->app->use_vaapi; cfg.use_kmsgrab = a->app->use_kmsgrab; }
@@ -966,7 +957,6 @@ static void lan_live_main(agent_t *a) {
             bsdr_capture_close(cap); cap = bsdr_capture_open(&cfg);
             if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: reopen for faceswap change failed"); break; }
             if (a->overlay) bsdr_capture_set_overlay(cap, a->overlay);
-            bsdr_capture_set_faceswap(cap, fs_engine);
             bsdr_capture_info(cap, &w, &h, &enc);
             tw = (uint16_t)((w+15)&~15); th = (uint16_t)((h+15)&~15);
         }
@@ -1010,7 +1000,7 @@ static void lan_live_main(agent_t *a) {
         if (a->app && !filemode && a->app->encoder_gen != my_enc_gen) {
             my_enc_gen = a->app->encoder_gen;
             cur_cpu = a->app->cpu_only;
-            int td = threed_on(a), fs_on = (fs_engine != NULL);
+            int td = threed_on(a), fs_on = faceswap_on(a);
             cfg.cpu_only = cur_cpu || td || fs_on;
             if (td || fs_on) { cfg.use_vaapi = 0; cfg.use_kmsgrab = 0; }
             else { cfg.use_vaapi = a->app->use_vaapi; cfg.use_kmsgrab = a->app->use_kmsgrab; }
@@ -1019,7 +1009,6 @@ static void lan_live_main(agent_t *a) {
             bsdr_capture_close(cap); cap = bsdr_capture_open(&cfg);
             if (!cap) { BSDR_ERROR("bsdr.agent", "LAN: reopen for encoder change failed"); break; }
             if (a->overlay) bsdr_capture_set_overlay(cap, a->overlay);
-            bsdr_capture_set_faceswap(cap, fs_engine);
             bsdr_capture_info(cap, &w, &h, &enc);
             tw = (uint16_t)((w+15)&~15); th = (uint16_t)((h+15)&~15);
             BSDR_INFO("bsdr.agent", "LAN encoder -> %s (in-place reopen, fresh keyframe)",
@@ -1046,6 +1035,13 @@ static void lan_live_main(agent_t *a) {
                 BSDR_INFO("bsdr.agent", "LAN live reconfig: %s %dx%d @ %d bps (fresh keyframe)",
                           (rw&&rh)?"window":"desktop", w, h, cfg.bitrate);
             }
+        }
+        /* Serve an on-demand keyframe request (a new cloud joiner / RTCP PLI). In coupled mode this
+         * LAN encoder is the cloud's source too, so its IDR reaches the joiner; the Quest just gets a
+         * harmless extra keyframe. */
+        if (a->app) {
+            unsigned g = a->app->keyframe_gen;
+            if (g != lan_kf_gen) { bsdr_capture_force_keyframe(cap); lan_kf_gen = g; }
         }
         const uint8_t *au; size_t len; uint32_t rtp_ts;
         int r = bsdr_capture_frame(cap, &au, &len, &rtp_ts);
@@ -1128,7 +1124,6 @@ static void lan_live_main(agent_t *a) {
     a->file_mode = 0; a->term_mode = 0;
     if (cap) bsdr_capture_close(cap);   /* drop the capture before the terminal it renders from */
     if (term) { a->term = NULL; bsdr_term_stop(term); term = NULL; }
-    if (fs_engine) bsdr_faceswap_close(fs_engine);
     bsdr_udp_close(&udp);
     BSDR_INFO("bsdr.agent", "LAN live stopped (%u NALs sent)", frame_num);
 }
@@ -1181,6 +1176,7 @@ static void cb_start(const bsdr_paired_device *dev, void *user) {
     teardown_session(a);
     if (a->app) {
         bsdr_app_set_paired(a->app, true, dev->device_name, dev->remote_ip);
+        bsdr_app_await_device_begin(a->app);   /* wait for the headset's resolution before frame 1 */
         bsdr_app_set_streaming(a->app, true);
     }
     bsdr_mutex_lock(a->lock);
@@ -1301,15 +1297,19 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     bsdr_app app;
     bsdr_app_init(&app);
     bsdr_app_load_settings(&app);   /* persisted encoder/bitrate prefs; CLI flags below still override */
+    bsdr_plugins_load(&app);        /* loadable plugins (build/plugins or $BSDR_PLUGIN_DIR); optional */
     app.audio = a.audio;
     app.max_bitrate = opt->max_bitrate;   /* cap the Quest's bitrate (e.g. hold 1 Mbps when sharing) */
     if (opt->cloud_data)
         snprintf(app.cloud_data_mode, sizeof(app.cloud_data_mode), "%s", opt->cloud_data);
     if (opt->cloud_dtls_role)
         snprintf(app.cloud_dtls_role, sizeof(app.cloud_dtls_role), "%s", opt->cloud_dtls_role);
-    if (opt->bot_mode)   /* CLI overrides the saved bot presence mode */
-        snprintf(app.bot_mode, sizeof(app.bot_mode),
-                 "%s", strcmp(opt->bot_mode, "full") == 0 ? "full" : "audio");
+    if (opt->bot_mode) {  /* CLI overrides the saved bot presence mode (plugins are already loaded, so
+                           * this fires the mode's activation callback). Legacy "full" -> the "fullbot"
+                           * plugin mode; anything else is passed through ("audio" or a plugin mode). */
+        const char *m = strcmp(opt->bot_mode, "full") == 0 ? "fullbot" : opt->bot_mode;
+        bsdr_app_bot_set_mode(&app, m);
+    }
     if (opt->encoder_mode)   /* CLI overrides the saved encoder mode: quality|balanced|performance */
         app.enc_level = strcmp(opt->encoder_mode, "performance") == 0 ? 2 :
                         strcmp(opt->encoder_mode, "balanced")    == 0 ? 1 : 0;
@@ -1331,6 +1331,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     if (opt->force_x11) app.force_x11 = true;             /* --x11: force x11grab */
     if (opt->force_pipewire) app.force_pipewire = true;   /* --wayland/--pipewire: force the portal */
     if (opt->pw_dmabuf) app.pw_dmabuf = true;             /* --pw-dmabuf: experimental zero-copy dmabuf->VAAPI */
+    app.cloud_rtcp_pli = opt->cloud_rtcp_pli;             /* --cloud-rtcp-pli: force IDR on an SFU keyframe request */
     if (opt->lan_1x) app.lan_1x = true;                   /* --lan-1x forces on; absence keeps the saved value */
     if (opt->fps > 0) app.fps_cap = opt->fps;             /* --fps caps the capture fps (persisted) */
     if (opt->faceswap_detect_every > 0) app.faceswap_detect_every = opt->faceswap_detect_every;  /* opt-in P4.5 */
@@ -1364,11 +1365,42 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
         bsdr_app_select_quest(&app, quest_ip);
         BSDR_INFO("bsdr.agent", "restricting to Quest %s (ignoring others)", quest_ip);
     }
-    /* If a Bigscreen session was saved last run, restore it (validate/renew the token) so we
-     * come up already logged in + online; internet sharing then auto-follows the Quest's screen. */
-    if (bsdr_app_restore_session(&app))
-        BSDR_INFO("bsdr.agent", "Bigscreen: already logged in (auto internet-share armed)");
-    bsdr_app_bot_restore(&app);   /* second "bot" account, if one was saved (its own session/WS) */
+    /* Bring the control web UI up FIRST — before the (slow, blocking) cloud session restore below — so
+     * the panel is reachable within a fraction of a second. It runs in its own thread and reflects
+     * login/bot state live via /api/status, so it works fine while the cloud calls proceed. */
+    bsdr_updatecheck_start(&app);   /* hourly, background, quiet — flags a newer release for the UI */
+
+    bsdr_webui *ui = NULL;
+    if (webui_port > 0) {
+        ui = bsdr_webui_start(&app, (uint16_t)webui_port, opt->webui_bind, opt->webui_allow);
+        if (ui && open_browser) {
+            /* Open the browser only once the UI actually answers — poll /api/status (up to ~3 s) so the
+             * first page load can't race a not-yet-serving server. */
+            char probe_url[64]; snprintf(probe_url, sizeof probe_url, "http://127.0.0.1:%d/api/status", webui_port);
+            static char probe[8192]; bool reachable = false;
+            for (int i = 0; i < 30 && !reachable; i++) {
+                if (bsdr_http_request("GET", probe_url, NULL, 0, NULL, NULL, 0, probe, sizeof probe) >= 0) reachable = true;
+                else bsdr_sleep_ms(100);
+            }
+            if (!reachable) BSDR_WARN("bsdr.agent", "web UI not reachable yet; open http://127.0.0.1:%d manually", webui_port);
+            if (reachable) {
+                char cmd[128];
+#if defined(__APPLE__)
+                snprintf(cmd, sizeof(cmd), "open http://127.0.0.1:%d >/dev/null 2>&1 &", webui_port);
+#elif defined(_WIN32)
+                snprintf(cmd, sizeof(cmd), "start http://127.0.0.1:%d", webui_port);
+#else
+                snprintf(cmd, sizeof(cmd), "xdg-open http://127.0.0.1:%d >/dev/null 2>&1 &", webui_port);
+#endif
+                if (system(cmd) != 0) { /* user can open it manually */ }
+            }
+        }
+    }
+
+    /* Bring the LAN remote-desktop path (discovery + control server) up BEFORE the cloud/bot logins
+     * below: a Quest that's already running discovers us and starts streaming the moment these are up,
+     * and none of the LAN video path needs a Bigscreen login. The (slow, blocking) session restores
+     * happen right after, so cloud internet-share / the bot arm a beat later without delaying LAN video. */
 
     /* identity (advertised via discovery) */
     bsdr_discovery_info info;
@@ -1401,23 +1433,6 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     bsdr_control *ctl = bsdr_control_start(code, &cbs);
     if (!disc || !ctl) { fprintf(stderr, "startup failed (ports in use?)\n"); return 1; }
 
-    /* local control web UI + open the browser */
-    bsdr_webui *ui = NULL;
-    if (webui_port > 0) {
-        ui = bsdr_webui_start(&app, (uint16_t)webui_port);
-        if (ui && open_browser) {
-            char cmd[128];
-#if defined(__APPLE__)
-            snprintf(cmd, sizeof(cmd), "open http://127.0.0.1:%d >/dev/null 2>&1 &", webui_port);
-#elif defined(_WIN32)
-            snprintf(cmd, sizeof(cmd), "start http://127.0.0.1:%d", webui_port);
-#else
-            snprintf(cmd, sizeof(cmd), "xdg-open http://127.0.0.1:%d >/dev/null 2>&1 &", webui_port);
-#endif
-            if (system(cmd) != 0) { /* user can open it manually */ }
-        }
-    }
-
     BSDR_INFO("bsdr.agent", "========================================================");
     BSDR_INFO("bsdr.agent", " Bigscreen Remote Desktop - %s agent (input channel)",
 #if defined(_WIN32)
@@ -1437,6 +1452,14 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     BSDR_INFO("bsdr.agent", "========================================================");
 
     if (ui) BSDR_INFO("bsdr.agent", " CONTROL UI: http://127.0.0.1:%d", webui_port);
+
+    /* Now (after the LAN path is live) restore the saved Bigscreen sessions — these do slow, blocking
+     * network round-trips (token validate/renew + the bot's WS), and are only needed for cloud
+     * internet-share and the second "bot" account, NOT for LAN video. Doing them here keeps a
+     * to-a-running-Quest LAN stream from waiting on logins it doesn't need. */
+    if (bsdr_app_restore_session(&app))
+        BSDR_INFO("bsdr.agent", "Bigscreen: already logged in (auto internet-share armed)");
+    bsdr_app_bot_restore(&app);   /* second "bot" account, if one was saved (its own session/WS) */
 
     /* Owner-mic sniffer: the Quest never sends its mic to us over the remote-desktop
      * protocol (proven from real captures) — the owner's voice only goes to the room's
@@ -1609,11 +1632,28 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
 #endif
                 int vg=0, vfm=0, vvol=0, vr=0, ve=0, vw=0; bool vsub=false;
                 bsdr_app_get_voicefx(&app, &vg, &vfm, &vvol, &vr, &ve, &vw, &vsub);
-                if (sniffer) bsdr_micsniff_set_voicefx(sniffer, vg, vfm, vvol, vr, ve, vw);
+                /* GUARD (owner directive): voice-changer / AI-voice SUBSTITUTION — replacing the owner's
+                 * voice in the room — may ONLY act on the INTERCEPTED ORIGINAL owner mic (the LAN
+                 * sniffer / MITM path). It must NEVER be applied to a RE-CONSUMED cloud stream (the
+                 * cloud-mic fallback or room loopback), because that stream is the owner's voice ALREADY
+                 * IN THE ROOM — "substituting" it would echo/double it, not replace it. That stream may
+                 * feed STT / computer-control / bot functions only. All substitution paths below require
+                 * `sniffer`, so this holds structurally; we ALSO force it off + surface a status when the
+                 * operator has substitution on but the owner-mic source is not an interceptable original
+                 * (cloud fallback or this-PC mic), so the invariant can't be broken by a future change. */
+                if (vsub && sniffer == NULL) {
+                    vsub = false;
+                    bsdr_app_set_sniff_status(&app, false,
+                        "voice change can't substitute the cloud/PC-mic source (needs the LAN owner-mic); it still feeds STT");
+                }
+                (void)vg; (void)vfm; (void)vvol; (void)vr; (void)ve; (void)vw;  /* effects are the voice-changer plugin's now */
                 /* Cloud SUBSTITUTION via the RELAY (all platforms incl. Android): bsdrX re-encodes the
                  * changed voice and the router companion forwards it to the cloud in place of the
                  * original. No-op unless the sniffer runs in router-companion mode. */
                 if (sniffer) bsdr_micsniff_set_substitute(sniffer, vsub);
+                /* Render the owner voice into the BSDR_QuestMic device only when the operator asked for
+                 * it (default off); the STT/computer-control tap runs regardless. */
+                if (sniffer) bsdr_micsniff_set_questmic_feedback(sniffer, app.owner_mic_to_questmic ? 1 : 0);
 #if !defined(BSDR_PLATFORM_ANDROID)
                 /* Cloud SUBSTITUTION in flight (LOCAL, no relay): rewrite the Quest->cloud owner-mic
                  * packets as they transit us. Only when we're the MITM (NFQUEUE/WinDivert/macOS BPF). */
@@ -1629,35 +1669,12 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                 } else if (!can_sub && micsub) {
                     bsdr_micsub_stop(micsub); micsub = NULL;
                 }
-                if (micsub) bsdr_micsub_set_voicefx(micsub, vg, vfm, vvol, vr, ve, vw);
 #endif
-                /* AI (RVC) voice tier: resolve the base + voice model paths from the voice store and
-                 * push them to both mic paths. Effective only when the models are actually present
-                 * (otherwise kick a background base-model download and stay on the DSP tier). */
-                bool vai_on; int vai_tier, vai_key; char vai_voice[64];
-                bsdr_app_get_voiceai(&app, &vai_on, &vai_tier, vai_voice, sizeof vai_voice, &vai_key);
-                char vcontent[1024] = "", vrmvpe[1024] = "", vpath[1200] = "";
-                int voice_sr = 40000, eff_on = 0;
-                if (vai_on && vai_voice[0]) {
-                    int have_c = bsdr_voice_base_present(BSDR_VBASE_CONTENT);
-                    int have_v = (bsdr_voice_path(vai_voice, vpath, sizeof vpath) == 0);
-                    if (have_c && have_v) {
-                        bsdr_voice_base_path(BSDR_VBASE_CONTENT, vcontent, sizeof vcontent);
-                        if (bsdr_voice_base_present(BSDR_VBASE_RMVPE)) bsdr_voice_base_path(BSDR_VBASE_RMVPE, vrmvpe, sizeof vrmvpe);
-                        bsdr_voice_entry ve; if (bsdr_voice_get(vai_voice, &ve) == 0 && ve.sample_rate > 0) voice_sr = ve.sample_rate;
-                        eff_on = 1;
-                        bsdr_app_set_voiceai_status(&app, bsdr_voiceai_available() ? "converting" : "no ONNX in this build");
-                    } else {
-                        if (!have_c) bsdr_voice_base_download_start();
-                        bsdr_app_set_voiceai_status(&app, !have_c ? "downloading base models…" : "voice model not found");
-                    }
-                } else {
-                    bsdr_app_set_voiceai_status(&app, "off");
-                }
-                if (sniffer) bsdr_micsniff_set_voiceai(sniffer, eff_on, vai_tier, vcontent, vrmvpe, vpath, voice_sr, vai_key);
-#if !defined(BSDR_PLATFORM_ANDROID)
-                if (micsub) bsdr_micsub_set_voiceai(micsub, eff_on, vai_tier, vcontent, vrmvpe, vpath, voice_sr, vai_key);
-#endif
+                /* Voice EFFECTS (DSP + AI/RVC) are the voice-changer PLUGIN's job now: it transforms the
+                 * PCM inside the mic paths via the media-fx hook, and the substitution plumbing above just
+                 * forwards the (already-changed) voice. The old in-core voice-fx/voice-ai reconcile — which
+                 * resolved RVC model paths and pushed effect params to the mic modules — is gone with the
+                 * engine. The RVC model store itself stays in the core (host services). */
             }
         }
         /* --- computer-control reconcile (gated on the owner mic + an LLM endpoint) --- */
@@ -1667,6 +1684,16 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
             char se[256], st[256], sm[256], le[256], lt[256], lm[256];
             bsdr_app_get_voice(&app, se, st, sm, le, lt, lm, 256);
             bool have_llm = le[0] != 0;
+            /* Per-speaker room utterance router (mic-check / one-shot translation): created once and
+             * kept for the process lifetime (the bot's room-audio tap feeds it), enabled while the LLM
+             * assistant is on. Skipped entirely when a PLUGIN owns the bot (it registered a presence
+             * mode) — then the core stays bare and the plugin is the sole brain; the tap routes to the
+             * plugin, not here. */
+            if (have_llm && cc_want && !app.roomcmd && !bsdr_app_has_plugin_bot(&app)) {
+                bsdr_roomcmd *rcmd = bsdr_roomcmd_new(&app);
+                bsdr_mutex_lock(app.lock); app.roomcmd = rcmd; bsdr_mutex_unlock(app.lock);
+            }
+            if (app.roomcmd) bsdr_roomcmd_set_enabled((bsdr_roomcmd *)app.roomcmd, have_llm && cc_want);
 #if defined(BSDR_PLATFORM_ANDROID)
             bool armable = cc_want && have_llm;                     /* device mic is the voice source */
 #else
@@ -1683,6 +1710,8 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                         bsdr_voice_config vc0; memset(&vc0, 0, sizeof vc0);
                         a.voice = bsdr_voice_new(&vc0, voice_inj);
                         if (a.voice) {
+                            bsdr_voice_set_speak(a.voice, agent_tts_speak, &app);   /* "speak" tool -> TTS */
+                            bsdr_voice_set_app(a.voice, &app);   /* owner balloon -> bot/room/admin tools too */
 #if defined(BSDR_PLATFORM_ANDROID)
                             bsdr_voice_set_state_cb(a.voice, voice_state_android, NULL);
                             bsdr_voice_set_feedback_cb(a.voice, voice_feedback_android, NULL);
@@ -1704,11 +1733,19 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                     snprintf(vc.llm.endpoint, sizeof vc.llm.endpoint, "%s", le);
                     snprintf(vc.llm.token,    sizeof vc.llm.token,    "%s", lt);
                     snprintf(vc.llm.model,    sizeof vc.llm.model,    "%.63s", lm);
+                    vc.llm.context_tokens   = app.llm_context_tokens > 0 ? app.llm_context_tokens : app.llm_context_detected;
+                    vc.llm.compact_pct      = app.llm_compact_pct;
+                    vc.llm.compact_strategy = app.llm_compact_strategy;
+                    vc.llm.max_rounds       = app.llm_max_rounds;
                     vc.vision = cc_vision;
                     vc.max_ms     = opt->listen_max_sec > 0 ? opt->listen_max_sec * 1000 : 0;  /* 0 => 5 min */
                     vc.confirm_ms = opt->confirm_sec   > 0 ? opt->confirm_sec   * 1000 : 0;  /* 0 => 1 min */
-                    snprintf(vc.system_prompt, sizeof vc.system_prompt, "%s%s",
-                             COMPCTL_SYSTEM_PROMPT, cc_vision ? COMPCTL_VISION_NOTE : "");
+                    /* Owner balloon: role-adaptive prompt, full owner toolset (incl. agentic coding).
+                     * No wake word and no persona: the balloon is functional, not conversational — the
+                     * owner talking to their own machine, push-to-talk, never addressed by name. Both
+                     * belong to the fullbot plugin, for the room. */
+                    bsdr_botprompt_build(vc.system_prompt, sizeof vc.system_prompt, BSDR_TG_ALL,
+                                         BSDR_ACL_OWNER, "the owner", "", "", cc_vision, /*spoken=*/false);
                     bsdr_voice_update_config(a.voice, &vc);
 #if defined(BSDR_PLATFORM_ANDROID)
                     if (sniffer) {   /* owner mic via the router companion relay (+ voice FX) */
@@ -1786,6 +1823,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
         if (++follow_ctr >= 75) {                 /* ~15 s: follow the operator between rooms */
             follow_ctr = 0;
             bsdr_app_bot_follow_tick(&app);
+            bsdr_app_bot_token_tick(&app);        /* keep the bot token fresh (renews ~every 10 min) */
         }
         if (++tick >= 25) {                       /* ~5 s heartbeat-expiry check */
             tick = 0;
@@ -1807,10 +1845,17 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     if (micsub) { bsdr_micsub_stop(micsub); micsub = NULL; }
 #endif
     teardown_session(&a);
+    if (app.roomcmd) {   /* stop the room command router before the injector it borrows goes away */
+        bsdr_roomcmd *rcmd = (bsdr_roomcmd *)app.roomcmd;
+        bsdr_mutex_lock(app.lock); app.roomcmd = NULL; bsdr_mutex_unlock(app.lock);
+        bsdr_roomcmd_free(rcmd);
+    }
     if (a.voice) bsdr_voice_free(a.voice);
     if (voice_inj) bsdr_injector_destroy(voice_inj);   /* voice borrows it; we own it */
     if (a.overlay) bsdr_overlay_free(a.overlay);
-    if (ui) bsdr_webui_stop(ui);
+    app.update_stop = 1;   /* let the detached update checker exit its sleep loop */
+    if (ui) bsdr_webui_stop(ui);   /* stop serving before unloading plugins (no more http hook calls) */
+    bsdr_plugins_unload();
     bsdr_discovery_stop(disc);
     bsdr_control_stop(ctl);
     bsdr_app_free(&app);
@@ -1876,7 +1921,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--threed-model-import") == 0 && i + 1 < argc) { int nimp = bsdr_model_import_zip(argv[++i]); fprintf(stderr, "imported %d model(s) from %s\n", nimp < 0 ? 0 : nimp, argv[i]); exit(nimp > 0 ? 0 : 1); }
         else if (strcmp(argv[i], "--replay") == 0 && i + 1 < argc) opt.replay_file = argv[++i];
         else if (strcmp(argv[i], "--quest_ip") == 0 && i + 1 < argc) opt.quest_ip = argv[++i];
-        else if (strcmp(argv[i], "--ui-port") == 0 && i + 1 < argc) opt.webui_port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--web-port") == 0 && i + 1 < argc) opt.webui_port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--web-bind") == 0 && i + 1 < argc) opt.webui_bind = argv[++i];
+        else if (strcmp(argv[i], "--web-allow") == 0 && i + 1 < argc) opt.webui_allow = argv[++i];
         else if (strcmp(argv[i], "--no-ui") == 0) opt.webui_port = 0;
         else if (strcmp(argv[i], "--no-browser") == 0) opt.open_browser = false;
         else if (strcmp(argv[i], "--no-cloud-video") == 0) opt.no_cloud_video = true;
@@ -1889,6 +1936,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--x11") == 0) opt.force_x11 = true;
         else if (strcmp(argv[i], "--wayland") == 0 || strcmp(argv[i], "--pipewire") == 0) opt.force_pipewire = true;
         else if (strcmp(argv[i], "--pw-dmabuf") == 0) opt.pw_dmabuf = true;
+        else if (strcmp(argv[i], "--cloud-rtcp-pli") == 0) opt.cloud_rtcp_pli = true;
         else if (strcmp(argv[i], "--sendmmsg") == 0) opt.use_sendmmsg = true;
         else if (strcmp(argv[i], "--no-sendmmsg") == 0) opt.no_sendmmsg = true;
         else if (strcmp(argv[i], "--no-cloud-audio") == 0) opt.no_cloud_audio = true;
@@ -1960,7 +2008,8 @@ int main(int argc, char **argv) {
 "  --ort-arena-off      EXPERIMENTAL: disable ORT's CPU memory arena on the depth/faceswap models\n"
 "                       (lowers steady RSS while they're idle; output unchanged).\n"
 "  --no-video           Don't stream video (input/control only).\n"
-"  --no-audio           Don't stream desktop audio or expose the headset mic.\n"
+"  --no-audio           Don't stream desktop audio, expose the headset mic, or bring up the\n"
+"                       full-bot's cloud room-mic producer.\n"
 "\n"
 "HEADSET\n"
 "  --quest_ip IP        Only pair with this headset; ignore all others.\n"
@@ -1994,7 +2043,12 @@ int main(int argc, char **argv) {
 "  --confirm-timeout SEC  Auto-cancel the Send/Cancel prompt after this long (default 60).\n"
 "\n"
 "WEB CONTROL PANEL\n"
-"  --ui-port N          Port for the local control panel (default 8088).\n"
+"  --web-port N         Port for the local control panel (default 8088).\n"
+"  --web-bind ADDR      Control-panel listen address (default 127.0.0.1). Use 0.0.0.0 for all\n"
+"                       interfaces or a specific IP to reach the panel from another device.\n"
+"                       Off-loopback is UNAUTHENTICATED — firewall it or put it behind a proxy.\n"
+"  --web-allow HOSTS    Extra Host/Origin values the CSRF guard accepts (comma-separated): a LAN\n"
+"                       IP, or your reverse-proxy hostname. '*' accepts any (behind an auth proxy).\n"
 "  --no-ui              Disable the web control panel.\n"
 "  --no-browser         Don't auto-open the panel in a browser at startup.\n"
 "\n"
@@ -2022,11 +2076,12 @@ int main(int argc, char **argv) {
 "                           superfast) for less CPU/GPU cost at a small quality drop.\n"
 "                           Persisted; the web UI has the same toggle. Applies on\n"
 "                           the next stream (re)start.\n"
-"  --bot-mode MODE          Second-account bot presence: 'audio' (default — REST-join the\n"
-"                           host room to unlock the owner mic when alone; no avatar) or\n"
-"                           'full' (also connect the room data channel and broadcast an\n"
-"                           avatar/pose so the bot is visible). Persisted; the web UI has\n"
-"                           the same toggle.\n"
+"  --bot-mode MODE          Second-account bot presence. 'audio' (default) is the bare\n"
+"                           built-in: REST-join the host room to unlock the owner mic when\n"
+"                           alone; no avatar, no assistant. Other modes are provided by\n"
+"                           plugins — the 'fullbot' plugin adds 'fullbot' (avatar + LLM\n"
+"                           assistant/moderation); legacy 'full' maps to it. Persisted; the\n"
+"                           web UI Presence dropdown lists whatever is available.\n"
 "\n"
 "PERFORMANCE\n"
 "  --cpu                    Force CPU scale + libx264 encode. This is the DEFAULT on\n"
@@ -2065,11 +2120,27 @@ int main(int argc, char **argv) {
 "  single window to share, or enable internet sharing.\n");
             return 0;
         }
+        /* Anything else that still looks like a flag is a typo or a renamed option (--ui-port is now
+         * --web-port). Say so: silently ignoring it starts the agent on the defaults instead, which
+         * reads exactly like the flag was honoured — you only notice when the panel isn't on the port
+         * you asked for. Not fatal, so a bad flag never takes down a working setup. A flag's VALUE is
+         * consumed by its own branch above and never reaches here; a known flag whose value is missing
+         * does, though (its branch needs i+1<argc), hence the two-part wording. */
+        else if (argv[i][0] == '-' && argv[i][1])
+            fprintf(stderr, "bsdr_agent: ignoring '%s' — unknown option, or a known one missing its "
+                            "value (see --help)\n", argv[i]);
     }
 
     signal(SIGINT, on_sigint);
 #ifdef SIGTERM
     signal(SIGTERM, on_sigint);   /* `kill` should also clean up the virtual devices */
+#endif
+#ifdef SIGPIPE
+    /* Never let a broken pipe kill the agent. The web/control servers write responses to sockets a
+     * browser can close mid-send (navigate away, aborted fetch, the store OAuth poll) — send() then
+     * raises SIGPIPE, whose default action is to TERMINATE. Ignore it so send() just returns EPIPE and
+     * bsdr_send_all reports the error normally. (Not defined on Windows, where sockets never raise it.) */
+    signal(SIGPIPE, SIG_IGN);
 #endif
     /* Restore the monitor on a CRASH too (not just Ctrl-C): these terminate the process, but the blank
      * is persistent gamma state, so without this a segfault would leave the screen black. */

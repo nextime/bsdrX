@@ -86,3 +86,11 @@ EOF
 echo ">> bundle -> $OUT/bsdrX-win.zip"
 ( cd "$OUT" && ls -la bsdrX-win.zip )
 rm -rf "$(dirname "$STAGE")"
+
+# ---- 5. loadable plugins (private; NOT inside the bundle) — one .dll zip per plugin --------------
+# The bundle above ships NO plugin; here we cross-build each plugins/<name>/ with the same MinGW
+# toolchain into a Windows .dll and package it on its own. No-op if there's no plugins/ tree.
+SRC="$SRC" OUT="$OUT" VERSION="$VERSION" PLATFORM=windows ARCH=x86_64 \
+  PLUGIN_CC="$WIN_HOST-gcc" PLUGIN_EXT=.dll \
+  ONNX_PREFIX="$([ -f "$WIN_DEPS/include/onnxruntime_c_api.h" ] && echo "$WIN_DEPS")" \
+  bash "$SRC/scripts/build-plugins.sh" || echo ">> WARN: plugin packaging failed (non-fatal)"

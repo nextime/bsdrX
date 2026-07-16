@@ -29,6 +29,8 @@
 #include "bsdr/audio.h"
 #include "bsdr/protocol.h"
 #include "bsdr/roommic.h"
+#include "bsdr/roomcmd.h"
+#include "bsdr/botsense.h"
 #include "bsdr/platform.h"
 
 #if defined(BSDR_PLATFORM_ANDROID)
@@ -80,7 +82,7 @@ static void botaudio_thread(void *arg) {
     bsdr_audio_player *play = NULL; int rm_sink = -1, rm_src = -1, dev_up = 0;
 #endif
     uint8_t buf[2048];
-    uint64_t next_play = bsdr_now_ms(), last_ka = next_play;
+    uint64_t next_play = bsdr_now_ms(), last_ka = next_play, now_pol = 0;
     while (!b->stop) {
         int want_dev = b->app && b->app->room_mic_want;
 #if !defined(BSDR_PLATFORM_ANDROID)
@@ -97,9 +99,35 @@ static void botaudio_thread(void *arg) {
         }
         ctx.play = play;
 #endif
-        /* Live solo: "listen only to me" mutes every SSRC but the room owner's. */
-        int solo = b->app && b->app->bot_solo_owner && b->owner_ssrc;
-        bsdr_audio_recv_set_solo(rx, solo ? b->owner_ssrc : 0);
+        /* Per-speaker volume policy (owner loud, host/friend lower, strangers silenced, mic-check
+         * target audible). Recomputed a few times a second — cheap and the roster changes rarely.
+         * When no policy can be resolved (empty roster / owner not identifiable), fall back to the
+         * legacy "listen only to me" solo so we never accidentally silence the whole room. */
+        if (now_pol == 0 || bsdr_now_ms() - now_pol >= 300) {
+            now_pol = bsdr_now_ms();
+            uint32_t psr[BSDR_ROSTER_MAX]; float pgn[BSDR_ROSTER_MAX], pdf = 0.0f;
+            /* A plugin bot (fullbot) may own the per-speaker policy; else the core default. */
+            int pm = bsdr_app_apply_gain_policy(b->app, psr, pgn, BSDR_ROSTER_MAX, &pdf);
+            if (pm < 0) {
+                bsdr_audio_recv_clear_gains(rx);
+                int solo = b->app && b->app->bot_solo_owner && b->owner_ssrc;
+                bsdr_audio_recv_set_solo(rx, solo ? b->owner_ssrc : 0);
+            } else {
+                bsdr_audio_recv_set_solo(rx, 0);                 /* gains handle isolation now */
+                for (int i = 0; i < pm; i++) bsdr_audio_recv_set_gain(rx, psr[i], pgn[i]);
+                bsdr_audio_recv_set_gain_default(rx, pdf);
+            }
+            /* Feed each audible speaker's PCM to whoever owns the bot's hearing. If a PLUGIN subscribed
+             * (host->utterance_subscribe), route to its utterance segmenter and BYPASS the in-core
+             * router — the plugin bot fully replaces it. Otherwise, the in-core command router. */
+            if (b->app && bsdr_app_botsense_active(b->app)) {
+                bsdr_audio_recv_set_tap(rx, bsdr_botsense_tap, b->app->botsense);
+            } else {
+                void *rcmd = b->app ? b->app->roomcmd : NULL;
+                bsdr_audio_recv_set_tap(rx, rcmd ? bsdr_roomcmd_tap : NULL, rcmd);
+                if (rcmd) bsdr_roomcmd_set_owner_ssrc((bsdr_roomcmd *)rcmd, bsdr_app_owner_ssrc(b->app));
+            }
+        }
 
         int n = bsdr_udp_recv(&udp, buf, sizeof buf, 5);
         if (n > 0) bsdr_audio_recv_feed(rx, buf, n);

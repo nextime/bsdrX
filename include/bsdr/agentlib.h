@@ -63,6 +63,7 @@ typedef struct {
     bool force_x11;               /* --x11: force x11grab (never the Wayland portal) */
     bool force_pipewire;          /* --wayland/--pipewire: force the portal + PipeWire capture */
     bool pw_dmabuf;               /* --pw-dmabuf (experimental): zero-copy PipeWire dmabuf -> VAAPI */
+    bool cloud_rtcp_pli;          /* --cloud-rtcp-pli: read RTCP on the cloud video socket + force IDR on PLI/FIR */
     bool use_sendmmsg;            /* --sendmmsg: batch LAN video fragments into one syscall (Linux; on by default) */
     bool no_sendmmsg;             /* --no-sendmmsg: force the per-datagram send path (disable batching) */
     bool no_cloud_audio;          /* --no-cloud-audio: disable relay audio (default: ON, Opus + 8B trailer) */
@@ -87,6 +88,9 @@ typedef struct {
     int  x264_threads;            /* --x264-threads N (opt-in P6.9): N x264 frame threads on live --cpu */
     bool ort_arena_off;           /* --ort-arena-off (experimental P4.6): disable ORT CPU mem arena (lower RSS) */
     int webui_port;          /* local control UI port; 0 = no UI */
+    const char *webui_bind;  /* --web-bind: control UI listen address (NULL/"" = 127.0.0.1 loopback) */
+    const char *webui_allow; /* --web-allow: extra Host/Origin values the CSRF guard accepts (comma
+                              * list; "*" = any, for use behind an authenticating reverse proxy) */
     bool open_browser;       /* auto-open the control UI (desktop only) */
     bsdr_pairing_cb on_pairing_code;
     void *user;

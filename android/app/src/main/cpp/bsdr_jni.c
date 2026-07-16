@@ -30,8 +30,7 @@
 
 #include "bsdr/agentlib.h"
 #include "bsdr/log.h"
-#include "bsdr/depth.h"
-#include "bsdr/faceswap.h"
+#include "bsdr/mediafx.h"       /* the 2d-3d plugin's depth service + the faceswap RGB interface */
 #include "bsdr_android.h"
 
 static JavaVM       *g_vm;
@@ -304,66 +303,40 @@ JNIEXPORT void JNICALL NB(nativePublishCameras)(JNIEnv *env, jobject thiz,
     bsdr_android_set_cameras(devs, n);
 }
 
-/* ---- in-process neural depth (NNAPI): the Kotlin GL pipeline reads back a small grayscale frame
- * and calls this to fill a depth grid the SBS shader samples. A single persistent engine is kept,
- * reopened when the tier changes. Returns TRUE if `out` was filled (w*h floats, 0..1, near=1). */
-static bsdr_depth *g_depth;
-static int         g_depth_tier;
-static pthread_mutex_t g_depth_lock = PTHREAD_MUTEX_INITIALIZER;
-
+/* ---- in-process neural depth (NNAPI): the Kotlin GL pipeline reads back a small grayscale frame and
+ * calls this to fill a depth grid the SBS shader samples. The depth engine lives in the CLOSED 2d-3d
+ * plugin (not compiled into the APK), so this routes to the plugin's depth service. Returns TRUE if the
+ * plugin filled `out`; FALSE (no plugin installed) -> the Kotlin GL side uses its own depth heuristic. */
 JNIEXPORT jboolean JNICALL NB(nativeDepth)(JNIEnv *env, jobject thiz,
                                            jint tier, jbyteArray gray, jint w, jint h, jfloatArray out) {
     (void)thiz;
     if (tier <= 0 || w <= 0 || h <= 0) return JNI_FALSE;
     if ((jint)((*env)->GetArrayLength(env, gray)) < w * h) return JNI_FALSE;
     if ((jint)((*env)->GetArrayLength(env, out))  < w * h) return JNI_FALSE;
+    if (!bsdr_mediafx_depth_active()) return JNI_FALSE;   /* 2d-3d plugin not installed -> GL heuristic */
 
     jboolean ok = JNI_FALSE;
-    pthread_mutex_lock(&g_depth_lock);
-    if (!g_depth || g_depth_tier != tier) {
-        if (g_depth) { bsdr_depth_close(g_depth); g_depth = NULL; }
-        g_depth = bsdr_depth_open((bsdr_depth_tier)tier);
-        g_depth_tier = tier;
-        if (g_depth) BSDR_INFO("bsdr.jni", "depth engine: %s", bsdr_depth_status(g_depth));
-        else BSDR_WARN("bsdr.jni", "depth engine open failed (tier=%d) — model missing? falling back to GL heuristic", tier);
-    }
-    if (g_depth) {
-        jbyte  *g = (*env)->GetByteArrayElements(env, gray, NULL);
-        jfloat *o = (*env)->GetFloatArrayElements(env, out, NULL);
-        if (g && o && bsdr_depth_infer(g_depth, (const uint8_t *)g, w, h, (float *)o) == 0) ok = JNI_TRUE;
-        if (o) (*env)->ReleaseFloatArrayElements(env, out, o, ok ? 0 : JNI_ABORT);
-        if (g) (*env)->ReleaseByteArrayElements(env, gray, g, JNI_ABORT);
-    }
-    pthread_mutex_unlock(&g_depth_lock);
+    jbyte  *g = (*env)->GetByteArrayElements(env, gray, NULL);
+    jfloat *o = (*env)->GetFloatArrayElements(env, out, NULL);
+    if (g && o)
+        ok = bsdr_mediafx_apply_depth(tier, (const uint8_t *)g, w, h, (float *)o) ? JNI_TRUE : JNI_FALSE;
+    if (o) (*env)->ReleaseFloatArrayElements(env, out, o, ok ? 0 : JNI_ABORT);
+    if (g) (*env)->ReleaseByteArrayElements(env, gray, g, JNI_ABORT);
     return ok;
 }
 
-/* ---- face swap (GL readback -> C ONNX swap -> re-upload). One engine, guarded. ---------------- */
-static bsdr_faceswap *g_fs;
-static int            g_fs_tier;
-static pthread_mutex_t g_fs_lock = PTHREAD_MUTEX_INITIALIZER;
+/* ---- face swap (GL readback -> plugin ONNX swap -> re-upload) --------------------------------------
+ * The face-swap ENGINE is the faceswap plugin (not compiled into the APK); these route to the plugin's
+ * packed-RGB interface (bsdr_mediafx_face_*), which reads its config from bsdr_app (the in-app WebView)
+ * and its models from the shared store. When the plugin isn't installed the calls no-op and the GL
+ * pipeline uploads the untouched frame. */
 
-/* Open/close the engine to match `on`. `dir` = the faceswap model dir; tier picks CPU/GPU(NNAPI).
- * Returns true if the engine is loaded (still needs a source image before it swaps anything). */
+/* Reports whether the face-swap plugin is loaded (Kotlin gates the GL readback on this). `dir`/`tier`
+ * are legacy args the plugin no longer needs — it uses bsdr_app config + the shared model dir. */
 JNIEXPORT jboolean JNICALL NB(nativeFaceswapConfig)(JNIEnv *env, jobject thiz,
                                                     jboolean on, jstring dir, jint tier) {
-    (void)thiz;
-    jboolean ok = JNI_FALSE;
-    pthread_mutex_lock(&g_fs_lock);
-    if (!on) {
-        if (g_fs) { bsdr_faceswap_close(g_fs); g_fs = NULL; }
-    } else if (!g_fs || g_fs_tier != tier) {
-        if (g_fs) { bsdr_faceswap_close(g_fs); g_fs = NULL; }
-        const char *d = dir ? (*env)->GetStringUTFChars(env, dir, NULL) : NULL;
-        g_fs = bsdr_faceswap_open(d ? d : "", tier >= 2);
-        g_fs_tier = tier;
-        if (d) (*env)->ReleaseStringUTFChars(env, dir, d);
-        if (g_fs) BSDR_INFO("bsdr.jni", "faceswap engine: %s", bsdr_faceswap_status(g_fs));
-        else BSDR_WARN("bsdr.jni", "faceswap engine open failed (models missing?)");
-    }
-    ok = g_fs != NULL;
-    pthread_mutex_unlock(&g_fs_lock);
-    return ok;
+    (void)env; (void)thiz; (void)on; (void)dir; (void)tier;
+    return bsdr_mediafx_face_active() ? JNI_TRUE : JNI_FALSE;
 }
 
 /* Set the identity to paste from a packed-RGB source image (decoded in Kotlin). */
@@ -371,14 +344,13 @@ JNIEXPORT jboolean JNICALL NB(nativeFaceswapSource)(JNIEnv *env, jobject thiz,
                                                     jbyteArray rgb, jint w, jint h) {
     (void)thiz;
     if (w <= 0 || h <= 0 || (jint)((*env)->GetArrayLength(env, rgb)) < w*h*3) return JNI_FALSE;
+    if (!bsdr_mediafx_face_active()) return JNI_FALSE;
     jboolean ok = JNI_FALSE;
-    pthread_mutex_lock(&g_fs_lock);
-    if (g_fs) {
-        jbyte *p = (*env)->GetByteArrayElements(env, rgb, NULL);
-        if (p && bsdr_faceswap_set_source_rgb(g_fs, (const uint8_t *)p, w, h) == 0) ok = JNI_TRUE;
-        if (p) (*env)->ReleaseByteArrayElements(env, rgb, p, JNI_ABORT);
+    jbyte *p = (*env)->GetByteArrayElements(env, rgb, NULL);
+    if (p) {
+        ok = (bsdr_mediafx_face_set_source((const uint8_t *)p, w, h) == 0) ? JNI_TRUE : JNI_FALSE;
+        (*env)->ReleaseByteArrayElements(env, rgb, p, JNI_ABORT);
     }
-    pthread_mutex_unlock(&g_fs_lock);
     return ok;
 }
 
@@ -388,14 +360,13 @@ JNIEXPORT jint JNICALL NB(nativeFaceswapProcess)(JNIEnv *env, jobject thiz,
                                                  jbyteArray rgb, jint w, jint h) {
     (void)thiz;
     if (w <= 0 || h <= 0 || (jint)((*env)->GetArrayLength(env, rgb)) < w*h*3) return -1;
+    if (!bsdr_mediafx_face_active()) return -1;
     int n = -1;
-    pthread_mutex_lock(&g_fs_lock);
-    if (g_fs && bsdr_faceswap_ready(g_fs)) {
-        jbyte *p = (*env)->GetByteArrayElements(env, rgb, NULL);
-        if (p) { n = bsdr_faceswap_process_rgb(g_fs, (uint8_t *)p, w, h);
-                 (*env)->ReleaseByteArrayElements(env, rgb, p, n > 0 ? 0 : JNI_ABORT); }
+    jbyte *p = (*env)->GetByteArrayElements(env, rgb, NULL);
+    if (p) {
+        n = bsdr_mediafx_face_process((uint8_t *)p, w, h);
+        (*env)->ReleaseByteArrayElements(env, rgb, p, n > 0 ? 0 : JNI_ABORT);   /* commit only if swapped */
     }
-    pthread_mutex_unlock(&g_fs_lock);
     return n;
 }
 

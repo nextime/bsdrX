@@ -31,6 +31,7 @@
 struct bsdr_botroom {
     bsdr_thread *th;
     volatile int stop;
+    volatile int avatar_state;   /* bsdr_avatar_state — live, polled by the UI */
     char ip[64];
     int  data_port;
     char user_id[160];   /* the room legacyUserId ("userNNN") — data-channel prefix + UserState.userId */
@@ -82,10 +83,12 @@ static void botroom_thread(void *arg) {
     }
     bsdr_sctp *sctp = associate(b, &udp);
     if (!sctp) {
+        b->avatar_state = BSDR_AVATAR_GHOST;
         BSDR_WARN("bsdr.botroom", "avatar: SCTP did not associate; the bot stays a userlist ghost");
         bsdr_udp_close(&udp);
         return;
     }
+    b->avatar_state = BSDR_AVATAR_UP;
     BSDR_INFO("bsdr.botroom", "avatar: associated; broadcasting UserState + pose for %s", b->user_id);
 
     /* 1) UserState once — identity + seat, wearing_hmd/showing_head so the avatar renders. */
@@ -110,9 +113,11 @@ static void botroom_thread(void *arg) {
         bsdr_sctp_handle_timers((uint32_t)(now - last)); last = now;
         if (bsdr_sctp_failed(sctp)) {                 /* lost the assoc -> reassociate */
             BSDR_WARN("bsdr.botroom", "avatar: association lost; reconnecting");
+            b->avatar_state = BSDR_AVATAR_CONNECTING;
             bsdr_sctp_free(sctp);
             sctp = associate(b, &udp);
-            if (!sctp) break;
+            if (!sctp) { b->avatar_state = BSDR_AVATAR_GHOST; break; }
+            b->avatar_state = BSDR_AVATAR_UP;
             if (roomstate_user_state(&msg, &mlen, b->user_id, 0, b->seat) == 0) {
                 bsdr_sctp_send_room(sctp, (const uint8_t *)msg, mlen); free(msg);
             }
@@ -146,9 +151,14 @@ bsdr_botroom *bsdr_botroom_start(const char *relay_ip, int data_port,
     b->data_port = data_port;
     snprintf(b->user_id, sizeof b->user_id, "%s", legacy_user_id ? legacy_user_id : "");
     b->seat = seat_index;
+    b->avatar_state = BSDR_AVATAR_CONNECTING;   /* until the thread associates or gives up */
     b->th = bsdr_thread_start(botroom_thread, b);
     if (!b->th) { free(b); return NULL; }
     return b;
+}
+
+bsdr_avatar_state bsdr_botroom_avatar_state(const bsdr_botroom *b) {
+    return b ? (bsdr_avatar_state)b->avatar_state : BSDR_AVATAR_OFF;
 }
 
 void bsdr_botroom_stop(bsdr_botroom *b) {
@@ -167,5 +177,6 @@ bsdr_botroom *bsdr_botroom_start(const char *relay_ip, int data_port,
     return NULL;
 }
 void bsdr_botroom_stop(bsdr_botroom *b) { (void)b; }
+bsdr_avatar_state bsdr_botroom_avatar_state(const bsdr_botroom *b) { (void)b; return BSDR_AVATAR_OFF; }
 
 #endif

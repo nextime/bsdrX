@@ -24,7 +24,18 @@
 
 typedef struct bsdr_webui bsdr_webui;
 
-bsdr_webui *bsdr_webui_start(bsdr_app *app, uint16_t port);
+/* Start the control panel. bind_addr = the listen address (NULL/"" => "127.0.0.1", loopback only;
+ * "0.0.0.0" = all interfaces; or a specific IP). allow_hosts = comma-separated extra Host/Origin
+ * values the CSRF guard should accept beyond loopback (a LAN IP, or the nginx server_name when behind
+ * a reverse proxy); "*" accepts any Host/Origin (trust the proxy / your network). NULL/"" => loopback
+ * only, unchanged. Binding off-loopback exposes an UNAUTHENTICATED panel — put it behind a proxy that
+ * adds auth, or a firewall. */
+bsdr_webui *bsdr_webui_start(bsdr_app *app, uint16_t port, const char *bind_addr, const char *allow_hosts);
 void bsdr_webui_stop(bsdr_webui *w);
+
+/* HTTP reply helper handed to loadable plugins (see bsdr/plugin.h). `conn` is the opaque handle the
+ * plugin received in its http() hook; it points at the live request socket. Not for general use. */
+#include <stddef.h>
+void bsdr_webui_plugin_respond(void *conn, int code, const char *ctype, const char *body, size_t len);
 
 #endif /* BSDR_WEBUI_H */

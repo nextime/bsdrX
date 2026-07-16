@@ -187,6 +187,8 @@ int roomstate_decode(const void *frame_in, size_t len, rs_decoded *out) {
                 }
                 out->area_index = ns(UserState_area_index)(us);
                 out->seat_index = ns(UserState_seat_index)(us);
+                ns(AvatarState_table_t) av = ns(UserState_avatar)(us);   /* nested Avatar (mandatory) */
+                if (av) out->body_type_index = ns(AvatarState_body_type_index)(av);
             }
             free(fb);
         }
@@ -198,6 +200,15 @@ int roomstate_decode(const void *frame_in, size_t len, rs_decoded *out) {
         memcpy(&out->head.rot[0], body + 0x10, 4); memcpy(&out->head.rot[1], body + 0x14, 4);
         memcpy(&out->head.rot[2], body + 0x18, 4); memcpy(&out->head.rot[3], body + 0x1C, 4);
         out->has_head = 1;
+        /* Hands (HandState @0x20 left / @0x64 right): showingHand@+0, pose.pos@+0x14, pose.rot@+0x20;
+         * eye gaze irisOffset(Vector2)@0xA8. (Struct offsets from the decompiled HandState/PoseState.) */
+        if (body_len >= 0xB0) {
+            out->has_left  = body[0x20] != 0;
+            memcpy(out->left_hand.pos, body + 0x34, 12);  memcpy(out->left_hand.rot, body + 0x40, 16);
+            out->has_right = body[0x64] != 0;
+            memcpy(out->right_hand.pos, body + 0x78, 12); memcpy(out->right_hand.rot, body + 0x84, 16);
+            memcpy(out->iris, body + 0xA8, 8);
+        }
     }
     free(raw);
     return rc;

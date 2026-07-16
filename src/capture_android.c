@@ -60,6 +60,10 @@ static size_t   g_cfg_len;
 static int g_want_w, g_want_h, g_want_fps, g_want_br;
 static int g_want_gen, g_want_seen;
 
+/* keyframe (IDR) request, published to the JNI bridge: a new consumer joining bumps the generation,
+ * and Kotlin asks MediaCodec for a sync frame (PARAMETER_KEY_REQUEST_SYNC_FRAME) on the next edge. */
+static int g_keyframe_gen, g_keyframe_seen;
+
 /* 2D->3D config, published to the JNI bridge (the Kotlin GL pipeline applies SBS on the
  * MediaProjection frame before MediaCodec, since C never sees a raw frame here). */
 static int g_td_mode, g_td_deep, g_td_conv, g_td_swap, g_td_full, g_td_tier;
@@ -106,27 +110,15 @@ void bsdr_capture_set_overlay(bsdr_capture *c, struct bsdr_overlay *ov) {
     (void)c; (void)ov;   /* overlay deferred on Android (web UI is the control surface) */
 }
 
-/* Face swap on Android runs in the Kotlin GL path (not this C capture); accept + no-op so the shared
- * agent links. Image decode needs ffmpeg (absent on Android) -> unavailable. */
-void bsdr_capture_set_faceswap(bsdr_capture *c, struct bsdr_faceswap *fs) { (void)c; (void)fs; }
+/* Face swap on Android runs in the Kotlin GL path (not this C capture / the desktop plugin). Image
+ * decode needs ffmpeg (absent on Android) -> unavailable. */
 int bsdr_capture_decode_image_rgb(const char *p, uint8_t **rgb, int *w, int *h) {
     (void)p; (void)rgb; (void)w; (void)h; return -1;
 }
 
-/* 2D->3D can't be applied here: Android capture hands us frames that MediaCodec already ENCODED on
- * the GPU (no raw NV12 in C). The SBS transform would have to run in the Kotlin MediaProjection ->
- * GL -> encoder-input-surface path. We accept and free the object so the shared agent links and the
- * web UI's 3D controls stay in sync; the transform is simply not applied on this build. */
-void bsdr_capture_set_threed(bsdr_capture *c, struct bsdr_threed *t) {
-    (void)c;
-    if (t) {
-        static int warned = 0;
-        if (!warned) { warned = 1;
-            BSDR_WARN("bsdr.capture", "2D->3D not applied on Android (HW-encoded frames); "
-                      "SBS must be done in the MediaCodec/GL pipeline"); }
-        bsdr_threed_close(t);
-    }
-}
+/* 2D->3D isn't applied in this C capture on Android (frames are HW-encoded; SBS runs in the Kotlin
+ * MediaProjection -> GL pipeline). The engine moved to the 2d-3d plugin; the JNI drives depth directly
+ * (see bsdr_jni.c). No capture-side threed hook is needed here. */
 
 void bsdr_android_push_video(const uint8_t *au, size_t len, int64_t pts_us, int is_config) {
     if (!au || !len || !g_lock) return;
@@ -295,6 +287,28 @@ int bsdr_android_capture_want(int *width, int *height, int *fps, int *bitrate) {
         if (bitrate) *bitrate = g_want_br;
         changed = 1;
     }
+    bsdr_mutex_unlock(g_lock);
+    return changed;
+}
+
+/* Request a keyframe on the next encoded frame. On Android the encoder is Kotlin's MediaCodec, so we
+ * just publish an edge the JNI bridge polls (bsdr_android_poll_keyframe); MediaCodec's periodic IDR
+ * covers consumers until Kotlin wires the explicit sync-frame request. */
+void bsdr_capture_force_keyframe(bsdr_capture *c) {
+    (void)c;
+    if (!g_lock) return;
+    bsdr_mutex_lock(g_lock);
+    g_keyframe_gen++;
+    bsdr_mutex_unlock(g_lock);
+}
+
+/* JNI bridge: returns 1 once after each force_keyframe() so Kotlin can ask MediaCodec for a sync
+ * frame (edge-triggered, same pattern as bsdr_android_capture_want). */
+int bsdr_android_poll_keyframe(void) {
+    if (!g_lock) return 0;
+    int changed = 0;
+    bsdr_mutex_lock(g_lock);
+    if (g_keyframe_gen != g_keyframe_seen) { g_keyframe_seen = g_keyframe_gen; changed = 1; }
     bsdr_mutex_unlock(g_lock);
     return changed;
 }

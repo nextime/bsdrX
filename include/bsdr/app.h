@@ -20,6 +20,10 @@
 #define BSDR_APP_H
 
 #include "bsdr/platform.h"
+#include "bsdr/plugin.h"   /* bsdr_utterance_cb — host->utterance_subscribe delivery type */
+#include "bsdr/tts.h"
+#include "bsdr/acl.h"
+#include "bsdr/roster.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -51,10 +55,23 @@ typedef struct bsdr_app {
     char bot_refresh_token[2048];
     char bot_room_id[128];        /* the room the bot last joined (status only) */
     char bot_social_id[80];       /* the bot account's socialId (for the host to invite it) */
+    char bot_session_id[200];     /* the bot's own userSessionId in the joined room (from GET /room
+                                   * localUser); marks the bot's own entry/SSRC in the roster */
     bool bot_joined;
     bool bot_stopped;             /* user hit "Stop": WS/room presence down but the login is remembered */
     void *bot_ws;                 /* bsdr_cloud_ws* presence handle for the bot account */
-    char bot_mode[8];             /* "audio" (REST join only, owner-mic unlock) | "full" (avatar) */
+    char bot_mode[16];            /* selected bot presence mode: built-in "audio" (bare join + room audio,
+                                   * no avatar/brain) or a plugin-registered mode name (e.g. "fullbot"). */
+    bool avatar_enabled;          /* the avatar actuator is on — set by the active plugin mode, NOT by a
+                                   * mode string; gates the join-path botroom bring-up. */
+    struct bsdr_bot_mode_reg {    /* bot modes a plugin added via host->bot_mode_register */
+        char name[16];
+        bsdr_bot_mode_cb cb;      /* on_active(1/0); called on select/leave/unload */
+        void *user;
+    } bot_modes[8];
+    int  bot_modes_n;
+    bsdr_gain_policy_fn gain_policy_fn;   /* plugin-owned per-speaker audio-gain policy; NULL = core default */
+    void *gain_policy_user;
     void *bot_room;               /* bsdr_botroom* avatar presence handle (full mode); NULL otherwise */
     bool bot_follow;              /* follow-me: re-join whatever room the operator moves into */
     bool bot_loopback;            /* cloud-mic loopback: route the bot's room audio -> BSDR_RoomMic
@@ -62,6 +79,50 @@ typedef struct bsdr_app {
     bool bot_solo_owner;          /* "listen only to me": solo the room owner's SSRC in the loopback */
     volatile int bot_roommic_active; /* set while the bot owns BSDR_RoomMic (cloud_mic_main defers) */
     void *bot_audio;              /* bsdr_botaudio* loopback handle; NULL otherwise */
+    void *bot_mic;                /* bsdr_botmic* room-mic producer (bot -> cloud); NULL otherwise */
+    uint64_t bot_token_ms;        /* bsdr_now_ms() when the bot access token was last issued/renewed
+                                   * (0 = unknown). Drives proactive renewal before the ~15 min expiry. */
+    volatile int lan_await_device;/* set on /start: the desktop stream should wait briefly for the
+                                   * headset's first PUT /device (its resolution) before the first frame,
+                                   * so we don't stream 720p then rebuild to 1080 (that mid-stream
+                                   * resolution change can crash the Quest compositor). Cleared by /device. */
+    /* Tiered voice access-control (owner ▸ host ▸ friend) + the last-known room participant roster.
+     * The roster is refreshed on join / room-data pushes and read by the audio-volume policy and the
+     * per-speaker command router; guarded by a->lock. See bsdr/acl.h, bsdr/roster.h. */
+    bsdr_acl   *acl;
+    bsdr_roster roster;
+    void       *roomcmd;          /* bsdr_roomcmd* per-speaker command router (created by the agent) */
+    void       *input_inj;        /* bsdr_injector* for the plugin input host services (type/click/keys),
+                                   * lazily created on first use */
+    void       *botsense;         /* bsdr_botsense* utterance segmenter for a bot PLUGIN; NULL unless a
+                                   * plugin subscribed via host->utterance_subscribe (then the in-core
+                                   * roomcmd is bypassed — see botaudio's tap handoff) */
+    uint32_t    mic_check_ssrc;   /* while a mic check runs: the target's SSRC is kept audible (gain 1)
+                                   * even though strangers are otherwise silenced. 0 = no mic check. */
+    bool        mic_check_auto;   /* auto age-verify unknown people who join the moderated room */
+    /* No personality here. The core bot never speaks conversationally: it only listens for the owner's
+     * balloon commands. The one personality belongs to the fullbot plugin ("personality" in its config). */
+    bool        browser_ctl_enabled;   /* owner-only browser control via CDP (default OFF) */
+    char        cdp_endpoint[256];     /* Chrome DevTools endpoint, e.g. http://127.0.0.1:9222 */
+    /* Background release-update check (bigscreen.nexlab.net). Set by the checker thread. */
+    bool        update_available;      /* a strictly-newer release than BSDR_VERSION was published */
+    char        update_latest[32];     /* that newer version string (for the web UI banner) */
+    volatile int update_stop;          /* shutdown flag for the checker loop */
+    /* On-demand keyframe (IDR) request: bumped when a new cloud consumer needs a fresh keyframe (a
+     * joiner appears in the roster, or an opt-in RTCP PLI arrives). Each encode loop (LAN + decoupled
+     * cloud) tracks the generation it last served, so one request forces an IDR in every active
+     * encoder without a shared test-and-clear race. */
+    volatile unsigned keyframe_gen;
+    bool        cloud_rtcp_pli;        /* opt-in: read RTCP on the cloud video socket + force IDR on PLI/FIR */
+    int         roster_prev_n;         /* participant count at the last roster refresh (detect a new joiner) */
+    float       gain_owner;       /* volume policy: owner speaker gain (default 1.0) */
+    float       gain_guest;       /* volume policy: host/friend speaker gain (default 0.7, < owner) */
+    int         overload_threshold; /* >this many queued room commands => owner-only until drained (default 3) */
+    char stay_with[64];           /* owner ordered the bot to stay + moderate this user's room even
+                                   * after the owner leaves (until told to leave). Empty = off. */
+    char web_search_endpoint[256];/* optional web-search API for the public web_search tool (the query
+                                   * is URL-appended); empty = web search disabled. */
+    char web_search_token[256];   /* bearer token for the search endpoint, if it needs one */
     char bot_audio_ip[64];        /* bot's room-audio relay + port + the room owner's session id, */
     int  bot_audio_port;          /* captured at join so the loopback toggle can (re)start without a */
     char bot_owner_sid[200];      /* re-join (owner sid drives the "listen only to me" solo) */
@@ -141,6 +202,8 @@ typedef struct bsdr_app {
      * (loudest speaker) only while a command is captured. See cloud_stream.c / audio.c. */
     bool cloud_mic_fallback;
     bool owner_mic_local;         /* use THIS machine's microphone as the owner mic (no sniff/relay) */
+    bool owner_mic_to_questmic;   /* render the owner voice into the BSDR_QuestMic device (default OFF;
+                                   * the STT/computer-control tap is unaffected either way) */
     volatile int cloud_mic_duck;  /* armed by the agent while a voice command is being captured */
     void (*room_pcm_cb)(void *user, const int16_t *pcm, int frames, int channels);
     void *room_pcm_user;          /* set-user-before-cb; cloud thread reads without a lock */
@@ -156,6 +219,12 @@ typedef struct bsdr_app {
     /* voice assistant config (STT + LLM endpoints) */
     char stt_endpoint[256], stt_token[256], stt_model[64];
     char llm_endpoint[256], llm_token[256], llm_model[64];
+    /* LLM context-window management for long agentic (e.g. coding) sessions. */
+    int  llm_context_tokens;      /* user override for the window size; 0 = auto (detect, else 32768) */
+    int  llm_context_detected;    /* cached window detected from the endpoint (/models); 0 = unknown */
+    int  llm_compact_pct;         /* compact once the conversation passes this % of the window; <0 = off */
+    int  llm_compact_strategy;    /* BSDR_COMPACT_* (0 truncate / 1 summary / 2 hybrid) */
+    int  llm_max_rounds;          /* tool-call rounds cap (0 = default 24) */
 
     /* computer control (voice -> STT -> LLM tools). Enableable only while the
      * owner-mic sniffer/MITM is active (that's the only source of the owner's
@@ -182,6 +251,19 @@ typedef struct bsdr_app {
     int  sniff_wifi;              /* cached: is the default capture NIC Wi-Fi? -1 unknown, 0 no, 1 yes
                                    * (drives the UI's MITM-over-Wi-Fi cancel/continue prompt) */
     bool room_mic_want;           /* expose the cloud room's voice mix as a virtual mic "BSDR_RoomMic" */
+    /* Text-to-speech for the computer-control "speak" tool (see tts.h). */
+    bsdr_tts_config tts;          /* engine + local/cloud params */
+    bool tts_enabled;             /* master: the LLM may speak */
+    int  tts_route;               /* 0 = bot -> cloud room mic (default); 1 = desktop audio -> Quest */
+    /* Serialized, non-blocking speak pipeline: bsdr_app_tts_say() enqueues text and returns at once;
+     * a single worker thread synthesizes + paces ONE utterance at a time into the room mic (route 0)
+     * or desktop audio (route 1), so utterances never overlap/interleave. Guarded by a->lock, woken by
+     * tts_cv; the worker is lazily started on the first say and joined in bsdr_app_free. */
+    void      *tts_worker;        /* bsdr_thread* (NULL until first say) */
+    bsdr_cond *tts_cv;            /* wakes the worker when the queue is non-empty or on teardown */
+    void      *tts_q_head, *tts_q_tail;  /* struct tts_utt* FIFO of pending utterances */
+    int        tts_q_len;         /* queue depth (bounded; oldest dropped when backed up) */
+    bool       tts_stop;          /* teardown: worker aborts the current utterance and exits */
     /* realtime voice change on the Quest mic: master on/off, gender -100..100 (0 = off); and, in
      * MITM/relay mode, substitute = stop the Quest->cloud voice and inject the changed audio. */
     bool voice_fx_on;             /* master enable for the voice changer (sliders ignored when off) */
@@ -256,9 +338,21 @@ void bsdr_app_set_threed(bsdr_app *a, int mode, int deepness, int convergence, i
                          int tier, const char *ai_cmd);
 void bsdr_app_get_threed(bsdr_app *a, int *mode, int *deepness, int *convergence, int *swap,
                          int *full, int *tier, char *ai_cmd, size_t ai_len);
+/* Force a running live session to close+reopen its capture (bumps threed_gen). Used when a plugin
+ * registers/clears a dim-changing video-source transform so the encoder is re-sized from the hook. */
+void bsdr_app_recapture(bsdr_app *a);
 void bsdr_app_set_cloud_mic_fallback(bsdr_app *a, bool on);
 void bsdr_app_set_owner_mic_local(bsdr_app *a, bool on);
+void bsdr_app_set_owner_mic_to_questmic(bsdr_app *a, bool on);
 void bsdr_app_set_relay_port(bsdr_app *a, int port);
+
+/* TTS: update the config (engine + params), master enable, and route (0=cloud room, 1=desktop). */
+void bsdr_app_set_tts(bsdr_app *a, const bsdr_tts_config *cfg, bool enabled, int route);
+/* Synthesize `text` and route it (cloud room mic or desktop audio). Blocks for the speech duration;
+ * called from the voice/compctl thread. No-op if TTS is disabled. */
+void bsdr_app_tts_say(bsdr_app *a, const char *text);
+/* Thread-safe push of one PCM frame into the bot's room-mic producer (NULL-safe; used by TTS). */
+int  bsdr_app_botmic_push(bsdr_app *a, const int16_t *pcm, int frames);
 int  bsdr_app_get_relay_port(bsdr_app *a);
 /* expose the cloud room's voice mix as a virtual mic "BSDR_RoomMic" (needs an active cloud session) */
 void bsdr_app_set_room_mic(bsdr_app *a, bool on);
@@ -313,8 +407,29 @@ void bsdr_app_bot_stop(bsdr_app *a);
 void bsdr_app_bot_start(bsdr_app *a);
 /* Set the bot presence mode: "audio" (REST join only) or "full" (avatar). Persisted. */
 void bsdr_app_bot_set_mode(bsdr_app *a, const char *mode);
+/* Bot-mode registry: a plugin adds a selectable presence mode (name + activation callback); the core
+ * always offers built-in "audio". set() switches (firing the old mode's cb(0) then the new mode's cb(1));
+ * get() copies the current name; modes_json() lists ["audio", …] for the web UI; clear_plugin_modes()
+ * drops plugin modes (deactivating the active one) at unload. set_avatar_enabled() toggles the avatar
+ * actuator (a plugin mode calls it on activate). */
+void bsdr_app_bot_mode_register(bsdr_app *a, const char *name, bsdr_bot_mode_cb cb, void *user);
+void bsdr_app_bot_mode_get(bsdr_app *a, char *out, size_t cap);
+int  bsdr_app_has_plugin_bot(bsdr_app *a);   /* a plugin registered a bot mode => core stays bare */
+/* Plugin input host services (computer-control): drive the desktop via a lazily-created injector. */
+void bsdr_app_input_type(bsdr_app *a, const char *text);
+void bsdr_app_input_key(bsdr_app *a, const char *keys);
+void bsdr_app_input_click(bsdr_app *a, double x, double y, const char *button);
+void bsdr_app_input_scroll(bsdr_app *a, int amount);
+size_t bsdr_app_bot_modes_json(bsdr_app *a, char *out, size_t cap);
+void bsdr_app_bot_mode_clear_plugin_modes(bsdr_app *a);
+void bsdr_app_set_avatar_enabled(bsdr_app *a, int on);
+/* Register/clear a plugin per-speaker gain policy. While set, botaudio applies it to the room-audio mix
+ * instead of the core ACL policy; NULL restores the core default. */
+void bsdr_app_set_gain_policy(bsdr_app *a, bsdr_gain_policy_fn fn, void *user);
+int  bsdr_app_apply_gain_policy(bsdr_app *a, uint32_t *ssrc_out, float *gain_out, int cap, float *default_out);
 /* Follow-me: when on, the bot re-joins whatever room the operator moves into. Persisted. */
 void bsdr_app_set_bot_follow(bsdr_app *a, bool on);
+int  bsdr_app_get_bot_follow(bsdr_app *a);
 /* Cloud-mic loopback: route the bot's room audio (incl. your own voice) into BSDR_RoomMic. Persisted;
  * starts/stops the loopback immediately if the bot is joined. */
 void bsdr_app_set_bot_loopback(bsdr_app *a, bool on);
@@ -324,6 +439,7 @@ void bsdr_app_set_bot_solo_owner(bsdr_app *a, bool on);
 /* Periodic follow-me reconcile (call ~every 15 s from the main loop). No-op unless follow is on and
  * the bot is logged in and not stopped. */
 void bsdr_app_bot_follow_tick(bsdr_app *a);
+void bsdr_app_bot_token_tick(bsdr_app *a);   /* proactive bot-token renewal (call periodically) */
 /* Toggle the performance encoder preset (lighter CPU/GPU vs the default quality preset). Persisted;
  * takes effect on the next stream (re)start. */
 void bsdr_app_set_enc_level(bsdr_app *a, int level);   /* 0 quality / 1 balanced / 2 performance */
@@ -387,6 +503,8 @@ void bsdr_app_set_terminal(bsdr_app *a, const char *backend, int cols, int rows)
 void bsdr_app_get_terminal(bsdr_app *a, char *backend, size_t bl, int *cols, int *rows);
 void bsdr_app_set_quality(bsdr_app *a, int w, int h, int bitrate);
 void bsdr_app_get_quality(bsdr_app *a, int *w, int *h, int *bitrate);
+void bsdr_app_await_device_begin(bsdr_app *a);   /* /start: expect the headset's first /device next */
+bool bsdr_app_await_device_pending(bsdr_app *a); /* true until that first /device arrives */
 /* Web-UI bitrate override: bps to force, or 0 to follow whatever the headset asks for. Recomputes
  * the effective bitrate immediately; the live streamer reopens the encoder on the next tick. */
 void bsdr_app_set_bitrate_override(bsdr_app *a, int bitrate);
@@ -400,6 +518,44 @@ void bsdr_app_load_settings(bsdr_app *a);
 /* Per-user config directory ($XDG_CONFIG_HOME/bsdr_agent or ~/.config/bsdr_agent), created if needed.
  * Exposed so cloud_stream can persist sticky source ports next to the other settings. */
 bool bsdr_config_dir(char *dir, size_t cap);
+/* Tiered access-control store (access.json) + room roster refresh. save() after any friend/ban/toggle
+ * change; load() at startup; refresh_roster() from a raw /room JSON body on join / room-data pushes. */
+void bsdr_app_acl_save(bsdr_app *a);
+void bsdr_app_acl_load(bsdr_app *a);
+/* Persist the flat `settings` file (encoder prefs, moderation toggles like mic_check_auto, web-search
+ * config, …). Call after mutating a persisted app field from outside app.c (e.g. the web UI). */
+void bsdr_app_save_settings(bsdr_app *a);
+void bsdr_app_refresh_roster(bsdr_app *a, const char *room_json);
+/* Compute the per-SSRC room-audio volume policy (owner loud, host/friend lower, others silenced;
+ * the mic-check target kept audible). Fills ssrc_out/gain_out (up to cap) + *default_out (the gain
+ * for anyone not listed). Returns the count, or -1 when no policy can be safely applied (empty roster
+ * or the owner isn't identifiable in it) — the caller should then leave the mix at unity. Pure ACL/
+ * roster resolution, so it stays out of the audio TU (keeps non-audio builds linking). */
+int bsdr_app_audio_gains(bsdr_app *a, uint32_t *ssrc_out, float *gain_out, int cap, float *default_out);
+/* Moderation: kick / soft-ban a room participant by display name (resolved to their userSessionId via
+ * the roster). ban also persists the socialId so rejoins are auto-re-kicked (bsdr_app_refresh_roster).
+ * Return true on a successful kick (ban also returns the kick result). */
+bool bsdr_app_kick_user(bsdr_app *a, const char *username);
+bool bsdr_app_ban_user(bsdr_app *a, const char *username);
+/* Owner-only "reset room": kick every participant so everyone rejoins a fresh room — recovers a
+ * stuck/frozen room cleanly (official kick, no crash). Returns the number kicked. */
+int  bsdr_app_reset_room(bsdr_app *a);
+/* The SSRC of the room owner (0 if not present/identified) — for the command router's overload
+ * protection (when backed up, serve only the owner). */
+uint32_t bsdr_app_owner_ssrc(bsdr_app *a);
+/* Plugin (bot host-service) reads: serialize the cached roster as a JSON array, and resolve one SSRC to
+ * {socialId,username,level,isHost,isSelf}. Both snapshot under the app lock. See PLAN-bot-plugin.md §5. */
+size_t bsdr_app_roster_json(bsdr_app *a, char *out, size_t cap);
+int    bsdr_app_resolve_ssrc(bsdr_app *a, uint32_t ssrc, char *out, size_t cap);
+int    bsdr_app_stt(bsdr_app *a, const int16_t *pcm, int frames, int rate, int channels, char *out, size_t cap);
+int    bsdr_app_avatar_state(bsdr_app *a);
+int    bsdr_app_local_legacy_id(bsdr_app *a, char *out, size_t cap);
+int    bsdr_app_llm_complete(bsdr_app *a, const char *messages_json, const char *tools_json, char *out, size_t cap);
+/* A bot plugin subscribes to hear complete room utterances (host->utterance_subscribe). Lazily creates
+ * the segmenter; cb=NULL unsubscribes (and waits for any in-flight callback). While subscribed,
+ * bsdr_app_botsense_active() is true and botaudio routes room audio to the plugin, not the in-core bot. */
+void   bsdr_app_utterance_subscribe(bsdr_app *a, bsdr_utterance_cb cb, void *user);
+int    bsdr_app_botsense_active(bsdr_app *a);
 void bsdr_app_set_region(bsdr_app *a, int x, int y, int w, int h);
 void bsdr_app_get_region(bsdr_app *a, int *x, int *y, int *w, int *h);
 /* voice config: each field may be "" to leave unchanged on set. get copies all. */
@@ -407,6 +563,14 @@ void bsdr_app_set_voice(bsdr_app *a, const char *se, const char *st, const char 
                         const char *le, const char *lt, const char *lm);
 void bsdr_app_get_voice(bsdr_app *a, char *se, char *st, char *sm,
                         char *le, char *lt, char *lm, size_t each);
+/* Kick off a background probe of the LLM endpoint for the model's context window; caches the result
+ * in a->llm_context_detected. Best-effort, non-blocking. */
+void bsdr_app_detect_llm_context(bsdr_app *a);
+
+/* Request an on-demand keyframe (IDR) from the video encoder(s) — for a newly-joined cloud consumer
+ * so it starts decoding immediately instead of waiting for the next scheduled GOP. Cheap; safe to
+ * call often (it just bumps a generation counter). */
+void bsdr_app_request_keyframe(bsdr_app *a);
 
 /* computer control: web UI sets the desired state; the main loop consumes the
  * dirty flag and arms/disarms the voice pipeline. `vision` also feeds a desktop

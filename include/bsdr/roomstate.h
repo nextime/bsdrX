@@ -50,14 +50,19 @@ int roomstate_user_state(char **out, size_t *out_len, const char *legacy_user_id
 int roomstate_tick_state(char **out, size_t *out_len, const char *legacy_user_id,
                          float mic_loudness, const rs_pose *head);
 
-/* Decoded view of an inbound frame (enough for seat/pose follow). */
+/* Decoded view of an inbound frame (enough for seat/pose + avatar hands/eyes). */
 typedef struct {
     int type;                 /* RS_TYPE_* */
     char user_id[160];        /* UserState.user_id */
     int area_index, seat_index;
+    int body_type_index;      /* UserState.Avatar.body_type_index (0=Smol,1=Basic,2=Chonk,3=Stronk) */
     float mic_loudness;       /* TickState */
     rs_pose head;
     int has_head;
+    /* TickState hands (HandState.pose) + eye gaze (irisOffset). has_* mirror HandState.showingHand. */
+    rs_pose left_hand, right_hand;
+    int has_left, has_right;
+    float iris[2];            /* irisOffset (Vector2) — eye gaze */
 } rs_decoded;
 
 /* Decode a framed message. Returns the type (>=0) or -1 on error. */

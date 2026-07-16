@@ -75,6 +75,13 @@ bsdr_voice *bsdr_voice_new(const bsdr_voice_config *cfg, bsdr_injector *inj) {
     return v;
 }
 
+void bsdr_voice_set_speak(bsdr_voice *v, void (*cb)(void *, const char *), void *user) {
+    if (v) bsdr_compcontrol_set_speak(v->cc, cb, user);
+}
+void bsdr_voice_set_app(bsdr_voice *v, struct bsdr_app *app) {
+    if (v) bsdr_compcontrol_set_app(v->cc, app);
+}
+
 void bsdr_voice_update_config(bsdr_voice *v, const bsdr_voice_config *cfg) {
     bsdr_mutex_lock(v->lock);
     v->cfg = *cfg;
@@ -242,9 +249,13 @@ static void phase_work(bsdr_voice *v) {
         /* On-demand vision: offer a take_screenshot tool the model calls only when the
          * request needs it (same signature as the shot cb, passed straight through). */
         bsdr_llm_image_cb icb = (v->cfg.vision && v->shot_cb) ? (bsdr_llm_image_cb)v->shot_cb : NULL;
+        /* The balloon is the OWNER: full tools (respecting the app's global group toggles). */
+        uint32_t mask = bsdr_compcontrol_owner_mask(v->cc);
+        bsdr_compcontrol_set_caller(v->cc, mask, BSDR_ACL_OWNER, "owner");
+        bsdr_compcontrol_set_abort(v->cc, &v->abort_req);
         bool ok = bsdr_llm_run_ex(&v->cfg.llm, v->cfg.system_prompt, text,
                                   bsdr_compcontrol_exec, v->cc, icb, v->shot_user,
-                                  &v->abort_req, reply, sizeof(reply));
+                                  mask, &v->abort_req, reply, sizeof(reply));
         set_last(v, v->abort_req ? "stopped" : (ok ? (reply[0] ? reply : "done") : "(assistant unavailable)"));
     }
 }

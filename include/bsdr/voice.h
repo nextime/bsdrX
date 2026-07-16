@@ -28,7 +28,8 @@
 typedef struct {
     bsdr_stt_config stt;
     bsdr_llm_config llm;
-    char system_prompt[1024];
+    char system_prompt[3072];   /* role-adaptive owner prompt (bsdr_botprompt_build; no persona —
+                                 * the balloon is functional, not conversational) */
     /* Listen-until-silence VAD (0 => sane defaults are applied):
      *   start_ms  — how long to wait for speech to begin before giving up
      *   silence_ms— trailing quiet after speech that ends the capture
@@ -61,6 +62,15 @@ typedef int (*bsdr_voice_shot_cb)(void *user, uint8_t *out, size_t cap);
 
 bsdr_voice *bsdr_voice_new(const bsdr_voice_config *cfg, bsdr_injector *inj);
 void bsdr_voice_free(bsdr_voice *v);
+
+/* Wire the computer-control "speak" tool to a TTS sink (forwarded to the inner compcontrol). */
+void bsdr_voice_set_speak(bsdr_voice *v, void (*cb)(void *, const char *), void *user);
+
+/* Give the balloon executor the app so the owner's spoken commands can drive the bot/room/admin/web
+ * tools too (not just the desktop). The balloon runs at owner level, respecting the app's global tool
+ * toggles. Optional; without it only the computer tools + speak are available. */
+struct bsdr_app;
+void bsdr_voice_set_app(bsdr_voice *v, struct bsdr_app *app);
 
 /* Refresh the STT/LLM endpoints + system prompt + timings at runtime. */
 void bsdr_voice_update_config(bsdr_voice *v, const bsdr_voice_config *cfg);

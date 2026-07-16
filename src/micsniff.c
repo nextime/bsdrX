@@ -30,6 +30,7 @@
 
 #include "bsdr/audio.h"
 #include "bsdr/voicefx.h"
+#include "bsdr/mediafx.h"
 #include "bsdr/platform.h"
 #include "micsniff_capture.h"
 
@@ -116,7 +117,10 @@ struct bsdr_micsniff {
 
     int         sink_mod, src_mod;
     bsdr_audio_player *player;
+    volatile int questmic_feedback;     /* 0 = don't render owner voice into BSDR_QuestMic (default);
+                                         * the STT/compctl PCM tap is unaffected either way */
     uint64_t     player_retry_ms;       /* Linux: throttle re-opening the session-scoped mic sink */
+    int          player_warned;         /* logged the "sink won't open" warning once for this outage */
     OpusDecoder *dec;
     /* Cloud voice SUBSTITUTION over the relay: bsdrX re-encodes the voice-changed owner audio and
      * sends the modified RTP back to the router companion, which forwards it to the cloud instead of
@@ -127,9 +131,8 @@ struct bsdr_micsniff {
     int          have_relay_peer;
     uint64_t     last_ctrl_ms;          /* throttle the relay control heartbeat */
 
-    /* realtime voice changer (gender shift) applied to the decoded owner voice before it reaches the
-     * virtual mic / the cloud / the command tap. 0 = off. */
-    bsdr_voicefx *fx;
+    /* Legacy voice-fx config, still set by the web UI but no longer consumed here (the voice-changer
+     * PLUGIN owns the effect via the media-fx hook). */
     bsdr_voicefx_params fxp;
     /* AI (RVC) voice tier config, pushed by the agent; applied to fx on change. */
     struct { int on, tier, voice_sr, key; char content[1024], rmvpe[1024], voice[1024]; } ai;
@@ -187,17 +190,9 @@ static void build_arp(uint8_t f[42], int op, const uint8_t smac[6], uint32_t sip
 /* Realtime voice change on the decoded owner voice (in place), lazily creating/reconfiguring the DSP
  * when the gender knob changes. A gender of 0 is a no-op. 48 kHz mono, as decoded from the Opus. */
 static void micsniff_apply_fx(struct bsdr_micsniff *s, int16_t *pcm, int frames) {
-    int dsp = s->fxp.gender || s->fxp.formant || s->fxp.volume ||
-              s->fxp.robot || s->fxp.echo || s->fxp.whisper;
-    if (!dsp && !s->ai.on) return;
-    if (!s->fx) { s->fx = bsdr_voicefx_new(48000); if (!s->fx) return; }
-    bsdr_voicefx_set_params(s->fx, &s->fxp);
-    if (s->ai_dirty) {   /* (re)load the RVC engine only when the config actually changed */
-        bsdr_voicefx_set_ai(s->fx, s->ai.on, s->ai.tier, s->ai.content, s->ai.rmvpe,
-                            s->ai.voice, s->ai.voice_sr, (float)s->ai.key);
-        s->ai_dirty = 0;
-    }
-    bsdr_voicefx_process(s->fx, pcm, frames);
+    (void)s;
+    /* Voice change is the voice-changer PLUGIN's job now (media-fx hook); no in-core engine. */
+    bsdr_mediafx_apply_audio(pcm, frames, 48000, 1);
 }
 
 /* Parse one captured IPv4 datagram: strip the 8B [ssrc][frame_id] trailer, dedupe the 2x send,
@@ -252,7 +247,10 @@ static void fix_ip_udp_csum(uint8_t *ip, int ihl, int ulen) {
  * starts and unloaded when it ends, so: drop a dead player (sink gone) and lazily re-open (throttled)
  * when the sink is back. On mac/win the loopback device is persistent, so this is just a NULL check. */
 static int owner_player_ensure(struct bsdr_micsniff *s) {
-#if !defined(__APPLE__) && !defined(_WIN32)
+    /* Only reached from the gated push sites (questmic_feedback on), so the player is opened lazily —
+     * never eagerly — and only when the operator has asked for the owner voice on BSDR_QuestMic. Works
+     * on every platform: on Linux the sink is session-scoped (reopen after each session), on mac/win the
+     * loopback device is persistent (opens once). Runs on the sniffer thread. */
     if (s->player && bsdr_audio_player_dead(s->player)) {   /* session ended -> sink unloaded */
         bsdr_audio_player_free(s->player); s->player = NULL;
     }
@@ -261,11 +259,18 @@ static int owner_player_ensure(struct bsdr_micsniff *s) {
         if (now >= s->player_retry_ms) {
             s->player_retry_ms = now + 3000;                /* poll every 3s (quiet: no ERROR spam) */
             s->player = bsdr_audio_player_new_quiet(OWNER_SINK, 1);
-            if (s->player)
+            if (s->player) {
                 BSDR_INFO("bsdr.micsniff", "owner voice -> %s (virtual mic up)", OWNER_DESC);
+                s->player_warned = 0;
+            } else if (!s->player_warned) {
+                /* Feedback is on and audio is flowing, but the sink won't open. Say so once (not every
+                 * 3 s) so a silent BSDR_QuestMic is diagnosable instead of a mystery. */
+                s->player_warned = 1;
+                BSDR_WARN("bsdr.micsniff", "owner voice enabled but the %s sink (%s) will not open — the "
+                          "device may not exist; retrying every 3s", OWNER_DESC, OWNER_SINK);
+            }
         }
     }
-#endif
     return s->player != NULL;
 }
 
@@ -324,8 +329,8 @@ static void handle_ip(struct bsdr_micsniff *s, const uint8_t *ip, int len) {
         BSDR_INFO("bsdr.micsniff", "locked owner-mic flow: %s -> %s:%u ssrc=%u (mono Opus)",
                   s->quest_ip, inet_ntoa(a), dport, ssrc);
         micsniff_apply_fx(s, probe, fr);
-        if (owner_player_ensure(s)) bsdr_audio_player_push(s->player, probe, fr);
-        if (s->pcm_cb) s->pcm_cb(s->pcm_user, probe, fr, 1);
+        if (s->questmic_feedback && owner_player_ensure(s)) bsdr_audio_player_push(s->player, probe, fr);
+        if (s->pcm_cb) s->pcm_cb(s->pcm_user, probe, fr, 1);   /* STT/compctl tap: always, regardless */
         s->decoded++;
         return;
     }
@@ -337,8 +342,8 @@ static void handle_ip(struct bsdr_micsniff *s, const uint8_t *ip, int len) {
     int fr = opus_decode(s->dec, pl, olen, pcm, 5760, 0);
     if (fr <= 0) return;
     micsniff_apply_fx(s, pcm, fr);
-    if (owner_player_ensure(s)) bsdr_audio_player_push(s->player, pcm, fr);
-    if (s->pcm_cb) s->pcm_cb(s->pcm_user, pcm, fr, 1);
+    if (s->questmic_feedback && owner_player_ensure(s)) bsdr_audio_player_push(s->player, pcm, fr);
+    if (s->pcm_cb) s->pcm_cb(s->pcm_user, pcm, fr, 1);          /* STT/compctl tap: always, regardless */
 
     /* Cloud SUBSTITUTION: re-encode the voice-changed audio (RTP header + new Opus + original 8-byte
      * trailer preserved) and hand the modified packet to whichever inline point forwards it to the cloud
@@ -1198,18 +1203,22 @@ bsdr_micsniff *bsdr_micsniff_start(const bsdr_micsniff_cfg *cfg) {
     /* mac/win: the installed loopback (BlackHole / VB-CABLE) IS the mic apps record from. */
     if (!bsdr_virtual_mic_create(OWNER_SINK, OWNER_SOURCE, OWNER_DESC, &s->sink_mod, &s->src_mod)) goto fail;
 #else
-    /* Linux: the persistent BSDR_QuestMic (audio.c's bsdr_micsink remap-source) is the device — we
-     * just play the decoded voice into that sink, so the mic stays one always-visible device. */
-    s->sink_mod = s->src_mod = -1;
+    /* Linux: the owner voice is played into bsdr_micsink, which apps see as BSDR_QuestMic. That sink is
+     * normally created by the RD desktop-streaming session (bsdr_audio_devices_create). But the relay
+     * runs INDEPENDENTLY of any desktop-stream — a user can relay their headset voice to the PC without
+     * ever streaming the desktop — so when no session owns the sink we must create it ourselves, or a
+     * relay-only user has no BSDR_QuestMic device at all (the bug this fixes). If a session already owns
+     * it we reuse it and create nothing, so there is only ever one BSDR_QuestMic. (Narrow caveat: if a
+     * streaming session starts mid-relay, its self-heal reclaims the shared name; that's fine — apps keep
+     * one device — and we tear down only what we still hold at stop.) */
+    s->sink_mod = s->src_mod = -1;   /* the QuestMic device is a persistent singleton the relay never owns */
+    bsdr_audio_questmic_ensure();     /* bring it up if no streaming session already did — persistent, not ours */
 #endif
-    /* Open quietly: the virtual mic sink (bsdr_micsink) is created only while a streaming session is
-     * active, so at startup it usually isn't up yet. owner_player_ensure() lazily (re)opens it once a
-     * session brings it up, and drops it when the session tears it down — so owner voice reaches the
-     * BSDR_QuestMic device whenever a session is live, and always drives compctl regardless. */
-    s->player = bsdr_audio_player_new_quiet(OWNER_SINK, 1);
-    if (!s->player)
-        BSDR_INFO("bsdr.micsniff", "virtual-mic sink '%s' not up yet (starts with a streaming session); "
-                  "owner voice drives computer-control meanwhile", OWNER_SINK);
+    /* Do NOT open the BSDR_QuestMic player eagerly. Rendering the owner voice into that device is OFF
+     * by default (bsdr_micsniff_set_questmic_feedback) — the owner voice always drives computer-control
+     * through the PCM tap regardless. owner_player_ensure() opens the player lazily, and only from the
+     * feedback-gated push path, once the operator enables it and the session-scoped sink is up. */
+    s->player = NULL;
     int err = 0; s->dec = opus_decoder_create(48000, 1, &err);
     if (err != OPUS_OK || !s->dec) { BSDR_ERROR("bsdr.micsniff", "decoder init failed"); goto fail; }
 
@@ -1261,6 +1270,14 @@ void bsdr_micsniff_set_substitute(bsdr_micsniff *s, int on) {
     if (was && !s->substitute) relay_send_control(s, 0);   /* tell the relay to stop dropping originals */
 }
 
+void bsdr_micsniff_set_questmic_feedback(bsdr_micsniff *s, int on) {
+    if (!s) return;
+    /* Flag only — thread-safe. The sniffer thread stops pushing when off (owner_player_ensure isn't
+     * reached), and any open player is released at session end / bsdr_micsniff_stop. Turning it on
+     * makes owner_player_ensure open the device lazily on the next decoded frame. */
+    s->questmic_feedback = on ? 1 : 0;
+}
+
 void bsdr_micsniff_stop(bsdr_micsniff *s) {
     if (!s) return;
     if (s->substitute) relay_send_control(s, 0);           /* restore passthrough before we go */
@@ -1274,7 +1291,6 @@ void bsdr_micsniff_stop(bsdr_micsniff *s) {
 #endif
     if (s->dec) { opus_decoder_destroy(s->dec); s->dec = NULL; }
     if (s->enc) { opus_encoder_destroy(s->enc); s->enc = NULL; }
-    if (s->fx) { bsdr_voicefx_free(s->fx); s->fx = NULL; }
 #if !defined(__ANDROID__)
     if (s->sink_mod >= 0 || s->src_mod >= 0) bsdr_virtual_mic_destroy(s->sink_mod, s->src_mod);
 #endif

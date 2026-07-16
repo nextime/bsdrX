@@ -51,4 +51,22 @@ const char *bsdr_depth_tier_name(bsdr_depth_tier t);
 /* 1 if this build has ONNX support compiled in (BSDR_HAVE_ONNX), else 0. */
 int bsdr_depth_available(void);
 
+/* Model provider — the embedder supplies the engine its per-tier model file + preprocessing params, so
+ * this module never links the core model store directly (it now lives in the 2d-3d plugin). The 2d-3d
+ * plugin sets it to thin wrappers over host services; the Android JNI sets it to the in-JNI model store.
+ * Set once before bsdr_depth_open (a NULL/absent provider makes open() fail -> heuristic fallback). */
+typedef struct {
+    /* per-tier params: model display name, square input edge, per-channel mean/std. Return 0 on success. */
+    int (*params)(int tier, char *name, size_t name_cap, int *input_size, float mean[3], float std[3]);
+    /* resolve the cached model path (allow_download: kick a background fetch if missing). 0 on success. */
+    int (*resolve)(int tier, int allow_download, char *path, size_t cap);
+    /* start a background download of the tier's model. 0 if started/queued/already present. */
+    int (*download_start)(int tier);
+} bsdr_depth_provider;
+void bsdr_depth_set_provider(const bsdr_depth_provider *p);
+
+/* 1 if the tier's model is already cached (resolve succeeds without a download), via the provider. Lets
+ * the SBS synth tell "download in flight" (keep retrying) from "present but won't load" (give up). */
+int bsdr_depth_model_present(int tier);
+
 #endif /* BSDR_DEPTH_H */

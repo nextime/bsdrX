@@ -416,8 +416,15 @@ bsdr_socket_t bsdr_tcp_accept(bsdr_socket_t listener, struct sockaddr_in *from) 
 int bsdr_send_all(bsdr_socket_t s, const void *buf, size_t len) {
     const char *p = (const char *)buf;
     size_t sent = 0;
+    /* MSG_NOSIGNAL (Linux) suppresses SIGPIPE on a closed peer at the call site; startup also does
+     * signal(SIGPIPE, SIG_IGN) for platforms without the flag (macOS uses SO_NOSIGPIPE, Windows none). */
+#ifdef MSG_NOSIGNAL
+    const int sflags = MSG_NOSIGNAL;
+#else
+    const int sflags = 0;
+#endif
     while (sent < len) {
-        int n = (int)send(s, p + sent, (int)(len - sent), 0);
+        int n = (int)send(s, p + sent, (int)(len - sent), sflags);
         if (n <= 0) return -1;
         sent += (size_t)n;
     }

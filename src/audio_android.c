@@ -149,3 +149,6 @@ void bsdr_audio_devices_destroy(bsdr_audio_devices *d) {
 }
 
 void bsdr_audio_cleanup_stale_devices(void) { /* AAudio: no virtual modules */ }
+/* Android: relay-only, no virtual audio devices — parity no-ops for the Linux persistent-QuestMic helpers. */
+void bsdr_audio_questmic_ensure(void) {}
+int  bsdr_audio_sink_exists(const char *sink_name) { (void)sink_name; return 0; }

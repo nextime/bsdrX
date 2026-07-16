@@ -46,6 +46,10 @@ void bsdr_android_push_video(const uint8_t *au, size_t len, int64_t pts_us, int 
  * last poll, filling the out params; 0 otherwise. */
 int  bsdr_android_capture_want(int *width, int *height, int *fps, int *bitrate);
 
+/* Keyframe (IDR) request: bsdr_capture_force_keyframe() publishes an edge here (e.g. a new consumer
+ * joined). The JNI bridge polls it and asks MediaCodec for a sync frame. Returns 1 once per request. */
+int  bsdr_android_poll_keyframe(void);
+
 /* 2D->3D: the agent publishes the current SBS config here; the JNI bridge polls it and drives the
  * Kotlin GL pipeline (MediaProjection -> SBS shader -> MediaCodec). mode 0=off/1=fast/2=ai (ai is
  * treated as fast on Android). poll returns 1 if changed since the last poll. */

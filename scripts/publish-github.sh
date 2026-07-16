@@ -3,7 +3,14 @@
 #
 # The private origin (Gitea) is NEVER touched: it keeps the full history, the packet captures, and
 # the compiled Bigscreen API key. GitHub instead gets a snapshot of the CURRENT tracked tree with:
-#   - packet captures / logs excluded (they're already gitignored, this is belt-and-suspenders), and
+#   - packet captures / logs excluded (they're already gitignored, this is belt-and-suspenders),
+#   - the plugins/ tree PRUNED to the 'open' (open-source) plugins only: 'closed' and 'private'
+#     plugins stay on the private origin and never reach the mirror, and even the open ones ship
+#     without their store.conf (no pricing/publish metadata leaks). The generic plugin *system* in
+#     src/plugin.c + include/bsdr/plugin.h is public and always stays, and
+#   - the private plugin-store uploader (scripts/push_plugin.py) and the private authoring doc
+#     (plugins/PLUGIN-AUTHORING.md) excluded — build-plugins.sh only uses the uploader when present,
+#     so its absence just disables the optional store-upload step, and
 #   - the Bigscreen client API key BLANKED OUT (it's Bigscreen's property — see the README).
 #
 # History model:
@@ -50,9 +57,49 @@ fi
 [ -n "$CHANGELOG" ] || CHANGELOG="$(git -C "$ROOT" log --no-merges -15 --format='- %s' HEAD 2>/dev/null || true)"
 [ -n "$CHANGELOG" ] || CHANGELOG="- (no commit history available)"
 
-# 2. lay down the current tracked tree (HEAD), minus captures/logs
+# 2. lay down the current tracked tree (HEAD), minus captures/logs, the private uploader, and the
+# private authoring doc. The plugins/ tree is laid down in full here and PRUNED to 'open' in 2b.
 find "$WORK" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-git -C "$ROOT" archive HEAD | tar -x -C "$WORK" --exclude='*.pcap' --exclude='*.pcapng' --exclude='*.log'
+git -C "$ROOT" archive HEAD | tar -x -C "$WORK" \
+    --exclude='*.pcap' --exclude='*.pcapng' --exclude='*.log' \
+    --exclude='.plugstore.env' \
+    --exclude='scripts/push_plugin.py' \
+    --exclude='scripts/push-plugins.sh' \
+    --exclude='plugins/PLUGIN-AUTHORING.md'
+
+# 2b. prune plugins/: publish ONLY plugins marked 'open' (open-source). Strip 'closed' and 'private'
+# ones entirely (they stay on the private origin), and strip store.conf from the survivors so no
+# store/pricing metadata leaks. A plugin's marking is the MARKING= line in its plugins/<name>/store.conf.
+if [ -d "$WORK/plugins" ]; then
+  for d in "$WORK"/plugins/*/; do
+    [ -d "$d" ] || continue
+    marking=""
+    [ -f "$d/store.conf" ] && marking="$(sh -c '. "$1" >/dev/null 2>&1; printf %s "${MARKING:-}"' _ "$d/store.conf" 2>/dev/null || true)"
+    if [ "$marking" = open ]; then
+      rm -f "$d/store.conf"          # keep the source, drop the publish/pricing metadata
+      echo ">> github: publishing open plugin '$(basename "$d")'"
+    else
+      echo ">> github: stripping non-open plugin '$(basename "$d")' (marking='${marking:-unset}')"
+      rm -rf "$d"
+    fi
+  done
+  # remove any stray non-dir files under plugins/, then drop plugins/ itself if now empty
+  find "$WORK/plugins" -mindepth 1 -maxdepth 1 ! -type d -exec rm -f {} + 2>/dev/null || true
+  rmdir "$WORK/plugins" 2>/dev/null || true
+fi
+
+# 2c. belt-and-suspenders. store.conf is stripped from every published (open) plugin, so any surviving
+# store.conf means a non-open plugin slipped through unprocessed -> abort. Also abort if the private
+# uploader leaked.
+if [ -d "$WORK/plugins" ] && find "$WORK/plugins" -name store.conf | grep -q .; then
+  echo "!! ABORT: a store.conf survived under plugins/ — a non-open plugin may have leaked" >&2
+  find "$WORK/plugins" -name store.conf -print >&2
+  exit 1
+fi
+if [ -e "$WORK/scripts/push_plugin.py" ]; then
+  echo "!! ABORT: scripts/push_plugin.py leaked into the GitHub snapshot" >&2
+  exit 1
+fi
 
 # 3. sanitize: blank BOTH Bigscreen API keys (companion + client) so neither reaches the public mirror
 CLOUD_H="$WORK/include/bsdr/cloud.h"

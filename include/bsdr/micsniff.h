@@ -114,6 +114,13 @@ void bsdr_micsniff_set_voiceai(bsdr_micsniff *s, int on, int tier, const char *c
  * the relay. Safe on a live sniffer / NULL. */
 void bsdr_micsniff_set_substitute(bsdr_micsniff *s, int on);
 
+/* Whether to PLAY the decoded owner voice into the BSDR_QuestMic virtual mic. OFF by default: the
+ * owner voice always drives computer-control / TTS (the PCM tap, unaffected by this), but it is only
+ * rendered into the BSDR_QuestMic device when explicitly enabled — the "feed the owner voice back to
+ * a virtual mic only if I ask for it" case, and a guard against the owner hearing themselves. Safe on
+ * a live sniffer / NULL; turning it off drops any open player at once. */
+void bsdr_micsniff_set_questmic_feedback(bsdr_micsniff *s, int on);
+
 #else  /* no audio backend: inert stubs */
 
 static inline int  bsdr_micsniff_helper_main(int argc, char **argv) { (void)argc; (void)argv; return 1; }
@@ -125,6 +132,7 @@ static inline void bsdr_micsniff_set_pcm_sink(bsdr_micsniff *s, bsdr_micsniff_pc
 static inline void bsdr_micsniff_set_voicefx(bsdr_micsniff *s, int g, int fm, int vo, int r, int e, int w) { (void)s;(void)g;(void)fm;(void)vo;(void)r;(void)e;(void)w; }
 static inline void bsdr_micsniff_set_voiceai(bsdr_micsniff *s, int on, int t, const char *c, const char *r, const char *v, int sr, int k) { (void)s;(void)on;(void)t;(void)c;(void)r;(void)v;(void)sr;(void)k; }
 static inline void bsdr_micsniff_set_substitute(bsdr_micsniff *s, int on) { (void)s; (void)on; }
+static inline void bsdr_micsniff_set_questmic_feedback(bsdr_micsniff *s, int on) { (void)s; (void)on; }
 
 #endif /* BSDR_HAVE_AUDIO */
 

@@ -27,22 +27,39 @@ set(CORE_SRC
   ${CORE}/discovery.c ${CORE}/control.c ${CORE}/udp_transport.c
   ${CORE}/dtls.c ${CORE}/cloud.c ${CORE}/cloud_stream.c
   ${CORE}/app.c ${CORE}/webui.c ${CORE}/overlay.c ${CORE}/httpc.c ${CORE}/tls.c
-  ${CORE}/stt.c ${CORE}/llm.c ${CORE}/compcontrol.c ${CORE}/voice.c
+  ${CORE}/stt.c ${CORE}/llm.c ${CORE}/llmctx.c ${CORE}/tts.c ${CORE}/compcontrol.c ${CORE}/voice.c
   ${CORE}/screenshot.c                  # stubbed on Android (no X11/ffmpeg)
   ${CORE}/agent.c                       # bsdr_agent_run(); main() is #ifdef'd out
   # transport / media (shared, OS-agnostic)
   ${CORE}/sctp.c ${CORE}/srtp_util.c ${CORE}/video.c
-  ${CORE}/threed.c                      # 2D->3D SBS core (agent.c refs it; not applied on the HW path)
-  ${CORE}/depth_onnx.c ${CORE}/model_store.c   # in-process neural depth (ONNX Runtime, NNAPI)
+  ${CORE}/threed_mode.c                 # 3D mode/tier <-> string glue (CLI); engine is the 2d-3d plugin
+  ${CORE}/model_store.c                 # depth/faceswap model store (download + cache; used by the web UI)
+  # NB: the 2D->3D depth engine (threed.c + depth_onnx.c) is the CLOSED 2d-3d plugin and is NOT compiled
+  # into the APK — bsdr_jni.c's nativeDepth routes to the plugin's depth service (installed via the
+  # in-app store), and the Kotlin GL side uses its own heuristic when the plugin isn't present.
   ${CORE}/webcam.c                      # camera enumeration (Android returns none; Kotlin enumerates)
-  ${CORE}/voicefx.c                     # realtime voice changer (gender shift) DSP
-  ${CORE}/faceswap.c                    # realtime face swap (SCRFD + ArcFace + inswapper, ONNX)
+  # NB: the face-swap engine is the faceswap plugin and is NOT compiled into the APK — bsdr_jni.c's
+  # nativeFaceswap* route to the plugin's RGB interface (installed via the in-app store); no plugin
+  # installed -> the GL pipeline uploads the untouched frame.
   ${CORE}/roomstate.c                   # room/avatar FlatBuffers state codec (bot Plane-2)
   ${CORE}/botroom.c                     # full-bot avatar presence (room data channel)
   ${CORE}/botaudio.c                    # cloud-mic loopback (bot room-audio -> BSDR_RoomMic)
+  ${CORE}/botmic.c                      # bot -> cloud room-mic producer (TTS/audio into the room)
   ${CORE}/voicestore.c                  # AI voice-changer model store + voice library
-  ${CORE}/voiceai.c                     # RVC voice conversion (ONNX Runtime)
+  ${CORE}/acl.c                         # tiered voice access-control (owner/host/friend)
+  ${CORE}/roster.c                      # room participant roster + ssrc->participant map
+  ${CORE}/roomcmd.c                     # per-speaker voice command router (wake word + tiers)
+  ${CORE}/botprompt.c                   # role-adaptive system-prompt builder + personality
+  ${CORE}/updatecheck.c                 # hourly background release-update check
+  ${CORE}/browserctl.c                  # owner-only browser control via Chrome DevTools Protocol
+  ${CORE}/plugin.c                      # loadable-plugin manager (dlopen); compiled in, no plugins bundled in the APK
+  ${CORE}/plugstore.c                   # in-app plugin-store client (account/catalog/buy/download/enable)
+  ${CORE}/toolregistry.c                # bot host-service: tool registry plugins register into (ABI 4)
+  ${CORE}/botsense.c                    # bot host-service: per-SSRC VAD + utterance delivery worker (ABI 4)
+  ${CORE}/mediafx.c                     # media-effect registry (voice-changer / 2D->3D plugins)
   ${REPO}/third_party/miniz/miniz.c     # model-zip import
+  ${REPO}/third_party/minimp3/minimp3.c # MP3 decode (FreeTTS engine)
+  ${REPO}/third_party/cjson/cJSON.c     # JSON parser (roster/social/access store)
   # flatcc runtime (vendored) backs roomstate.c's FlatBuffers codec
   ${REPO}/third_party/flatcc/runtime/builder.c
   ${REPO}/third_party/flatcc/runtime/emitter.c
@@ -66,6 +83,8 @@ add_library(bsdr_agent SHARED ${CORE_SRC})
 # fopen/ftello/fseeko branch and emits a "may not support large files" #pragma message. That branch is
 # actually correct here — the NDK compiles with _FILE_OFFSET_BITS=64 at API 29, so ftello/fseeko are
 # already 64-bit — making the message a false positive. Silence just that pragma for the miniz TU.
+set_source_files_properties(${REPO}/third_party/minimp3/minimp3.c PROPERTIES COMPILE_OPTIONS "-w")
+set_source_files_properties(${REPO}/third_party/cjson/cJSON.c PROPERTIES COMPILE_OPTIONS "-w")
 set_source_files_properties(${REPO}/third_party/miniz/miniz.c PROPERTIES
   COMPILE_DEFINITIONS "_LARGEFILE64_SOURCE=1"
   COMPILE_OPTIONS "-Wno-#pragma-messages")
@@ -78,7 +97,7 @@ set_source_files_properties(
   PROPERTIES COMPILE_OPTIONS "-w")
 
 target_include_directories(bsdr_agent PRIVATE
-  ${REPO}/include ${CORE} ${DEPS}/include ${REPO}/third_party/miniz
+  ${REPO}/include ${CORE} ${DEPS}/include ${REPO}/third_party/miniz ${REPO}/third_party/minimp3 ${REPO}/third_party/cjson
   ${REPO}/third_party/flatcc/include ${REPO}/src/generated)
 
 target_compile_definitions(bsdr_agent PRIVATE
@@ -111,4 +130,4 @@ set_target_properties(onnxruntime PROPERTIES IMPORTED_LOCATION ${DEPS}/lib/libon
 
 # srtp2/ssl ordering matters for the static link; group them.
 target_link_libraries(bsdr_agent
-  opus srtp2 usrsctp ssl crypto onnxruntime ${log_lib})
+  opus srtp2 usrsctp ssl crypto onnxruntime ${log_lib} dl)   # dl: src/plugin.c dlopen()s loadable plugins

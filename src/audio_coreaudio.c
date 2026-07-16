@@ -213,6 +213,9 @@ bool bsdr_audio_devices_create(bsdr_audio_devices *d) {
 }
 void bsdr_audio_devices_destroy(bsdr_audio_devices *d) { if (d) d->active = false; }
 void bsdr_audio_cleanup_stale_devices(void) { /* nothing persistent to clean on macOS */ }
+/* macOS: BlackHole is the persistent loopback device — parity no-ops for the Linux persistent-QuestMic helpers. */
+void bsdr_audio_questmic_ensure(void) {}
+int  bsdr_audio_sink_exists(const char *sink_name) { (void)sink_name; return 0; }
 
 /* Standalone owner-mic device for the sniffer: BlackHole again (see header). */
 bool bsdr_virtual_mic_create(const char *sink_name, const char *source_name,

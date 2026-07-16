@@ -99,10 +99,42 @@ struct bsdr_cloud_stream {
      * oldest frame is dropped — a brief glitch until the next keyframe, not a permanent freeze. */
     bsdr_mutex *flock;
     bsdr_cond *vcond;           /* signalled by feed_video; coupled sender sleeps on it when empty */
-    struct cloud_vframe { uint8_t *buf; size_t cap, len; } vq[BSDR_CLOUD_VQ];
+    struct cloud_vframe { uint8_t *buf; size_t cap, len; int keyframe; } vq[BSDR_CLOUD_VQ];
     int vq_head, vq_tail;       /* head = next to send, tail = next to write */
     long vq_dropped;
+    unsigned kf_gen;            /* last on-demand keyframe generation this stream's own encoder served */
 };
+
+/* Does this Annex-B access unit contain a keyframe NAL (IDR=5 or SPS=7)? Used so the FIFO never drops
+ * a keyframe on overflow — a new joiner waiting for one would otherwise miss it and stall a full GOP. */
+static bool au_has_keyframe(const uint8_t *au, size_t len) {
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (au[i] != 0 || au[i+1] != 0) continue;
+        size_t nal;                                  /* index of the NAL header byte after the start code */
+        if (au[i+2] == 1)                       nal = i + 3;          /* 00 00 01 */
+        else if (au[i+2] == 0 && i + 4 < len && au[i+3] == 1) nal = i + 4;  /* 00 00 00 01 */
+        else continue;
+        if (nal >= len) break;
+        uint8_t t = au[nal] & 0x1f;
+        if (t == 5 || t == 7) return true;           /* IDR slice / SPS */
+    }
+    return false;
+}
+
+/* Does this (possibly compound) RTCP packet contain a keyframe request (PLI fmt=1 or FIR fmt=4,
+ * payload type 206 PSFB)? Only consulted on the opt-in --cloud-rtcp-pli path. */
+static bool rtcp_wants_keyframe(const uint8_t *p, size_t len) {
+    size_t off = 0;
+    while (off + 4 <= len) {
+        if ((p[off] & 0xC0) != 0x80) break;          /* not RTCP v2 */
+        uint8_t pt = p[off+1], fmt = p[off] & 0x1f;
+        if (pt == 206 && (fmt == 1 || fmt == 4)) return true;
+        size_t pkt_len = (((size_t)p[off+2] << 8 | p[off+3]) + 1) * 4;   /* length field is in 32-bit words - 1 */
+        if (pkt_len == 0) break;
+        off += pkt_len;
+    }
+    return false;
+}
 
 #ifdef BSDR_HAVE_CAPTURE
 /* Enqueue one encoded access unit (no network). Called from the LAN loop under the app lock, so the
@@ -111,15 +143,25 @@ void bsdr_cloud_stream_feed_video(bsdr_cloud_stream *cs, const uint8_t *au, size
     if (!cs || !cs->video_ready || !cs->flock || len == 0) return;
     if (!cs->active) return;               /* paused: drop frames, keep the connection alive */
     cs->vid_w = w; cs->vid_h = h;                    /* LAN encoder resolution -> cloud trailer */
+    bool incoming_key = au_has_keyframe(au, len);
     bsdr_mutex_lock(cs->flock);
     int next = (cs->vq_tail + 1) % BSDR_CLOUD_VQ;
-    if (next == cs->vq_head) {                       /* full -> drop the oldest unsent frame */
-        cs->vq_head = (cs->vq_head + 1) % BSDR_CLOUD_VQ;
+    if (next == cs->vq_head) {                       /* full -> must drop something */
+        /* Protect a queued keyframe: a new joiner is waiting for one, and dropping it strands them a
+         * whole GOP. If the oldest is a keyframe and this new frame isn't, drop the incoming frame
+         * instead. A newer keyframe (~1s cadence) supersedes the old one, so latency self-corrects. */
+        if (cs->vq[cs->vq_head].keyframe && !incoming_key) {
+            cs->vq_dropped++;
+            if (cs->vcond) bsdr_cond_signal(cs->vcond);
+            bsdr_mutex_unlock(cs->flock);
+            return;
+        }
+        cs->vq_head = (cs->vq_head + 1) % BSDR_CLOUD_VQ;   /* drop the oldest unsent frame */
         cs->vq_dropped++;
     }
     struct cloud_vframe *f = &cs->vq[cs->vq_tail];
     if (len > f->cap) { uint8_t *nb = realloc(f->buf, len); if (nb) { f->buf = nb; f->cap = len; } }
-    if (f->buf && len <= f->cap) { memcpy(f->buf, au, len); f->len = len; cs->vq_tail = next; }
+    if (f->buf && len <= f->cap) { memcpy(f->buf, au, len); f->len = len; f->keyframe = incoming_key; cs->vq_tail = next; }
     if (cs->vcond) bsdr_cond_signal(cs->vcond);       /* wake the sender the instant a frame lands */
     bsdr_mutex_unlock(cs->flock);
 }
@@ -320,9 +362,19 @@ static void cloud_video_main(void *arg) {
     cs->video_ready = 1;
     long sent = 0; uint64_t last_log = bsdr_now_ms();
     while (!cs->stop) {
+        /* Opt-in (--cloud-rtcp-pli): drain any RTCP the SFU sent back and force a keyframe on a PLI/FIR
+         * (a new consumer's keyframe request). Off by default — the roster-join trigger already forces
+         * one, and reading this socket is only useful when the SFU actually feeds RTCP back to us. */
+        if (cs->app && cs->app->cloud_rtcp_pli) {
+            uint8_t rb[512]; int rn;
+            while ((rn = bsdr_udp_recv(&cs->vid_udp, rb, sizeof rb, 0)) > 0)
+                if (rtcp_wants_keyframe(rb, (size_t)rn)) {
+                    BSDR_INFO("bsdr.cloud", "video: RTCP keyframe request -> forcing IDR");
+                    bsdr_app_request_keyframe(cs->app);
+                }
+        }
         /* every iteration (even when idle): keep the comedia tuple alive with a periodic
-         * keepalive, like the official host. (The relay is receive-only — it never sends
-         * RTCP/PLI back — so there's nothing to read on this socket.) */
+         * keepalive, like the official host. */
         uint64_t now = bsdr_now_ms();
         if (now - cs->last_sr >= 1000) { bsdr_video_send_keepalive(cs->vid); cs->last_sr = now; }
         /* paused (share toggled off): keep the socket + keepalives alive but send no frames. */
@@ -350,6 +402,9 @@ static void cloud_video_main(void *arg) {
 
         const uint8_t *au = NULL; size_t len = 0;
         if (cs->decoupled) {
+            /* serve an on-demand keyframe request on our OWN encoder (coupled mode is served by the
+             * LAN loop instead, which is this stream's source there). */
+            if (cs->app) { unsigned g = cs->app->keyframe_gen; if (g != cs->kf_gen) { bsdr_capture_force_keyframe(cap); cs->kf_gen = g; } }
             uint32_t ts;
             int r = bsdr_capture_frame(cap, &au, &len, &ts);
             if (r <= 0) { if (r < 0) break; bsdr_sleep_ms(2); }

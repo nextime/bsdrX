@@ -1,0 +1,82 @@
+                       bsdrX Plugin Exception
+                              Version 1.0
+
+  Additional permission under the GNU General Public License, version 3,
+  section 7, for the bsdrX program.
+
+  Copyright (C) 2026 Stefy Lanza <stefy@nexlab.net>
+
+  bsdrX ("the Program") is distributed under the terms of the GNU General
+  Public License, version 3 or (at your option) any later version ("the
+  GPL"), the full text of which is in LICENSE.md. This document grants an
+  "additional permission" as described in section 7 of the GPL. It applies
+  only to the extent stated below; in every other respect the Program
+  remains governed by the GPL.
+
+
+1. Definitions.
+
+   "Plugin API" means the application programming interface declared in the
+   header file include/bsdr/plugin.h as distributed with the Program,
+   consisting of the bsdr_plugin and bsdr_plugin_host structures, the
+   BSDR_PLUGIN_ABI constant, and the bsdr_plugin_register() entry point —
+   and nothing else. The Plugin API deliberately requires a plugin to link
+   against no symbol of the host binary: every host service is reached
+   through function pointers supplied to the plugin at run time.
+
+   "Plugin" means a separate and independent work, in the form of a
+   dynamically loadable module (a shared object or dynamic library), that is
+   designed to be loaded by the Program at run time and that interacts with
+   the Program solely through the Plugin API.
+
+   "Combine" means to load a Plugin into, or otherwise cause a Plugin to run
+   in combination with, the Program.
+
+
+2. Grant of additional permission.
+
+   As a special exception, the copyright holder of the Program gives you
+   permission to Combine the Program with a Plugin, and to convey the
+   Plugin, under terms of your choice — including terms that are proprietary
+   or otherwise incompatible with the GPL — provided that both of the
+   following conditions are met:
+
+   (a) The Plugin interacts with the Program only through the Plugin API,
+       and does not copy, incorporate, link against, or otherwise use any
+       other part of the Program's source code, headers, or object code; and
+
+   (b) You comply with the GPL in all other respects for the Program itself,
+       including for any modification you make to the Program or to the
+       Plugin API, which modifications remain governed by the GPL.
+
+   Including the header include/bsdr/plugin.h, and building a Plugin against
+   the interface it declares, is expressly permitted by this exception and
+   does not by itself place the Plugin under the GPL.
+
+
+3. Scope and limits.
+
+   This exception applies only to a Plugin, and only insofar as that Plugin
+   is Combined with the Program through the Plugin API. It does not:
+
+   - grant any right to convey the Program itself, or any modified version
+     of the Program, under terms other than the GPL;
+
+   - cover any work that uses more of the Program than the Plugin API, or
+     that is statically or otherwise tightly linked with the Program beyond
+     run-time loading through the Plugin API; or
+
+   - waive any obligation of the GPL with respect to the Program.
+
+   A Plugin that does not satisfy the conditions of section 2 is not covered
+   by this exception, and its distribution together with the Program is
+   governed by the GPL alone.
+
+
+4. Removal.
+
+   As provided by section 7 of the GPL, if you convey a modified version of
+   the Program you may, at your option, remove this exception from your
+   version; and a recipient may remove it from any covered work you convey
+   to them. Removing this exception does not affect Plugins already conveyed
+   under it.

@@ -31,6 +31,7 @@
 #if defined(BSDR_MICSUB_ACTIVE)
 
 #include "bsdr/voicefx.h"
+#include "bsdr/mediafx.h"
 #include "bsdr/platform.h"
 
 #include <stdlib.h>
@@ -56,7 +57,8 @@ struct bsdr_micsub {
     char     quest_ip[64];
     OpusDecoder *dec;
     OpusEncoder *enc;
-    bsdr_voicefx *fx;
+    /* Legacy voice-fx config, still populated by the web UI via the setters below but no longer consumed
+     * (the voice-changer PLUGIN owns the effect). Kept so the setters + callers keep compiling. */
     bsdr_voicefx_params fxp;
     struct { int on, tier, voice_sr, key; char content[1024], rmvpe[1024], voice[1024]; } ai;
     int ai_dirty;
@@ -156,20 +158,10 @@ static int rewrite(struct bsdr_micsub *s, uint8_t *pkt, int len, uint8_t *out, i
     int fr = opus_decode(s->dec, pl, olen, pcm, 5760, 0);
     if (fr <= 0) return 0;
 
-    /* voice change (lazy engine): DSP knobs and/or the AI (RVC) tier */
-    int dsp = s->fxp.gender || s->fxp.formant || s->fxp.volume || s->fxp.robot || s->fxp.echo || s->fxp.whisper;
-    if (dsp || s->ai.on) {
-        if (!s->fx) s->fx = bsdr_voicefx_new(48000);
-        if (s->fx) {
-            bsdr_voicefx_set_params(s->fx, &s->fxp);
-            if (s->ai_dirty) {
-                bsdr_voicefx_set_ai(s->fx, s->ai.on, s->ai.tier, s->ai.content, s->ai.rmvpe,
-                                    s->ai.voice, s->ai.voice_sr, (float)s->ai.key);
-                s->ai_dirty = 0;
-            }
-            bsdr_voicefx_process(s->fx, pcm, fr);
-        }
-    }
+    /* Voice change is delivered by the voice-changer PLUGIN now (via the media-fx hook): route the mic
+     * PCM through it if one is loaded; otherwise the owner's voice is unchanged. The legacy fxp/ai setters
+     * still exist (fed by the web UI) but are no longer consumed here. */
+    bsdr_mediafx_apply_audio(pcm, fr, 48000, 1);
 
     uint8_t neu[1500];
     int nolen = opus_encode(s->enc, pcm, fr, neu, sizeof neu);
@@ -359,7 +351,6 @@ void bsdr_micsub_stop(bsdr_micsub *s) {
 #elif defined(BSDR_HAVE_WINDIVERT)
     if (s->wd && s->wd != INVALID_HANDLE_VALUE) { WinDivertClose(s->wd); s->wd = INVALID_HANDLE_VALUE; }
 #endif
-    if (s->fx) bsdr_voicefx_free(s->fx);
     if (s->dec) opus_decoder_destroy(s->dec);
     if (s->enc) opus_encoder_destroy(s->enc);
     free(s);

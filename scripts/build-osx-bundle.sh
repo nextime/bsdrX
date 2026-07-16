@@ -27,6 +27,12 @@ for triple_pair in "o64 x86_64 x86_64-apple-darwin25.1" "oa64 arm64 arm64-apple-
   make osxcross OSX_HOST=$host OSX_DEPS="/opt/ossl-$arch" OSX_BUILD="build-osx-$arch" BUILD_TESTS=no >/dev/null
   "$tr-strip" -Sx "build-osx-$arch/bsdr_agent"      # strip symbols from the agent only
   BINS+=("build-osx-$arch/bsdr_agent")
+  # loadable plugins (private; NOT inside the .app) — one .so zip per plugin, per arch, built with the
+  # osxcross clang for this arch. No-op if there's no plugins/ tree. dlopen loads .so on macOS.
+  SRC="$WORK/bsdrX" OUT="$OUT" VERSION="$VERSION" PLATFORM=macos ARCH="$arch" \
+    PLUGIN_CC="$host-clang" PLUGIN_EXT=.so \
+    ONNX_PREFIX="$([ -f "/opt/ossl-$arch/include/onnxruntime_c_api.h" ] && echo "/opt/ossl-$arch")" \
+    bash "$WORK/bsdrX/scripts/build-plugins.sh" || echo ">> WARN: plugin packaging failed for macOS/$arch (non-fatal)"
 done
 
 # ---- 2. lipo into one universal binary ---------------------------------------

@@ -16,10 +16,19 @@
  */
 #include "bsdr/app.h"
 #include "bsdr/inject.h"
+#include "bsdr/compcontrol.h"   /* bsdr_cc_type/key/click/scroll for the input host services */
 #include "bsdr/cloud.h"
 #include "bsdr/cloud_stream.h"
 #include "bsdr/botroom.h"
 #include "bsdr/botaudio.h"
+#include "bsdr/botmic.h"
+#include "bsdr/plugin.h"
+#include "bsdr/roomcmd.h"
+#include "bsdr/botsense.h"
+#include "bsdr/audio.h"
+#include "bsdr/tts.h"
+#include "bsdr/stt.h"
+#include "bsdr/llm.h"
 #include "bsdr/voicestore.h"
 #include "bsdr/voiceai.h"
 #include "bsdr/json.h"
@@ -120,9 +129,13 @@ int bsdr_playlist_entry(const char *src, int i, char *out, size_t outlen) {
     return n;
 }
 
+/* One queued utterance (FIFO node behind bsdr_app.tts_q_head/tail; drained by the speak worker). */
+struct tts_utt { char text[512]; struct tts_utt *next; };
+
 void bsdr_app_init(bsdr_app *a) {
     memset(a, 0, sizeof(*a));
     a->lock = bsdr_mutex_new();
+    a->acl = bsdr_acl_new();          /* tiered voice access-control (owner/host/friend) */
     snprintf(a->source, sizeof(a->source), "desktop");
     snprintf(a->term_backend, sizeof(a->term_backend), "pty");   /* headless-native default */
     a->term_cols = 120; a->term_rows = 36;
@@ -137,6 +150,16 @@ void bsdr_app_init(bsdr_app *a) {
     snprintf(a->cloud_msg, sizeof(a->cloud_msg), "not logged in");
     snprintf(a->bot_mode, sizeof(a->bot_mode), "audio");   /* default: REST join only (owner-mic unlock) */
     a->bot_solo_owner = true;     /* cloud-mic loopback defaults to "listen only to me" */
+    a->gain_owner = 1.0f;         /* volume policy defaults: owner loudest, host/friend slightly lower */
+    a->gain_guest = 0.7f;
+    a->overload_threshold = 3;    /* >3 queued room commands => owner-only until drained */
+    a->llm_compact_pct = 80;      /* compaction on by default at 80% of the context window */
+    a->llm_compact_strategy = 1;  /* BSDR_COMPACT_SUMMARY — preserve the gist over a long session */
+    /* A free, keyless default search endpoint (DuckDuckGo Instant Answer API, JSON). The query is
+     * appended as &q=... The owner can point this at any endpoint that takes ?q= / &q=. */
+    snprintf(a->web_search_endpoint, sizeof a->web_search_endpoint,
+             "https://api.duckduckgo.com/?format=json&no_html=1&no_redirect=1");
+    snprintf(a->cdp_endpoint, sizeof a->cdp_endpoint, "http://127.0.0.1:9222");   /* default CDP endpoint (disabled until enabled) */
     a->voiceai_tier = 1;          /* AI voice tier default: CPU */
     a->cloud_auto_share = true;   /* follow the Quest's RDC screen (auto start/stop sharing) */
     /* Cloud VIDEO is ON: the relay video is plain H.264 (NOT encrypted, as first thought) but uses
@@ -174,8 +197,16 @@ static void recompute_bitrate_locked(bsdr_app *a) {
     a->bitrate = eff;
 }
 
+void bsdr_app_await_device_begin(bsdr_app *a) {
+    bsdr_mutex_lock(a->lock); a->lan_await_device = 1; bsdr_mutex_unlock(a->lock);
+}
+bool bsdr_app_await_device_pending(bsdr_app *a) {
+    bsdr_mutex_lock(a->lock); int p = a->lan_await_device; bsdr_mutex_unlock(a->lock); return p != 0;
+}
+
 void bsdr_app_set_quality(bsdr_app *a, int w, int h, int bitrate) {
     bsdr_mutex_lock(a->lock);
+    if (h >= 0) a->lan_await_device = 0;   /* the headset's /device resolution arrived — stop waiting */
     if (w >= 0) a->res_w = w;
     if (h >= 0) a->res_h = h;
     /* The headset's bitrate is a fixed cycle (1/3/5/8/.../100 Mbps) and it forces 3 Mbps when
@@ -280,6 +311,30 @@ void bsdr_app_set_voice(bsdr_app *a, const char *se, const char *st, const char 
     bsdr_mutex_unlock(a->lock);
     settings_save(a);   /* persist STT/LLM endpoint+model+token across restarts */
     BSDR_INFO("bsdr.app", "voice config: stt=%s llm=%s", a->stt_endpoint, a->llm_endpoint);
+    bsdr_app_detect_llm_context(a);   /* refresh the auto context-window in the background */
+}
+
+/* Background worker: ask the LLM endpoint for the model's context window and cache it. Best-effort. */
+static void detect_ctx_fn(void *arg) {
+    bsdr_app *a = (bsdr_app *)arg;
+    bsdr_llm_config cfg; memset(&cfg, 0, sizeof cfg);
+    bsdr_mutex_lock(a->lock);
+    snprintf(cfg.endpoint, sizeof cfg.endpoint, "%s", a->llm_endpoint);
+    snprintf(cfg.token,    sizeof cfg.token,    "%s", a->llm_token);
+    snprintf(cfg.model,    sizeof cfg.model,    "%s", a->llm_model);
+    bsdr_mutex_unlock(a->lock);
+    if (!cfg.endpoint[0]) return;
+    int ctx = bsdr_llm_detect_context(&cfg);
+    if (ctx > 0) { bsdr_mutex_lock(a->lock); a->llm_context_detected = ctx; bsdr_mutex_unlock(a->lock); }
+}
+
+void bsdr_app_detect_llm_context(bsdr_app *a) {
+    if (!a || !a->llm_endpoint[0]) return;
+    bsdr_thread_start_detached(detect_ctx_fn, a);   /* don't block the caller / web request */
+}
+
+void bsdr_app_request_keyframe(bsdr_app *a) {
+    if (a) a->keyframe_gen++;   /* each encode loop serves the new generation once */
 }
 void bsdr_app_get_voice(bsdr_app *a, char *se, char *st, char *sm,
                         char *le, char *lt, char *lm, size_t each) {
@@ -315,6 +370,23 @@ void bsdr_app_set_compctl_status(bsdr_app *a, bool active, const char *msg) {
 
 void bsdr_app_free(bsdr_app *a) {
     if (a->cloud_stream) { bsdr_cloud_stream_stop(a->cloud_stream); a->cloud_stream = NULL; }
+    /* Stop the speak worker: flag + wake it, then join (it aborts any in-flight utterance). */
+    bsdr_thread *w = NULL;
+    if (a->lock) {
+        bsdr_mutex_lock(a->lock);
+        a->tts_stop = true;
+        if (a->tts_cv) bsdr_cond_signal(a->tts_cv);
+        w = (bsdr_thread *)a->tts_worker; a->tts_worker = NULL;
+        bsdr_mutex_unlock(a->lock);
+    }
+    if (w) bsdr_thread_join(w);
+    struct tts_utt *u = (struct tts_utt *)a->tts_q_head;   /* drain any leftover queued lines */
+    while (u) { struct tts_utt *n = u->next; free(u); u = n; }
+    a->tts_q_head = a->tts_q_tail = NULL;
+    if (a->tts_cv) { bsdr_cond_free(a->tts_cv); a->tts_cv = NULL; }
+    if (a->botsense) { bsdr_botsense_free((bsdr_botsense *)a->botsense); a->botsense = NULL; }
+    if (a->input_inj) { bsdr_injector_destroy((bsdr_injector *)a->input_inj); a->input_inj = NULL; }
+    if (a->acl) { bsdr_acl_free(a->acl); a->acl = NULL; }
     if (a->lock) bsdr_mutex_free(a->lock);
 }
 
@@ -458,6 +530,13 @@ void bsdr_app_set_threed(bsdr_app *a, int mode, int deepness, int convergence, i
     bsdr_mutex_unlock(a->lock);
 }
 
+void bsdr_app_recapture(bsdr_app *a) {
+    if (!a) return;
+    bsdr_mutex_lock(a->lock);
+    a->threed_gen++;   /* same reopen path the 3D toggle uses: close+reopen re-queries the video-src hook */
+    bsdr_mutex_unlock(a->lock);
+}
+
 void bsdr_app_get_threed(bsdr_app *a, int *mode, int *deepness, int *convergence, int *swap,
                          int *full, int *tier, char *ai_cmd, size_t ai_len) {
     bsdr_mutex_lock(a->lock);
@@ -480,6 +559,130 @@ void bsdr_app_set_cloud_mic_fallback(bsdr_app *a, bool on) {
 void bsdr_app_set_owner_mic_local(bsdr_app *a, bool on) {
     bsdr_mutex_lock(a->lock);
     a->owner_mic_local = on;
+    bsdr_mutex_unlock(a->lock);
+    settings_save(a);   /* remember the owner-mic source choice across restarts */
+}
+
+void bsdr_app_set_owner_mic_to_questmic(bsdr_app *a, bool on) {
+    bsdr_mutex_lock(a->lock);
+    a->owner_mic_to_questmic = on;
+    bsdr_mutex_unlock(a->lock);
+    settings_save(a);   /* the "route owner voice into BSDR_QuestMic" toggle must survive a restart */
+    BSDR_INFO("bsdr.app", "owner voice -> BSDR_QuestMic device: %s", on ? "on" : "off");
+}
+
+void bsdr_app_set_tts(bsdr_app *a, const bsdr_tts_config *cfg, bool enabled, int route) {
+    bsdr_mutex_lock(a->lock);
+    if (cfg) {
+        char keep[256]; snprintf(keep, sizeof keep, "%s", a->tts.token);   /* preserve secret when blank */
+        a->tts = *cfg;
+        if (!a->tts.token[0]) snprintf(a->tts.token, sizeof a->tts.token, "%s", keep);
+    }
+    a->tts_enabled = enabled;
+    a->tts_route = route ? 1 : 0;
+    bsdr_mutex_unlock(a->lock);
+    BSDR_INFO("bsdr.app", "TTS %s: engine=%s route=%s", enabled ? "on" : "off",
+              (cfg && cfg->engine == BSDR_TTS_CLOUD) ? "cloud" : "local",
+              route ? "desktop-audio" : "cloud-room");
+}
+
+int bsdr_app_botmic_push(bsdr_app *a, const int16_t *pcm, int frames) {
+    /* Push under a->lock: bot_mic is only ever freed (in leave/stop) after being nulled under the
+     * same lock, so holding it here for the brief encode+send makes the free wait — no use-after-free. */
+    int rc = -1;
+    bsdr_mutex_lock(a->lock);
+    if (a->bot_mic) rc = bsdr_botmic_push((bsdr_botmic *)a->bot_mic, pcm, frames);
+    bsdr_mutex_unlock(a->lock);
+    return rc;
+}
+
+/* Synthesize one utterance and pace it out — to the cloud room mic (route 0) or, played into the
+ * desktop sink, the Quest (route 1). Runs on the speak worker, off the caller's thread. Aborts
+ * mid-utterance if teardown flips a->tts_stop (plain read is fine for a cooperative cancel flag). */
+static void tts_render_one(bsdr_app *a, const char *text) {
+    bsdr_tts_config cfg; bool enabled; int route;
+    bsdr_mutex_lock(a->lock);
+    cfg = a->tts; enabled = a->tts_enabled; route = a->tts_route;
+    bsdr_mutex_unlock(a->lock);
+    if (!enabled) return;
+
+    int16_t *pcm = NULL;
+    int frames = bsdr_tts_synth(&cfg, text, &pcm);       /* 48 kHz mono */
+    if (frames <= 0 || !pcm) return;
+
+    if (route == 1) {
+#ifdef BSDR_HAVE_AUDIO
+        /* Desktop audio: play into the default sink (bsdr_speaker) so it's captured and reaches the
+         * Quest alongside the desktop audio. The player's own buffer paces playout. */
+        bsdr_audio_player *pl = bsdr_audio_player_new_quiet("bsdr_speaker", 1);
+        if (pl) {
+            for (int off = 0; off < frames && !a->tts_stop; off += 960)
+                bsdr_audio_player_push(pl, pcm + off, frames - off < 960 ? frames - off : 960);
+            if (!a->tts_stop) bsdr_sleep_ms((frames * 1000) / 48000 + 120);   /* drain before close */
+            bsdr_audio_player_free(pl);
+        }
+#endif
+    } else {
+        /* Cloud room mic: pace 10 ms (480-sample) RTP frames in realtime — matches the real client's
+         * BigMicStream framing — so the receiver's jitter buffer plays out cleanly instead of
+         * overflowing on a burst. (botmic dup-sends each frame; the keepalive uses the same 480.) */
+        for (int off = 0; off < frames && !a->tts_stop; off += 480) {
+            int n = frames - off < 480 ? frames - off : 480;
+            bsdr_app_botmic_push(a, pcm + off, n);
+            bsdr_sleep_ms(10);
+        }
+    }
+    free(pcm);
+}
+
+/* Speak worker: drains the FIFO one utterance at a time so room audio never overlaps. */
+static void tts_worker_fn(void *arg) {
+    bsdr_app *a = (bsdr_app *)arg;
+    bsdr_mutex_lock(a->lock);
+    while (!a->tts_stop) {
+        struct tts_utt *u = (struct tts_utt *)a->tts_q_head;
+        if (!u) { bsdr_cond_wait(a->tts_cv, a->lock); continue; }
+        a->tts_q_head = u->next;
+        if (!a->tts_q_head) a->tts_q_tail = NULL;
+        a->tts_q_len--;
+        bsdr_mutex_unlock(a->lock);
+        tts_render_one(a, u->text);       /* blocking pace, but off the caller's thread */
+        free(u);
+        bsdr_mutex_lock(a->lock);
+    }
+    bsdr_mutex_unlock(a->lock);
+}
+
+/* Queue text for the bot to speak and return immediately (never blocks the LLM tool / web handler).
+ * The worker (lazily started here) synthesizes + paces it into the room in order. */
+void bsdr_app_tts_say(bsdr_app *a, const char *text) {
+    if (!a || !text || !text[0]) return;
+    bsdr_mutex_lock(a->lock);
+    if (!a->tts_enabled || a->tts_stop) { bsdr_mutex_unlock(a->lock); return; }
+    if (!a->tts_worker) {                              /* lazy: one idle thread only once TTS is used */
+        if (!a->tts_cv) a->tts_cv = bsdr_cond_new();
+        a->tts_worker = bsdr_thread_start(tts_worker_fn, a);
+    }
+    /* bounded FIFO: if we're badly backed up (LLM spamming speak), drop the oldest queued line so
+     * fresh speech stays responsive rather than growing an unbounded backlog. */
+    if (a->tts_q_len >= 8) {
+        struct tts_utt *old = (struct tts_utt *)a->tts_q_head;
+        if (old) {
+            a->tts_q_head = old->next;
+            if (!a->tts_q_head) a->tts_q_tail = NULL;
+            a->tts_q_len--;
+            free(old);
+        }
+    }
+    struct tts_utt *u = calloc(1, sizeof *u);
+    if (u) {
+        snprintf(u->text, sizeof u->text, "%s", text);
+        if (a->tts_q_tail) ((struct tts_utt *)a->tts_q_tail)->next = u;
+        else               a->tts_q_head = u;
+        a->tts_q_tail = u;
+        a->tts_q_len++;
+        if (a->tts_cv) bsdr_cond_signal(a->tts_cv);
+    }
     bsdr_mutex_unlock(a->lock);
 }
 
@@ -674,6 +877,275 @@ static bool settings_path(char *out, size_t cap) {
     snprintf(out, cap, "%s/settings", dir);
     return true;
 }
+/* Tiered access-control store (friends/bans/toggles) — a JSON file alongside `settings`, since a
+ * variable-length friends list doesn't fit the flat key=value format. */
+static bool access_path(char *out, size_t cap) {
+    char dir[512];
+    if (!config_dir(dir, sizeof(dir))) return false;
+    snprintf(out, cap, "%s/access.json", dir);
+    return true;
+}
+void bsdr_app_acl_save(bsdr_app *a) {
+    char path[600];
+    if (a->acl && access_path(path, sizeof path)) bsdr_acl_save(a->acl, path);
+}
+static void settings_save(bsdr_app *a);
+void bsdr_app_save_settings(bsdr_app *a) { if (a) settings_save(a); }
+void bsdr_app_acl_load(bsdr_app *a) {
+    char path[600];
+    if (a->acl && access_path(path, sizeof path)) bsdr_acl_load(a->acl, path);
+}
+
+/* Refresh the room participant roster from a raw /room JSON body (called on join and on room-data
+ * pushes). Robust to an unparsable body (leaves the roster empty). Guarded by a->lock. */
+void bsdr_app_refresh_roster(bsdr_app *a, const char *room_json) {
+    if (!a) return;
+    bsdr_roster tmp;
+    char self[200];
+    bsdr_mutex_lock(a->lock);
+    snprintf(self, sizeof self, "%s", a->bot_session_id);
+    bsdr_mutex_unlock(a->lock);
+    int n = bsdr_roster_parse(&tmp, room_json, self);
+    bsdr_mutex_lock(a->lock);
+    a->roster = tmp;
+    char tok[2048], room[128];
+    snprintf(tok, sizeof tok, "%s", a->bot_access_token);
+    snprintf(room, sizeof room, "%s", a->bot_room_id);
+    bool joiner = (n > a->roster_prev_n);          /* someone new appeared since last refresh */
+    bool sharing = a->internet_sharing;
+    a->roster_prev_n = n;
+    bsdr_mutex_unlock(a->lock);
+    BSDR_DEBUG("bsdr.app", "roster refreshed: %d participant(s)", n);
+    /* A new joiner's cloud consumer needs a keyframe to start decoding; force one now instead of
+     * making them wait for the next scheduled GOP (only meaningful while internet-sharing). */
+    if (joiner && sharing) { BSDR_INFO("bsdr.app", "new joiner -> forcing a keyframe for the cloud stream"); bsdr_app_request_keyframe(a); }
+    /* Soft-ban enforcement: auto-re-kick any banned participant that (re)joined while the bot is here. */
+    if (room[0] && tok[0])
+        for (int i = 0; i < tmp.n; i++) {
+            if (tmp.e[i].is_self || !tmp.e[i].user_session_id[0]) continue;
+            if (bsdr_acl_is_banned(a->acl, tmp.e[i].social_id, tmp.e[i].username)) {
+                BSDR_INFO("bsdr.app", "re-kicking banned %s", tmp.e[i].username[0] ? tmp.e[i].username : "?");
+                bsdr_cloud_kick(tok, room, tmp.e[i].user_session_id);
+            }
+        }
+    /* Auto mic-check: when enabled and the bot is moderating (owner present or a stay-with target),
+     * age-verify the first unknown (non-owner/friend/host, non-banned) joiner — one at a time; the
+     * router dedups so a given person is only auto-checked once per session. */
+    bool mca; char stayw[64];
+    bsdr_mutex_lock(a->lock); mca = a->mic_check_auto; snprintf(stayw, sizeof stayw, "%s", a->stay_with); bsdr_mutex_unlock(a->lock);
+    if (mca && a->roomcmd && (bsdr_app_owner_ssrc(a) != 0 || stayw[0]))
+        for (int i = 0; i < tmp.n; i++) {
+            if (tmp.e[i].is_self || tmp.e[i].ssrc == 0) continue;
+            if (bsdr_acl_is_banned(a->acl, tmp.e[i].social_id, tmp.e[i].username)) continue;
+            if (bsdr_acl_resolve(a->acl, tmp.e[i].social_id, tmp.e[i].username, tmp.e[i].is_host) != BSDR_ACL_NONE)
+                continue;   /* owner / friend / host = known */
+            if (bsdr_roomcmd_autocheck((bsdr_roomcmd *)a->roomcmd, tmp.e[i].ssrc, tmp.e[i].username)) break;
+        }
+}
+
+uint32_t bsdr_app_owner_ssrc(bsdr_app *a) {
+    if (!a) return 0;
+    bsdr_mutex_lock(a->lock);
+    bsdr_roster s = a->roster;
+    bsdr_mutex_unlock(a->lock);
+    for (int i = 0; i < s.n; i++) {
+        if (s.e[i].is_self) continue;
+        if (bsdr_acl_resolve(a->acl, s.e[i].social_id, s.e[i].username, s.e[i].is_host) == BSDR_ACL_OWNER)
+            return s.e[i].ssrc;
+    }
+    return 0;
+}
+
+/* Serialize the cached roster as a JSON array for a plugin (bot host-service surface, ABI 4). */
+size_t bsdr_app_roster_json(bsdr_app *a, char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!a) { if (cap >= 3) { snprintf(out, cap, "[]"); return 2; } return 0; }
+    bsdr_mutex_lock(a->lock);
+    bsdr_roster s = a->roster;
+    bsdr_mutex_unlock(a->lock);
+    size_t o = 0;
+    o += (size_t)snprintf(out + o, cap - o, "[");
+    for (int i = 0; i < s.n && o < cap - 320; i++) {
+        int lvl = a->acl ? (int)bsdr_acl_resolve(a->acl, s.e[i].social_id, s.e[i].username, s.e[i].is_host) : 0;
+        char ue[160], se[200], le[160];
+        bsdr_json_escape(ue, sizeof ue, s.e[i].username);
+        bsdr_json_escape(se, sizeof se, s.e[i].social_id);
+        bsdr_json_escape(le, sizeof le, s.e[i].legacy_user_id);
+        o += (size_t)snprintf(out + o, cap - o,
+            "%s{\"ssrc\":%u,\"username\":\"%s\",\"socialId\":\"%s\",\"legacyUserId\":\"%s\","
+            "\"level\":%d,\"isHost\":%s,\"isSelf\":%s}",
+            i ? "," : "", s.e[i].ssrc, ue, se, le, lvl,
+            s.e[i].is_host ? "true" : "false", s.e[i].is_self ? "true" : "false");
+    }
+    if (o < cap) o += (size_t)snprintf(out + o, cap - o, "]");
+    return o;
+}
+
+/* Resolve a speaker's SSRC to {socialId,username,level,isHost,isSelf}; returns 1 if found, else 0. */
+int bsdr_app_resolve_ssrc(bsdr_app *a, uint32_t ssrc, char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!a || !out || cap == 0) return 0;
+    bsdr_mutex_lock(a->lock);
+    bsdr_roster s = a->roster;
+    bsdr_mutex_unlock(a->lock);
+    const bsdr_roster_entry *e = bsdr_roster_by_ssrc(&s, ssrc);
+    if (!e) return 0;
+    int lvl = a->acl ? (int)bsdr_acl_resolve(a->acl, e->social_id, e->username, e->is_host) : 0;
+    char ue[160], se[200];
+    bsdr_json_escape(ue, sizeof ue, e->username);
+    bsdr_json_escape(se, sizeof se, e->social_id);
+    snprintf(out, cap, "{\"socialId\":\"%s\",\"username\":\"%s\",\"level\":%d,\"isHost\":%s,\"isSelf\":%s}",
+             se, ue, lvl, e->is_host ? "true" : "false", e->is_self ? "true" : "false");
+    return 1;
+}
+
+/* Transcribe PCM using the app's configured STT endpoint (bot host-service, ABI 4). Returns 1 on
+ * success with text in out, else 0. */
+int bsdr_app_stt(bsdr_app *a, const int16_t *pcm, int frames, int rate, int channels,
+                 char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!a || !pcm || frames <= 0 || !out || cap == 0) return 0;
+    bsdr_stt_config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    bsdr_mutex_lock(a->lock);
+    snprintf(cfg.endpoint, sizeof cfg.endpoint, "%s", a->stt_endpoint);
+    snprintf(cfg.token,    sizeof cfg.token,    "%s", a->stt_token);
+    snprintf(cfg.model,    sizeof cfg.model,    "%s", a->stt_model);
+    bsdr_mutex_unlock(a->lock);
+    return bsdr_stt_transcribe(&cfg, pcm, frames, rate, channels, out, cap) ? 1 : 0;
+}
+
+/* A bot plugin subscribes/unsubscribes to complete room utterances. Lazily brings up the segmenter on
+ * first subscribe; NULL cb tears the subscription down (waiting for any in-flight callback). The
+ * segmenter itself is freed with the app. */
+void bsdr_app_utterance_subscribe(bsdr_app *a, bsdr_utterance_cb cb, void *user) {
+    if (!a) return;
+    if (cb && !a->botsense) a->botsense = bsdr_botsense_new();
+    if (a->botsense) bsdr_botsense_set_cb((bsdr_botsense *)a->botsense, cb, user);
+    if (cb) BSDR_INFO("bsdr.app", "a plugin now owns the bot's hearing (in-core router bypassed)");
+    else    BSDR_INFO("bsdr.app", "plugin bot hearing released (in-core router resumes)");
+}
+
+int bsdr_app_botsense_active(bsdr_app *a) {
+    return (a && a->botsense && bsdr_botsense_has_cb((bsdr_botsense *)a->botsense)) ? 1 : 0;
+}
+
+/* One LLM round-trip using the app's configured endpoint (bot host-service, ABI 4). The plugin owns the
+ * agentic loop; this is the wire call. Returns 1 with the assistant message object in out, else 0. */
+int bsdr_app_llm_complete(bsdr_app *a, const char *messages_json, const char *tools_json,
+                          char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!a) return 0;
+    bsdr_llm_config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    bsdr_mutex_lock(a->lock);
+    snprintf(cfg.endpoint, sizeof cfg.endpoint, "%s", a->llm_endpoint);
+    snprintf(cfg.token,    sizeof cfg.token,    "%s", a->llm_token);
+    snprintf(cfg.model,    sizeof cfg.model,    "%s", a->llm_model);
+    bsdr_mutex_unlock(a->lock);
+    return bsdr_llm_complete_once(&cfg, messages_json, tools_json, out, cap);
+}
+
+/* The bot avatar presence state (0=off 1=connecting 2=up 3=ghost) — bot host-service. */
+int bsdr_app_avatar_state(bsdr_app *a) {
+    if (!a) return 0;
+    bsdr_mutex_lock(a->lock);
+    void *br = a->bot_room;
+    bsdr_mutex_unlock(a->lock);
+    return br ? (int)bsdr_botroom_avatar_state((bsdr_botroom *)br) : 0;
+}
+
+/* The bot's OWN legacyUserId (from its is_self roster entry). Returns 1 and fills out if known. */
+int bsdr_app_local_legacy_id(bsdr_app *a, char *out, size_t cap) {
+    if (out && cap) out[0] = '\0';
+    if (!a || !out || cap == 0) return 0;
+    bsdr_mutex_lock(a->lock);
+    bsdr_roster s = a->roster;
+    bsdr_mutex_unlock(a->lock);
+    for (int i = 0; i < s.n; i++)
+        if (s.e[i].is_self && s.e[i].legacy_user_id[0]) { snprintf(out, cap, "%s", s.e[i].legacy_user_id); return 1; }
+    return 0;
+}
+
+bool bsdr_app_kick_user(bsdr_app *a, const char *username) {
+    if (!a || !username || !username[0]) return false;
+    char tok[2048], room[128], usid[200] = "";
+    bsdr_mutex_lock(a->lock);
+    snprintf(tok, sizeof tok, "%s", a->bot_access_token);
+    snprintf(room, sizeof room, "%s", a->bot_room_id);
+    const bsdr_roster_entry *e = bsdr_roster_by_username(&a->roster, username);
+    if (e) snprintf(usid, sizeof usid, "%s", e->user_session_id);
+    bsdr_mutex_unlock(a->lock);
+    if (!usid[0] || !room[0] || !tok[0]) { BSDR_WARN("bsdr.app", "kick: %s not found / no room", username); return false; }
+    return bsdr_cloud_kick(tok, room, usid) / 100 == 2;
+}
+
+/* Reset the room: kick every participant so everyone drops to the lobby and can rejoin a fresh room.
+ * Owner-only. Clean server action (the official kick) — recovers a stuck/frozen room without crashing
+ * anyone. Returns the number kicked. */
+int bsdr_app_reset_room(bsdr_app *a) {
+    if (!a) return 0;
+    char tok[2048], room[128], self[200];
+    bsdr_roster s;
+    bsdr_mutex_lock(a->lock);
+    snprintf(tok, sizeof tok, "%s", a->bot_access_token);
+    snprintf(room, sizeof room, "%s", a->bot_room_id);
+    snprintf(self, sizeof self, "%s", a->bot_session_id);
+    s = a->roster;
+    bsdr_mutex_unlock(a->lock);
+    if (!room[0] || !tok[0]) { BSDR_WARN("bsdr.app", "reset_room: bot not in a room"); return 0; }
+    int n = 0;
+    for (int i = 0; i < s.n; i++) {
+        if (s.e[i].is_self || !s.e[i].user_session_id[0]) continue;      /* not the bot itself */
+        if (self[0] && strcmp(s.e[i].user_session_id, self) == 0) continue;
+        if (bsdr_cloud_kick(tok, room, s.e[i].user_session_id) / 100 == 2) n++;
+    }
+    BSDR_INFO("bsdr.app", "reset_room: kicked %d participant(s) from %s (everyone rejoins fresh)", n, room);
+    return n;
+}
+
+bool bsdr_app_ban_user(bsdr_app *a, const char *username) {
+    if (!a || !username || !username[0]) return false;
+    char sid[80] = "";
+    bsdr_mutex_lock(a->lock);
+    const bsdr_roster_entry *e = bsdr_roster_by_username(&a->roster, username);
+    if (e) snprintf(sid, sizeof sid, "%s", e->social_id);
+    bsdr_mutex_unlock(a->lock);
+    bsdr_acl_ban_add(a->acl, sid[0] ? sid : NULL, username);   /* persist first, so a rejoin is caught */
+    bsdr_app_acl_save(a);
+    return bsdr_app_kick_user(a, username);
+}
+
+int bsdr_app_audio_gains(bsdr_app *a, uint32_t *ssrc_out, float *gain_out, int cap, float *default_out) {
+    if (!a || !ssrc_out || !gain_out || cap <= 0) return -1;
+    bsdr_mutex_lock(a->lock);
+    bsdr_roster s = a->roster;            /* snapshot */
+    bool solo_owner = a->bot_solo_owner;
+    uint32_t mc = a->mic_check_ssrc;
+    float g_owner = a->gain_owner, g_guest = a->gain_guest;
+    bsdr_mutex_unlock(a->lock);
+    if (s.n == 0) return -1;
+    int m = 0, owner_found = 0;
+    for (int i = 0; i < s.n && m < cap; i++) {
+        if (s.e[i].is_self || s.e[i].ssrc == 0) continue;   /* never loop the bot's own voice */
+        bsdr_acl_level lvl = bsdr_acl_resolve(a->acl, s.e[i].social_id, s.e[i].username, s.e[i].is_host);
+        float g;
+        if (s.e[i].ssrc == mc)                 g = 1.0f;    /* mic-check target: keep audible */
+        else if (lvl == BSDR_ACL_OWNER)      { g = g_owner; owner_found = 1; }
+        else if (solo_owner)                   g = 0.0f;    /* "listen only to me" */
+        else if (lvl == BSDR_ACL_HOST || lvl == BSDR_ACL_FRIEND) g = g_guest;  /* slightly below owner */
+        else                                   g = 0.0f;    /* strangers silenced */
+        if (lvl == BSDR_ACL_OWNER) owner_found = 1;
+        ssrc_out[m] = s.e[i].ssrc; gain_out[m] = g; m++;
+    }
+    /* Only mute-by-default once we can actually identify the owner in the room — otherwise a bad/empty
+     * roster would silence everyone (incl. the owner). Without that anchor, fall back to unity. */
+    if (!owner_found && mc == 0) return -1;
+    if (default_out) *default_out = 0.0f;
+    return m;
+}
+
 static void settings_save(bsdr_app *a) {
     char path[600];
     if (!settings_path(path, sizeof(path))) return;
@@ -681,8 +1153,10 @@ static void settings_save(bsdr_app *a) {
     int cpu = a->cpu_only ? 1 : 0, bro = a->bitrate_override, ptouch = a->pointer_touch ? 1 : 0;
     int encp = a->enc_level, lan1x = a->lan_1x ? 1 : 0, fcap = a->fps_cap, wopt = a->wifi_opt ? 1 : 0;
     int x264t = a->enc_x264_threads, vaapi = a->use_vaapi ? 1 : 0, kms = a->use_kmsgrab ? 1 : 0;
+    int cpli = a->cloud_rtcp_pli ? 1 : 0;
     int smeth = a->sniff_method, sport = a->sniff_remote_port, swant = a->sniff_want ? 1 : 0;
-    char bmode[8]; snprintf(bmode, sizeof bmode, "%s", a->bot_mode[0] ? a->bot_mode : "audio");
+    int omlocal = a->owner_mic_local ? 1 : 0, omquest = a->owner_mic_to_questmic ? 1 : 0;
+    char bmode[16]; snprintf(bmode, sizeof bmode, "%s", a->bot_mode[0] ? a->bot_mode : "audio");
     int bfollow = a->bot_follow ? 1 : 0, bloop = a->bot_loopback ? 1 : 0, bsolo = a->bot_solo_owner ? 1 : 0;
     int vfon = a->voice_fx_on ? 1 : 0, vsub = a->voice_substitute ? 1 : 0;
     int vg = a->voice_gender, vfm = a->voice_formant, vvol = a->voice_volume;
@@ -694,15 +1168,23 @@ static void settings_save(bsdr_app *a) {
     snprintf(se, sizeof se, "%s", a->stt_endpoint); snprintf(sm, sizeof sm, "%s", a->stt_model);
     snprintf(stk, sizeof stk, "%s", a->stt_token);  snprintf(le, sizeof le, "%s", a->llm_endpoint);
     snprintf(lm, sizeof lm, "%s", a->llm_model);    snprintf(ltk, sizeof ltk, "%s", a->llm_token);
+    int mca = a->mic_check_auto ? 1 : 0;
+    int govr = (int)(a->gain_owner * 100 + 0.5f), ggst = (int)(a->gain_guest * 100 + 0.5f), othr = a->overload_threshold;
+    int lctx = a->llm_context_tokens, lcp = a->llm_compact_pct, lcs = a->llm_compact_strategy, lmr = a->llm_max_rounds;
+    char wse[256], wst[256];
+    snprintf(wse, sizeof wse, "%s", a->web_search_endpoint);
+    snprintf(wst, sizeof wst, "%s", a->web_search_token);
     bsdr_mutex_unlock(a->lock);
     FILE *f = fopen(path, "w");
     if (!f) { BSDR_WARN("bsdr.app", "could not save settings to %s", path); return; }
+    fprintf(f, "cloud_rtcp_pli=%d\n", cpli);
     fprintf(f, "cpu_only=%d\nbitrate_override=%d\npointer_touch=%d\n"
                "sniff_method=%d\nsniff_relay_port=%d\nsniff_want=%d\nbot_mode=%s\nbot_follow=%d\n"
                "bot_loopback=%d\nbot_solo_owner=%d\nenc_level=%d\nlan_1x=%d\nfps_cap=%d\nwifi_opt=%d\n"
                "x264_threads=%d\nuse_vaapi=%d\nuse_kmsgrab=%d\n",
             cpu, bro, ptouch, smeth, sport, swant, bmode, bfollow, bloop, bsolo, encp, lan1x, fcap, wopt,
             x264t, vaapi, kms);
+    fprintf(f, "owner_mic_local=%d\nowner_mic_to_questmic=%d\n", omlocal, omquest);   /* owner-mic routing */
     fprintf(f, "file_loop=%d\n", a->file_loop);   /* loop the file/playlist source continuously */
     fprintf(f, "term_backend=%s\nterm_cols=%d\nterm_rows=%d\n",   /* terminal-source prefs */
             a->term_backend[0] ? a->term_backend : "pty", a->term_cols, a->term_rows);
@@ -726,6 +1208,15 @@ static void settings_save(bsdr_app *a) {
     if (le[0])  fprintf(f, "llm_endpoint=%s\n", le);
     if (lm[0])  fprintf(f, "llm_model=%s\n", lm);
     if (ltk[0]) fprintf(f, "llm_token=%s\n", ltk);
+    /* in-room bot moderation prefs */
+    fprintf(f, "mic_check_auto=%d\n", mca);
+    fprintf(f, "gain_owner=%d\ngain_guest=%d\noverload_threshold=%d\n", govr, ggst, othr);
+    fprintf(f, "llm_context_tokens=%d\nllm_compact_pct=%d\nllm_compact_strategy=%d\nllm_max_rounds=%d\n",
+            lctx, lcp, lcs, lmr);
+    fprintf(f, "browser_ctl=%d\n", a->browser_ctl_enabled ? 1 : 0);
+    if (a->cdp_endpoint[0]) fprintf(f, "cdp_endpoint=%s\n", a->cdp_endpoint);
+    if (wse[0]) fprintf(f, "web_search_endpoint=%s\n", wse);
+    if (wst[0]) fprintf(f, "web_search_token=%s\n", wst);
     fclose(f);
     BSDR_DEBUG("bsdr.app", "settings saved to %s", path);
 }
@@ -748,6 +1239,8 @@ void bsdr_app_load_settings(bsdr_app *a) {
         else if (sscanf(line, "sniff_method=%d", &v) == 1)     a->sniff_method = (v >= 0 && v <= 2) ? v : 0;
         else if (sscanf(line, "sniff_relay_port=%d", &v) == 1) a->sniff_remote_port = (v > 0 && v < 65536) ? v : 0;
         else if (sscanf(line, "sniff_want=%d", &v) == 1)       a->sniff_want = v ? true : false;
+        else if (sscanf(line, "owner_mic_local=%d", &v) == 1)       a->owner_mic_local = v ? true : false;
+        else if (sscanf(line, "owner_mic_to_questmic=%d", &v) == 1) a->owner_mic_to_questmic = v ? true : false;
         else if (sscanf(line, "enc_level=%d", &v) == 1)        a->enc_level = v < 0 ? 0 : v > 2 ? 2 : v;
         else if (sscanf(line, "enc_perf=%d", &v) == 1)         a->enc_level = v ? 2 : 0;  /* legacy bool -> level */
         else if (sscanf(line, "x264_threads=%d", &v) == 1)     a->enc_x264_threads = v < 0 ? 0 : v > 32 ? 32 : v;
@@ -757,6 +1250,7 @@ void bsdr_app_load_settings(bsdr_app *a) {
         else if (sscanf(line, "term_backend=%7[a-z]", a->term_backend) == 1) { if (strcmp(a->term_backend,"xvfb")) snprintf(a->term_backend, sizeof(a->term_backend), "pty"); }
         else if (sscanf(line, "use_vaapi=%d", &v) == 1)        a->use_vaapi = v ? true : false;
         else if (sscanf(line, "use_kmsgrab=%d", &v) == 1)      a->use_kmsgrab = v ? true : false;
+        else if (sscanf(line, "cloud_rtcp_pli=%d", &v) == 1)   a->cloud_rtcp_pli = v ? true : false;
         else if (sscanf(line, "lan_1x=%d", &v) == 1)           a->lan_1x = v ? true : false;
         else if (sscanf(line, "fps_cap=%d", &v) == 1)          a->fps_cap = (v >= 0 && v <= 120) ? v : 0;
         else if (sscanf(line, "wifi_opt=%d", &v) == 1)         a->wifi_opt = v ? true : false;
@@ -787,9 +1281,11 @@ void bsdr_app_load_settings(bsdr_app *a) {
                 }
             }
         }
-        else if (sscanf(line, "bot_mode=%7[^\n]", a->bot_mode) == 1) {
-            if (strcmp(a->bot_mode, "full") != 0 && strcmp(a->bot_mode, "audio") != 0)
-                snprintf(a->bot_mode, sizeof a->bot_mode, "audio");
+        else if (sscanf(line, "bot_mode=%15[^\n]", a->bot_mode) == 1) {
+            /* Accept any saved mode name: "audio" is built-in; a plugin mode (e.g. "fullbot") activates
+             * when its plugin registers it at load. Legacy "full" maps to the plugin "fullbot". If no
+             * plugin ever claims the name it simply behaves as bare audio (nothing activates it). */
+            if (strcmp(a->bot_mode, "full") == 0) snprintf(a->bot_mode, sizeof a->bot_mode, "fullbot");
         }
         else if (sscanf(line, "bot_follow=%d", &v) == 1) a->bot_follow = v ? true : false;
         else if (sscanf(line, "bot_loopback=%d", &v) == 1) a->bot_loopback = v ? true : false;
@@ -800,6 +1296,19 @@ void bsdr_app_load_settings(bsdr_app *a) {
         else if (sscanf(line, "llm_endpoint=%255[^\n]", a->llm_endpoint) == 1) continue;
         else if (sscanf(line, "llm_model=%63[^\n]", a->llm_model) == 1) continue;
         else if (sscanf(line, "llm_token=%255[^\n]", a->llm_token) == 1) continue;
+        else if (sscanf(line, "mic_check_auto=%d", &v) == 1) a->mic_check_auto = v ? true : false;
+        else if (sscanf(line, "gain_owner=%d", &v) == 1) a->gain_owner = v / 100.0f;
+        else if (sscanf(line, "gain_guest=%d", &v) == 1) a->gain_guest = v / 100.0f;
+        else if (sscanf(line, "overload_threshold=%d", &v) == 1) a->overload_threshold = (v >= 1 && v <= 99) ? v : 3;
+        else if (strncmp(line, "bot_personality=", 16) == 0) continue;   /* moved to the fullbot plugin */
+        else if (sscanf(line, "browser_ctl=%d", &v) == 1) a->browser_ctl_enabled = v ? true : false;
+        else if (sscanf(line, "cdp_endpoint=%255[^\n]", a->cdp_endpoint) == 1) continue;
+        else if (sscanf(line, "llm_context_tokens=%d", &v) == 1) a->llm_context_tokens = v >= 0 ? v : 0;
+        else if (sscanf(line, "llm_compact_pct=%d", &v) == 1) a->llm_compact_pct = (v <= 100) ? v : 80;
+        else if (sscanf(line, "llm_compact_strategy=%d", &v) == 1) a->llm_compact_strategy = (v >= 0 && v <= 2) ? v : 1;
+        else if (sscanf(line, "llm_max_rounds=%d", &v) == 1) a->llm_max_rounds = (v >= 0 && v <= 200) ? v : 0;
+        else if (sscanf(line, "web_search_endpoint=%255[^\n]", a->web_search_endpoint) == 1) continue;
+        else if (sscanf(line, "web_search_token=%255[^\n]", a->web_search_token) == 1) continue;
     }
 #if defined(__ANDROID__)
     a->sniff_method = 2;                        /* Android: relay only, whatever was saved */
@@ -815,6 +1324,7 @@ void bsdr_app_load_settings(bsdr_app *a) {
     fclose(f);
     BSDR_INFO("bsdr.app", "loaded settings from %s (encoder=%s, bitrate override=%d)",
               path, a->cpu_only ? "cpu/x264" : "gpu/nvenc", a->bitrate_override);
+    bsdr_app_acl_load(a);   /* friends / bans / access toggles (access.json) */
 }
 
 /* lines: access_token / refresh_token / email / name (token strings have no newlines). */
@@ -844,8 +1354,11 @@ void bsdr_app_login(bsdr_app *a, const char *email, const char *password) {
 
     bsdr_cloud_result res;
     bool ok = bsdr_cloud_login(0, email, password, &res);   /* blocking HTTPS */
-    char name[128] = "";
-    if (ok) bsdr_cloud_account(bsdr_cloud_api_key(), res.access_token, name, sizeof(name));
+    char name[128] = "", osid[80] = "";
+    if (ok) {
+        bsdr_cloud_account(bsdr_cloud_api_key(), res.access_token, name, sizeof(name));
+        bsdr_cloud_my_socialid(res.access_token, osid, sizeof osid);   /* owner = the primary account */
+    }
 
     bsdr_mutex_lock(a->lock);
     a->cloud_logged_in = ok;
@@ -856,6 +1369,7 @@ void bsdr_app_login(bsdr_app *a, const char *email, const char *password) {
         snprintf(a->cloud_name, sizeof(a->cloud_name), "%s", name[0] ? name : email);
     }
     bsdr_mutex_unlock(a->lock);
+    if (ok) { bsdr_acl_set_owner(a->acl, osid, name[0] ? name : email); bsdr_app_acl_save(a); }
 
     /* Open the presence WS so the host shows online and a Quest can add a screen. */
     if (ok) {
@@ -921,6 +1435,13 @@ bool bsdr_app_restore_session(bsdr_app *a) {
     bsdr_mutex_unlock(a->lock);
 
     session_save(a);   /* persist any renewed token */
+    /* owner = the primary account; resolve its socialId for access-control (best-effort, non-fatal).
+     * Skip the network call entirely when access.json already carries it — otherwise we'd re-resolve
+     * (and re-log any server error) on every launch even though it never changes. */
+    char osid[80] = "";
+    bsdr_acl_get_owner_social_id(a->acl, osid, sizeof osid);
+    if (!osid[0]) bsdr_cloud_my_socialid(access, osid, sizeof osid);
+    bsdr_acl_set_owner(a->acl, osid, a->cloud_name); bsdr_app_acl_save(a);
     bsdr_cloud_ws *ws = bsdr_cloud_ws_open(a->access_token, 0);
     bsdr_mutex_lock(a->lock);
     a->cloud_ws = ws;
@@ -991,6 +1512,8 @@ void bsdr_app_bot_login(bsdr_app *a, const char *email, const char *password) {
     if (ok) {
         char sid[80] = ""; bsdr_cloud_my_socialid(res.access_token, sid, sizeof sid);
         bsdr_mutex_lock(a->lock); snprintf(a->bot_social_id, sizeof a->bot_social_id, "%s", sid); bsdr_mutex_unlock(a->lock);
+        bsdr_acl_set_bot(a->acl, sid, a->bot_name);   /* bot identity + default wake word (its name) */
+        bsdr_app_acl_save(a);
         bot_session_save(a);
         /* Presence WS: the room-participants count is fanned to sessions the server considers present,
          * so keep the bot's WS open (same reason as the host). */
@@ -1040,12 +1563,19 @@ void bsdr_app_bot_restore(bsdr_app *a) {
     bsdr_mutex_lock(a->lock);
     a->bot_logged_in = true;
     a->bot_stopped = false;
+    a->bot_token_ms = bsdr_now_ms();   /* token just verified/renewed — start the proactive-renew clock */
     snprintf(a->bot_access_token, sizeof(a->bot_access_token), "%s", access);
     snprintf(a->bot_refresh_token, sizeof(a->bot_refresh_token), "%s", refresh);
     snprintf(a->bot_email, sizeof(a->bot_email), "%s", email);
     snprintf(a->bot_name, sizeof(a->bot_name), "%s", vname[0] ? vname : (name[0] ? name : email));
     snprintf(a->bot_msg, sizeof(a->bot_msg), "logged in (restored)");
+    char bname[128]; snprintf(bname, sizeof bname, "%s", a->bot_name);
     bsdr_mutex_unlock(a->lock);
+    /* Restore the bot identity into the ACL too (login does this; restore didn't). set_bot defaults the
+     * wake word to the bot's own name when the owner hasn't set one — so "hey <botname>" works out of
+     * the box after a restart. socialId is left blank (resolved lazily / matched by username). */
+    bsdr_acl_set_bot(a->acl, "", bname);
+    bsdr_app_acl_save(a);
     bot_session_save(a);
     bsdr_cloud_ws *ws = bsdr_cloud_ws_open(access, 1);
     bsdr_mutex_lock(a->lock); a->bot_ws = ws; bsdr_mutex_unlock(a->lock);
@@ -1054,18 +1584,21 @@ void bsdr_app_bot_restore(bsdr_app *a) {
 
 static void bot_set_msg(bsdr_app *a, bool joined, const char *room, const char *fmt, ...);
 static void bot_loopback_apply(bsdr_app *a);
+static bool bot_renew_token(bsdr_app *a);
 
 void bsdr_app_bot_logout(bsdr_app *a) {
     bsdr_mutex_lock(a->lock);
     bsdr_cloud_ws *ws = a->bot_ws;
     bsdr_botroom *room = (bsdr_botroom *)a->bot_room; a->bot_room = NULL;
     bsdr_botaudio *ba = (bsdr_botaudio *)a->bot_audio; a->bot_audio = NULL;
+    bsdr_botmic *bm = (bsdr_botmic *)a->bot_mic; a->bot_mic = NULL;
     a->bot_ws = NULL; a->bot_logged_in = false; a->bot_joined = false;
     a->bot_access_token[0] = a->bot_refresh_token[0] = a->bot_name[0] = a->bot_email[0] = a->bot_room_id[0] = 0;
     snprintf(a->bot_msg, sizeof(a->bot_msg), "not logged in");
     bsdr_mutex_unlock(a->lock);
     if (room) bsdr_botroom_stop(room);   /* tear down the avatar presence */
     if (ba) bsdr_botaudio_stop(ba);      /* tear down the cloud-mic loopback */
+    if (bm) bsdr_botmic_stop(bm);        /* tear down the room-mic producer */
     bot_session_clear();
     if (ws) bsdr_cloud_ws_close(ws);
     BSDR_INFO("bsdr.app", "bot account logged out");
@@ -1079,11 +1612,20 @@ bool bsdr_app_bot_leave_room(bsdr_app *a) {
     bool logged = a->bot_logged_in;
     bsdr_botroom *br = (bsdr_botroom *)a->bot_room; a->bot_room = NULL;
     bsdr_botaudio *ba = (bsdr_botaudio *)a->bot_audio; a->bot_audio = NULL;
+    bsdr_botmic *bm = (bsdr_botmic *)a->bot_mic; a->bot_mic = NULL;
     snprintf(bot_tok, sizeof bot_tok, "%s", a->bot_access_token);
     snprintf(room, sizeof room, "%s", a->bot_room_id);
     bsdr_mutex_unlock(a->lock);
     if (br) bsdr_botroom_stop(br);   /* stop broadcasting the avatar first */
     if (ba) bsdr_botaudio_stop(ba);  /* stop the cloud-mic loopback */
+    if (bm) bsdr_botmic_stop(bm);    /* stop the room-mic producer */
+    /* Clear the joined state up front so the UI/roster stop showing the bot immediately, and the
+     * follow/watch ticks don't treat it as still-in-room (the network leave below is best-effort). */
+    bsdr_mutex_lock(a->lock);
+    a->bot_joined = false;
+    a->bot_room_id[0] = 0;
+    a->bot_audio_ip[0] = 0; a->bot_audio_port = 0; a->bot_owner_sid[0] = 0;
+    bsdr_mutex_unlock(a->lock);
     if (!logged) { bot_set_msg(a, false, NULL, "bot is not logged in"); return false; }
     int rc = room[0] ? bsdr_cloud_leave_room(bot_tok, room) : 0;
     bot_set_msg(a, false, NULL, (rc / 100 == 2 || !room[0]) ? "left the room" : "left the room (HTTP %d)", rc);
@@ -1099,6 +1641,7 @@ void bsdr_app_bot_stop(bsdr_app *a) {
     bsdr_cloud_ws *ws = a->bot_ws; a->bot_ws = NULL;
     bsdr_botroom *br = (bsdr_botroom *)a->bot_room; a->bot_room = NULL;
     bsdr_botaudio *ba = (bsdr_botaudio *)a->bot_audio; a->bot_audio = NULL;
+    bsdr_botmic *bm = (bsdr_botmic *)a->bot_mic; a->bot_mic = NULL;
     snprintf(bot_tok, sizeof bot_tok, "%s", a->bot_access_token);
     snprintf(room, sizeof room, "%s", a->bot_room_id);
     a->bot_logged_in = false; a->bot_joined = false; a->bot_stopped = true;
@@ -1107,6 +1650,7 @@ void bsdr_app_bot_stop(bsdr_app *a) {
     bsdr_mutex_unlock(a->lock);
     if (br) bsdr_botroom_stop(br);
     if (ba) bsdr_botaudio_stop(ba);                      /* stop the cloud-mic loopback */
+    if (bm) bsdr_botmic_stop(bm);                        /* stop the room-mic producer */
     if (room[0]) bsdr_cloud_leave_room(bot_tok, room);   /* best-effort: drop the room participation */
     if (ws) bsdr_cloud_ws_close(ws);                     /* drop online presence (keeps the saved session) */
     BSDR_INFO("bsdr.app", "bot stopped (login remembered)");
@@ -1131,7 +1675,7 @@ static void bot_set_msg(bsdr_app *a, bool joined, const char *room, const char *
     bsdr_mutex_unlock(a->lock);
 }
 bool bsdr_app_bot_join_room(bsdr_app *a) {
-    char host_tok[2048], bot_tok[2048], bot_sid[80], mode[8];
+    char host_tok[2048], bot_tok[2048], bot_sid[80], mode[16];
     bsdr_mutex_lock(a->lock);
     int have = a->cloud_logged_in && a->bot_logged_in;
     snprintf(host_tok, sizeof host_tok, "%s", a->access_token);
@@ -1165,6 +1709,19 @@ bool bsdr_app_bot_join_room(bsdr_app *a) {
      * must not require one). Only if the server actually refuses do we fall back to the invite flow. */
     bsdr_cloud_screen peer; memset(&peer, 0, sizeof peer);
     bool ok = bsdr_cloud_join_room(bot_tok, room.room_id, &peer);
+
+    /* 1b) EXPIRED BOT TOKEN. The bot's access token is short-lived and expires mid-session; then the join
+     * (and /social/profile) 403 with "requires a valid entry for 'x-access-token'" — which is NOT an
+     * authorization refusal. Renew the bot token and retry the direct join ONCE before assuming the bot
+     * needs invite staging (the old code mis-read this 403 as "need a RoomInvite"). */
+    if (!ok && (peer.http_status == 401 || peer.http_status == 403) && bot_renew_token(a)) {
+        bsdr_mutex_lock(a->lock); snprintf(bot_tok, sizeof bot_tok, "%s", a->bot_access_token); bsdr_mutex_unlock(a->lock);
+        if (!bot_sid[0]) { bsdr_cloud_my_socialid(bot_tok, bot_sid, sizeof bot_sid);
+            bsdr_mutex_lock(a->lock); snprintf(a->bot_social_id, sizeof a->bot_social_id, "%s", bot_sid); bsdr_mutex_unlock(a->lock); }
+        memset(&peer, 0, sizeof peer);
+        ok = bsdr_cloud_join_room(bot_tok, room.room_id, &peer);
+        BSDR_INFO("bsdr.app", "bot join retried after token renew -> %s (HTTP %d)", ok ? "OK" : "still refused", peer.http_status);
+    }
 
     /* 2) Refused on a non-open room -> the bot must be STAGED (in the room's stagedSocialIds), which
      * happens when it ACCEPTS a RoomInvite. Prefer an invite already sent from the Bigscreen app (no
@@ -1204,46 +1761,92 @@ bool bsdr_app_bot_join_room(bsdr_app *a) {
         bsdr_cloud_join_room(bot_tok, room.room_id, &peer);   /* best-effort mic peer; failure is fine */
     }
 
-    /* Full-bot mode: after a successful join, bring up the room data plane so an avatar renders.
-     * The bot's own MediaPeer (relay ip + dataPort) comes back in the join response; if the server
-     * didn't include one (some join responses carry only MediaServerInfo), fall back to the room's
-     * presenting-screen relay from GET /rooms — same mediasoup, same dataPort semantics. */
-    if (ok && strcmp(mode, "full") == 0) {
-        const char *rip = peer.media_ip[0] ? peer.media_ip : room.media_ip;
-        int dport = peer.data_port ? peer.data_port : room.data_port;
-        /* The avatar's data-channel prefix MUST be our room legacyUserId — the Quest keys remote avatars
-         * by it (RemoteUsersManager dictionary). Prefer the join response; if it didn't carry one, fetch
-         * the full room state (localUser.legacyUserId). Without it, an avatar cannot render — the Quest
-         * drops every UserState/TickState whose prefix it can't resolve. */
-        char legacy[64] = "";
-        snprintf(legacy, sizeof legacy, "%s", peer.legacy_user_id);
-        if (!legacy[0] && room.room_id[0]) {
-            bsdr_cloud_screen full; memset(&full, 0, sizeof full);
-            if (bsdr_cloud_get_room(bot_tok, room.room_id, &full) && full.legacy_user_id[0])
-                snprintf(legacy, sizeof legacy, "%s", full.legacy_user_id);
+    /* After a successful join, bring up the bot's room MEDIA. The ROOM-MIC PRODUCER is the piece that
+     * matters for the bare "audio" mode: a REST join alone makes the CLOUD participant count rise, but the
+     * Quest gates the owner mic on seeing a real co-participant's MEDIA on the SFU — proven in the field, a
+     * REST-only bot left participants=2 yet the Quest never resumed transmitting the owner mic. So the
+     * producer must run for ANY join, not only when the avatar renders (this used to be gated on
+     * mode=="full" since 29169ff, which is why "audio" mode never unlocked the mic). The AVATAR is a
+     * separate data-channel presence and stays gated on want_avatar. The bot's own MediaPeer (relay ip +
+     * mic/data ports + legacyUserId + seat) comes from GET /room; the flat me.mediaPeer in the join
+     * response is often empty ({}) or the SCREEN's, so prefer GET /room. */
+    int want_avatar; bsdr_mutex_lock(a->lock); want_avatar = a->avatar_enabled; bsdr_mutex_unlock(a->lock);
+    if (ok) {
+        /* The avatar data channel must target the BOT'S OWN mediaPeer (its assigned dataPort), NOT the
+         * presenting screen's data producer. The join response's me.mediaPeer is often empty ({}), so its
+         * flat dataPort actually belongs to the SCREEN (e.g. 47700) — an SCTP INIT there never associates
+         * (mediasoup has that port latched to the owner's producer), leaving the bot a userlist ghost with
+         * no avatar. GET /room returns the bot's own me.mediaPeer (dataPort e.g. 41943) plus our
+         * legacyUserId (the Quest keys remote avatars by it) and seatIndex — prefer all three from there. */
+        bsdr_cloud_screen full; memset(&full, 0, sizeof full);
+        int have_full = (room.room_id[0] && bsdr_cloud_get_room(bot_tok, room.room_id, &full) && full.found);
+
+        /* Remember the bot's own userSessionId (marks its entry/SSRC in the roster) and pull the full
+         * participant roster so access-control + the audio-volume policy know who is present. */
+        if (have_full && full.session_id[0]) {
+            bsdr_mutex_lock(a->lock);
+            snprintf(a->bot_session_id, sizeof a->bot_session_id, "%s", full.session_id);
+            bsdr_mutex_unlock(a->lock);
         }
+        if (room.room_id[0]) {
+            bsdr_roster tmp;
+            bsdr_cloud_get_participants(bot_tok, room.room_id, &tmp, full.session_id);
+            bsdr_mutex_lock(a->lock); a->roster = tmp; bsdr_mutex_unlock(a->lock);
+        }
+
+        const char *rip = (have_full && full.media_ip[0]) ? full.media_ip
+                        : (peer.media_ip[0] ? peer.media_ip : room.media_ip);
+        int dport = (have_full && full.data_port > 0) ? full.data_port
+                  : (peer.data_port ? peer.data_port : room.data_port);
+        char legacy[64] = "";
+        snprintf(legacy, sizeof legacy, "%s",
+                 (have_full && full.legacy_user_id[0]) ? full.legacy_user_id : peer.legacy_user_id);
+        int seat = (have_full && full.seat_index >= 0) ? full.seat_index : peer.seat_index;
+        if (seat < 0) seat = 0;                         /* last resort: a valid seat, never -1 */
         /* replace any presence from a previous join */
         bsdr_mutex_lock(a->lock);
         bsdr_botroom *old_room = (bsdr_botroom *)a->bot_room; a->bot_room = NULL;
+        bsdr_botmic  *old_mic  = (bsdr_botmic *)a->bot_mic;   a->bot_mic  = NULL;
         bsdr_mutex_unlock(a->lock);
         if (old_room) bsdr_botroom_stop(old_room);
-        if (rip && rip[0] && dport > 0 && legacy[0]) {
-            BSDR_INFO("bsdr.app", "full-bot: avatar prefix legacyUserId=%s relay=%s data=%d", legacy, rip, dport);
-            bsdr_botroom *br = bsdr_botroom_start(rip, dport, legacy, /*seat*/-1);
+        if (old_mic)  bsdr_botmic_stop(old_mic);
+        /* ROOM-MIC producer — the media presence that unlocks the owner mic. Runs for ANY join (audio and
+         * fullbot), skipped only by --no-audio. In fullbot mode it also carries the bot's TTS voice; in
+         * bare audio mode it stays silent keepalive, which is enough — the Quest only needs to SEE the
+         * producer to count the bot as a real co-participant. Uses the bot's OWN mediaPeer micPort +
+         * session id from GET /room. Keepalive always on (NULL flag = continuous silence, like a real
+         * client). */
+        bool no_mic; bsdr_mutex_lock(a->lock); no_mic = !a->audio; bsdr_mutex_unlock(a->lock);
+        if (no_mic) {
+            BSDR_WARN("bsdr.app", "bot: room-mic producer SKIPPED (--no-audio) — the Quest may not unlock the owner mic");
+        } else if (have_full && full.mic_port > 0 && full.session_id[0]) {
+            bsdr_botmic *bm = bsdr_botmic_start(rip, full.mic_port, full.session_id, NULL /*keepalive always on*/);
+            bsdr_mutex_lock(a->lock); a->bot_mic = bm; bsdr_mutex_unlock(a->lock);
+            BSDR_INFO("bsdr.app", "bot: room-mic producer up (%s:%d) — audio presence for the owner-mic unlock",
+                      rip ? rip : "(none)", full.mic_port);
+        } else {
+            BSDR_WARN("bsdr.app", "bot: no mic peer from the cloud (GET /room lacked mic_port/session) — "
+                      "the owner-mic unlock may not trigger");
+        }
+
+        /* AVATAR — a separate data-channel presence, only when enabled (fullbot / avatar toggle). */
+        if (want_avatar && rip && rip[0] && dport > 0 && legacy[0]) {
+            BSDR_INFO("bsdr.app", "full-bot: avatar prefix legacyUserId=%s seat=%d relay=%s data=%d", legacy, seat, rip, dport);
+            bsdr_botroom *br = bsdr_botroom_start(rip, dport, legacy, seat);
             bsdr_mutex_lock(a->lock); a->bot_room = br; bsdr_mutex_unlock(a->lock);
-            if (br) bot_set_msg(a, true, room.room_id, "joined the host's room (full bot: avatar up)");
+            if (br) bot_set_msg(a, true, room.room_id, "joined — bringing up avatar\xE2\x80\xA6");
             else    bot_set_msg(a, true, room.room_id, "joined (avatar transport unavailable — audio-only)");
-        } else if (rip && rip[0] && dport > 0) {
+        } else if (want_avatar && rip && rip[0] && dport > 0) {
             BSDR_WARN("bsdr.app", "full-bot: no legacyUserId from the cloud (join + GET /room both lacked it) "
                       "— the avatar can't render; staying joined audio-only. Capture the room JSON to confirm the key.");
             bot_set_msg(a, true, room.room_id, "joined (no legacyUserId for the avatar — check the log)");
-        } else {
+        } else if (want_avatar) {
             BSDR_WARN("bsdr.app", "full-bot: join returned no data peer (relay=%s data=%d) — avatar skipped",
                       rip ? rip : "(none)", dport);
             bot_set_msg(a, true, room.room_id, "joined (no data peer for the avatar — check the log)");
+        } else {
+            bot_set_msg(a, true, room.room_id, "joined the host's room (audio presence up)");
         }
-    } else if (ok) {
-        bot_set_msg(a, true, room.room_id, "joined the host's room");
     } else {
         bot_set_msg(a, false, room.room_id, "room-join failed (HTTP %d)", peer.http_status);
     }
@@ -1297,17 +1900,153 @@ void bsdr_app_set_wifi_opt(bsdr_app *a, bool on) {
     BSDR_INFO("bsdr.app", "Wi-Fi network optimization -> %s (restart the stream to apply)", on ? "on (DSCP/WMM)" : "off");
 }
 
+/* Registered-plugin-mode lookup (caller holds the lock). -1 if not a plugin mode. */
+static int bot_mode_find(bsdr_app *a, const char *name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < a->bot_modes_n; i++)
+        if (strcmp(a->bot_modes[i].name, name) == 0) return i;
+    return -1;
+}
+
+void bsdr_app_bot_mode_register(bsdr_app *a, const char *name, bsdr_bot_mode_cb cb, void *user) {
+    if (!a || !name || !name[0] || strlen(name) >= sizeof a->bot_modes[0].name) return;
+    if (strcmp(name, "audio") == 0) return;                 /* "audio" is the reserved core built-in */
+    bsdr_bot_mode_cb activate = NULL; void *au = NULL;
+    bsdr_mutex_lock(a->lock);
+    int i = bot_mode_find(a, name);
+    if (i < 0 && a->bot_modes_n < (int)(sizeof a->bot_modes / sizeof a->bot_modes[0])) i = a->bot_modes_n++;
+    if (i >= 0) {
+        snprintf(a->bot_modes[i].name, sizeof a->bot_modes[i].name, "%s", name);
+        a->bot_modes[i].cb = cb; a->bot_modes[i].user = user;
+        if (strcmp(a->bot_mode, name) == 0) { activate = cb; au = user; }   /* already-selected (persisted) */
+    }
+    bsdr_mutex_unlock(a->lock);
+    if (activate) activate(1, au);                          /* activate outside the lock */
+    BSDR_INFO("bsdr.app", "bot mode '%s' registered%s", name, activate ? " (active)" : "");
+}
+
+/* Lazily create the shared injector for the plugin input services. */
+static bsdr_injector *app_input_inj(bsdr_app *a) {
+    if (!a->input_inj) a->input_inj = bsdr_injector_create(1920, 1080);
+    return (bsdr_injector *)a->input_inj;
+}
+void bsdr_app_input_type(bsdr_app *a, const char *text)  { if (a) bsdr_cc_type(app_input_inj(a), text); }
+void bsdr_app_input_key(bsdr_app *a, const char *keys)   { if (a) bsdr_cc_key(app_input_inj(a), keys); }
+void bsdr_app_input_click(bsdr_app *a, double x, double y, const char *button) { if (a) bsdr_cc_click(app_input_inj(a), x, y, button); }
+void bsdr_app_input_scroll(bsdr_app *a, int amount)      { if (a) bsdr_cc_scroll(app_input_inj(a), amount); }
+
+/* True once any plugin has registered a bot presence mode — i.e. a plugin owns "the bot". The core uses
+ * this to stay BARE: it won't spin up its own in-core command router or apply its ACL audio gains, so
+ * "audio" mode is truly just join + audio and the plugin is the sole brain. With no such plugin the core
+ * keeps its legacy in-core behaviour. */
+int bsdr_app_has_plugin_bot(bsdr_app *a) {
+    if (!a) return 0;
+    bsdr_mutex_lock(a->lock);
+    int has = a->bot_modes_n > 0;
+    bsdr_mutex_unlock(a->lock);
+    return has;
+}
+
+void bsdr_app_bot_mode_get(bsdr_app *a, char *out, size_t cap) {
+    if (!out || !cap) return;
+    out[0] = '\0';
+    if (!a) return;
+    bsdr_mutex_lock(a->lock);
+    snprintf(out, cap, "%s", a->bot_mode[0] ? a->bot_mode : "audio");
+    bsdr_mutex_unlock(a->lock);
+}
+
+size_t bsdr_app_bot_modes_json(bsdr_app *a, char *out, size_t cap) {
+    if (!out || !cap) return 0;
+    size_t o = (size_t)snprintf(out, cap, "[\"audio\"");
+    if (a) {
+        bsdr_mutex_lock(a->lock);
+        for (int i = 0; i < a->bot_modes_n && o < cap - 40; i++) {
+            char ne[32]; bsdr_json_escape(ne, sizeof ne, a->bot_modes[i].name);
+            o += (size_t)snprintf(out + o, cap - o, ",\"%s\"", ne);
+        }
+        bsdr_mutex_unlock(a->lock);
+    }
+    o += (size_t)snprintf(out + o, cap - o, "]");
+    return o;
+}
+
 void bsdr_app_bot_set_mode(bsdr_app *a, const char *mode) {
     if (!a || !mode) return;
-    const char *m = (strcmp(mode, "full") == 0) ? "full" : "audio";
-    bsdr_botroom *stop_room = NULL;
+    /* Validate: "audio" (built-in) or a registered plugin mode; anything else coerces to "audio". Switch
+     * fires the OLD plugin mode's cb(0) then the NEW plugin mode's cb(1), so a plugin brings its
+     * behaviour (hearing + avatar) up/down itself. */
+    bsdr_bot_mode_cb old_cb = NULL, new_cb = NULL; void *old_u = NULL, *new_u = NULL;
+    char newname[16];
     bsdr_mutex_lock(a->lock);
-    snprintf(a->bot_mode, sizeof a->bot_mode, "%s", m);
-    if (strcmp(m, "audio") == 0) { stop_room = (bsdr_botroom *)a->bot_room; a->bot_room = NULL; }
+    int isaudio = (strcmp(mode, "audio") == 0);
+    int mi = isaudio ? -1 : bot_mode_find(a, mode);
+    if (!isaudio && mi < 0) { mode = "audio"; isaudio = 1; }
+    snprintf(newname, sizeof newname, "%s", mode);
+    if (strcmp(a->bot_mode, newname) != 0) {
+        int oi = bot_mode_find(a, a->bot_mode);
+        if (oi >= 0) { old_cb = a->bot_modes[oi].cb; old_u = a->bot_modes[oi].user; }
+        snprintf(a->bot_mode, sizeof a->bot_mode, "%s", newname);
+        if (mi >= 0) { new_cb = a->bot_modes[mi].cb; new_u = a->bot_modes[mi].user; }
+    }
     bsdr_mutex_unlock(a->lock);
-    if (stop_room) bsdr_botroom_stop(stop_room);   /* downgraded to audio -> tear the avatar down */
+    if (old_cb) old_cb(0, old_u);
+    if (new_cb) new_cb(1, new_u);
     settings_save(a);
-    BSDR_INFO("bsdr.app", "bot mode -> %s", m);
+    BSDR_INFO("bsdr.app", "bot mode -> %s", newname);
+}
+
+void bsdr_app_bot_mode_clear_plugin_modes(bsdr_app *a) {
+    if (!a) return;
+    bsdr_bot_mode_cb active_cb = NULL; void *active_u = NULL; int reset = 0;
+    bsdr_mutex_lock(a->lock);
+    int oi = bot_mode_find(a, a->bot_mode);
+    if (oi >= 0) { active_cb = a->bot_modes[oi].cb; active_u = a->bot_modes[oi].user; reset = 1; }
+    a->bot_modes_n = 0;
+    if (reset) snprintf(a->bot_mode, sizeof a->bot_mode, "audio");
+    bsdr_mutex_unlock(a->lock);
+    if (active_cb) active_cb(0, active_u);        /* deactivate the active plugin mode before it unmaps */
+    if (reset) bsdr_app_set_avatar_enabled(a, 0); /* and make sure the avatar is down */
+}
+
+void bsdr_app_set_gain_policy(bsdr_app *a, bsdr_gain_policy_fn fn, void *user) {
+    if (!a) return;
+    bsdr_mutex_lock(a->lock);
+    a->gain_policy_fn = fn; a->gain_policy_user = user;
+    bsdr_mutex_unlock(a->lock);
+    BSDR_INFO("bsdr.app", "per-speaker gain policy %s", fn ? "taken over by a plugin" : "back to core default");
+}
+
+/* botaudio calls this each policy cycle: a plugin policy if one is registered, else the core ACL policy.
+ * Returns the pair count (or -1 for "no policy — leave unity"). */
+int bsdr_app_apply_gain_policy(bsdr_app *a, uint32_t *ssrc_out, float *gain_out, int cap, float *default_out) {
+    if (!a) return -1;
+    bsdr_mutex_lock(a->lock);
+    bsdr_gain_policy_fn fn = a->gain_policy_fn; void *u = a->gain_policy_user;
+    bsdr_mutex_unlock(a->lock);
+    if (fn) return fn(u, ssrc_out, gain_out, cap, default_out);   /* plugin owns the policy */
+    /* No plugin policy: if a plugin owns the bot, stay BARE (unity — silence no one); only the legacy
+     * no-plugin core applies its ACL-based per-speaker gains. */
+    if (bsdr_app_has_plugin_bot(a)) return -1;
+    return bsdr_app_audio_gains(a, ssrc_out, gain_out, cap, default_out);
+}
+
+void bsdr_app_set_avatar_enabled(bsdr_app *a, int on) {
+    if (!a) return;
+    bsdr_botroom *stop = NULL;
+    bsdr_mutex_lock(a->lock);
+    a->avatar_enabled = on ? true : false;
+    if (!on) { stop = (bsdr_botroom *)a->bot_room; a->bot_room = NULL; }
+    bsdr_mutex_unlock(a->lock);
+    if (stop) bsdr_botroom_stop(stop);
+    BSDR_INFO("bsdr.app", "avatar actuator -> %s%s", on ? "on" : "off",
+              on ? " (renders on the next bot (re)join)" : "");
+}
+
+int bsdr_app_get_bot_follow(bsdr_app *a) {
+    if (!a) return 0;
+    bsdr_mutex_lock(a->lock); int v = a->bot_follow ? 1 : 0; bsdr_mutex_unlock(a->lock);
+    return v;
 }
 
 void bsdr_app_set_bot_follow(bsdr_app *a, bool on) {
@@ -1362,6 +2101,13 @@ void bsdr_app_set_bot_solo_owner(bsdr_app *a, bool on) {
  * old room, join the new). Called on a timer from the main loop. Cheap no-op when follow is off or the
  * bot isn't a live participant. */
 void bsdr_app_bot_follow_tick(bsdr_app *a) {
+    /* Debounce: pulling a JOINED bot out of its room (operator left, or moved elsewhere) requires
+     * several CONSECUTIVE confirming polls. A single /rooms hiccup — the headset briefly asleep, a
+     * transient 5xx, or the operator's room momentarily not listed first — must not evict the bot,
+     * which is why an idle audio-only bot used to "join then leave" on its own. Joining an unjoined
+     * bot is NOT debounced (follow should attach promptly when you enable it). */
+    static int miss = 0;
+    #define FOLLOW_CONFIRM 3            /* ~3 polls (~45-60s) of agreement before we act */
     if (!a) return;
     char host_tok[2048], cur[128];
     bsdr_mutex_lock(a->lock);
@@ -1369,27 +2115,45 @@ void bsdr_app_bot_follow_tick(bsdr_app *a) {
     snprintf(host_tok, sizeof host_tok, "%s", a->access_token);
     snprintf(cur, sizeof cur, "%s", a->bot_room_id);   /* room the bot is currently in */
     bsdr_mutex_unlock(a->lock);
-    if (!active || !host_tok[0]) return;
+    if (!active || !host_tok[0]) { miss = 0; return; }
 
     char op_room[128] = "";
     if (!bsdr_cloud_poll_room_id(host_tok, op_room, sizeof op_room)) {
-        /* Operator left every room -> pull the bot out too (if it was in one). */
+        /* Operator not reported in any room. Only pull a joined bot out after repeated confirmations. */
         if (cur[0] && a->bot_joined) {
-            BSDR_INFO("bsdr.app", "follow-me: operator left; the bot leaves %s", cur);
+            if (++miss < FOLLOW_CONFIRM) {
+                BSDR_DEBUG("bsdr.app", "follow-me: operator room not seen (%d/%d) — holding %s",
+                           miss, FOLLOW_CONFIRM, cur);
+                return;
+            }
+            miss = 0;
+            BSDR_INFO("bsdr.app", "follow-me: operator left (confirmed); the bot leaves %s", cur);
             bsdr_app_bot_leave_room(a);
-        }
+        } else miss = 0;
         return;
     }
     /* Same room (bare-vs-prefixed tolerant): nothing to do. */
     const char *c = cur, *o = op_room;
     if (strncmp(c, "room:", 5) == 0) c += 5;
     if (strncmp(o, "room:", 5) == 0) o += 5;
-    if (a->bot_joined && strcmp(c, o) == 0) return;
+    if (a->bot_joined && strcmp(c, o) == 0) { miss = 0; return; }
 
-    BSDR_INFO("bsdr.app", "follow-me: operator moved to %s (bot was in %s) — following", op_room,
+    /* Different room. If the bot is already joined somewhere, this is a MOVE — confirm it repeatedly
+     * before tearing the good session down (guards against a spurious first-roomId in /rooms). A bot
+     * that isn't joined yet attaches immediately. */
+    if (a->bot_joined && cur[0]) {
+        if (++miss < FOLLOW_CONFIRM) {
+            BSDR_DEBUG("bsdr.app", "follow-me: operator seen in %s vs bot %s (%d/%d) — holding",
+                       op_room, cur, miss, FOLLOW_CONFIRM);
+            return;
+        }
+    }
+    miss = 0;
+    BSDR_INFO("bsdr.app", "follow-me: operator in %s (bot was in %s) — following", op_room,
               cur[0] ? cur : "(none)");
     if (cur[0] && a->bot_joined) bsdr_app_bot_leave_room(a);   /* drop the old room first */
     bsdr_app_bot_join_room(a);                                 /* re-resolves + joins the operator's room */
+    #undef FOLLOW_CONFIRM
 }
 
 /* Renew the cloud access token using the stored refresh token (the access token is short-lived;
@@ -1409,6 +2173,43 @@ static bool app_renew_token(bsdr_app *a) {
     session_save(a);
     BSDR_INFO("bsdr.app", "cloud token renewed (was expired)");
     return true;
+}
+
+/* Same, for the BOT account (its own client-key session + refresh token). The bot's short-lived access
+ * token expires mid-session just like the host's; without this every bot call (join, /social/profile)
+ * 403s with "requires a valid entry for 'x-access-token'". Updates + persists the new bot token. */
+static bool bot_renew_token(bsdr_app *a) {
+    char refresh[2048];
+    bsdr_mutex_lock(a->lock);
+    snprintf(refresh, sizeof(refresh), "%s", a->bot_refresh_token);
+    bsdr_mutex_unlock(a->lock);
+    if (!refresh[0]) return false;
+    bsdr_cloud_result rr;
+    if (!bsdr_cloud_renew(bsdr_cloud_client_key(), refresh, &rr)) { BSDR_WARN("bsdr.app", "bot token renew failed"); return false; }
+    bsdr_mutex_lock(a->lock);
+    snprintf(a->bot_access_token, sizeof(a->bot_access_token), "%s", rr.access_token);
+    if (rr.refresh_token[0]) snprintf(a->bot_refresh_token, sizeof(a->bot_refresh_token), "%s", rr.refresh_token);
+    a->bot_token_ms = bsdr_now_ms();
+    bsdr_mutex_unlock(a->lock);
+    bot_session_save(a);
+    BSDR_INFO("bsdr.app", "bot token renewed");
+    return true;
+}
+
+/* Proactive bot-token renewal: renew ~10 min after the token was issued (they last ~15 min), so the
+ * bot's calls (join, /social/profile, roster) never hit an expired-token 403. Cheap — the elapsed-time
+ * guard makes this a no-op on all but one call per ~10 min. Driven from the agent's periodic tick. */
+void bsdr_app_bot_token_tick(bsdr_app *a) {
+    if (!a) return;
+    uint64_t issued; int go;
+    bsdr_mutex_lock(a->lock);
+    go = a->bot_logged_in && !a->bot_stopped && a->bot_refresh_token[0];
+    issued = a->bot_token_ms;
+    bsdr_mutex_unlock(a->lock);
+    if (!go) return;
+    uint64_t now = bsdr_now_ms();
+    if (issued != 0 && now - issued < 10u * 60u * 1000u) return;   /* still fresh */
+    bot_renew_token(a);   /* refreshes bot_token_ms on success */
 }
 
 /* Reconcile internet sharing: DESIRED state = a->internet_sharing (set by the Quest's
@@ -1695,7 +2496,7 @@ void bsdr_app_get_terminal(bsdr_app *a, char *backend, size_t bl, int *cols, int
 
 size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
     bsdr_mutex_lock(a->lock);
-    char esc_name[160], esc_email[160], esc_msg[200], esc_sniff[200], esc_cc[200], esc_ai[400];
+    char esc_name[160], esc_email[160], esc_msg[200], esc_sniff[200], esc_cc[200], esc_ai[400], esc_cdp[300];
     char esc_botname[160], esc_botemail[160], esc_botmsg[200], esc_botroom[200];
     bsdr_json_escape(esc_name, sizeof(esc_name), a->cloud_name);
     bsdr_json_escape(esc_email, sizeof(esc_email), a->cloud_email);
@@ -1706,46 +2507,75 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
     bsdr_json_escape(esc_botroom, sizeof(esc_botroom), a->bot_room_id);
     bsdr_json_escape(esc_sniff, sizeof(esc_sniff), a->sniff_msg);
     bsdr_json_escape(esc_cc, sizeof(esc_cc), a->compctl_msg);
+    bsdr_json_escape(esc_cdp, sizeof(esc_cdp), a->cdp_endpoint);
     bsdr_json_escape(esc_ai, sizeof(esc_ai), a->threed_ai_cmd);
     if (a->sniff_wifi < 0)   /* resolve once, then cache (default iface rarely changes) */
         a->sniff_wifi = bsdr_micsniff_default_wireless() ? 1 : 0;
+    /* Live avatar-plane state (full bot): connecting/up/ghost while a presence thread runs, else off.
+     * Lets the UI show real progress after a join instead of a premature "avatar up". */
+    const char *avatar_st = "off";
+    switch (bsdr_botroom_avatar_state((bsdr_botroom *)a->bot_room)) {
+        case BSDR_AVATAR_CONNECTING: avatar_st = "connecting"; break;
+        case BSDR_AVATAR_UP:         avatar_st = "up";         break;
+        case BSDR_AVATAR_GHOST:      avatar_st = "ghost";      break;
+        default:                     avatar_st = "off";        break;
+    }
+    char e_tpiper[300], e_tmodel[600], e_tendp[300], e_tcm[96], e_tvoice[96];
+    bsdr_json_escape(e_tpiper, sizeof e_tpiper, a->tts.piper);
+    bsdr_json_escape(e_tmodel, sizeof e_tmodel, a->tts.model);
+    bsdr_json_escape(e_tendp,  sizeof e_tendp,  a->tts.endpoint);
+    bsdr_json_escape(e_tcm,    sizeof e_tcm,    a->tts.cloud_model);
+    bsdr_json_escape(e_tvoice, sizeof e_tvoice, a->tts.voice);
+    /* Selectable bot presence modes: built-in "audio" + any a plugin registered. Built lock-free here
+     * (we already hold a->lock) to avoid re-locking via bsdr_app_bot_modes_json. */
+    char botmodes[160]; size_t bmo = (size_t)snprintf(botmodes, sizeof botmodes, "[\"audio\"");
+    for (int i = 0; i < a->bot_modes_n && bmo < sizeof botmodes - 40; i++) {
+        char mne[24]; bsdr_json_escape(mne, sizeof mne, a->bot_modes[i].name);
+        bmo += (size_t)snprintf(botmodes + bmo, sizeof botmodes - bmo, ",\"%s\"", mne);
+    }
+    snprintf(botmodes + bmo, sizeof botmodes - bmo, "]");
     int n = snprintf(out, cap,
         "{\"cloud\":{\"loggedIn\":%s,\"email\":\"%s\",\"name\":\"%s\",\"msg\":\"%s\","
         "\"internetSharing\":%s},"
-        "\"bot\":{\"loggedIn\":%s,\"email\":\"%s\",\"name\":\"%s\",\"msg\":\"%s\",\"joined\":%s,\"room\":\"%s\",\"mode\":\"%s\",\"stopped\":%s,\"follow\":%s,\"loopback\":%s,\"solo\":%s},"
+        "\"bot\":{\"loggedIn\":%s,\"email\":\"%s\",\"name\":\"%s\",\"msg\":\"%s\",\"joined\":%s,\"room\":\"%s\",\"mode\":\"%s\",\"modes\":%s,\"pluginBot\":%s,\"stopped\":%s,\"follow\":%s,\"loopback\":%s,\"solo\":%s,\"avatar\":\"%s\"},"
         "\"quest\":{\"paired\":%s,\"name\":\"%s\",\"ip\":\"%s\",\"streaming\":%s,\"paused\":%s},"
         "\"source\":{\"mode\":\"%s\",\"path\":\"%s\",\"path2\":\"%s\",\"audio\":%s,\"fileLoop\":%s,"
         "\"termBackend\":\"%s\",\"termCols\":%d,\"termRows\":%d},"
-        "\"blank\":%s,\"pointerTouch\":%s,\"cloudMic\":%s,\"ownerMicLocal\":%s,\"roomMic\":%s,\"tlsInsecure\":%s,"
+        "\"blank\":%s,\"pointerTouch\":%s,\"cloudMic\":%s,\"ownerMicLocal\":%s,\"ownerMicToQuestMic\":%s,\"roomMic\":%s,\"tlsInsecure\":%s,"
         "\"threed\":{\"mode\":%d,\"deepness\":%d,\"convergence\":%d,\"swap\":%s,\"full\":%s,\"tier\":%d,\"ai\":\"%s\"},"
-        "\"quality\":{\"w\":%d,\"h\":%d,\"bitrate\":%d,\"brOverride\":%d,\"gpuEncode\":%s,\"encLevel\":%d,\"x264Threads\":%d,\"vaapi\":%s,\"kmsgrab\":%s,\"lan1x\":%s,\"fpsCap\":%d,\"wifiOpt\":%s},"
+        "\"quality\":{\"w\":%d,\"h\":%d,\"bitrate\":%d,\"brOverride\":%d,\"gpuEncode\":%s,\"encLevel\":%d,\"x264Threads\":%d,\"vaapi\":%s,\"kmsgrab\":%s,\"lan1x\":%s,\"fpsCap\":%d,\"wifiOpt\":%s,\"cloudPli\":%s},"
         "\"voice\":{\"stt\":\"%s\",\"sttModel\":\"%s\",\"sttToken\":%s,"
         "\"llm\":\"%s\",\"llmModel\":\"%s\",\"llmToken\":%s},"
+        "\"tts\":{\"enabled\":%s,\"engine\":%d,\"route\":%d,\"piper\":\"%s\",\"model\":\"%s\","
+        "\"endpoint\":\"%s\",\"cloudModel\":\"%s\",\"voice\":\"%s\",\"tokenSet\":%s},"
         "\"sniff\":{\"want\":%s,\"mitm\":%s,\"method\":%d,\"active\":%s,\"msg\":\"%s\",\"wifi\":%s,"
         "\"fxOn\":%s,\"gender\":%d,\"formant\":%d,\"volume\":%d,\"robot\":%d,\"echo\":%d,\"whisper\":%d,\"substitute\":%s,\"relayPort\":%d},"
-        "\"compctl\":{\"want\":%s,\"vision\":%s,\"active\":%s,\"msg\":\"%s\"},"
+        "\"compctl\":{\"want\":%s,\"vision\":%s,\"active\":%s,\"msg\":\"%s\",\"browserCtl\":%s,\"cdp\":\"%s\"},"
         "\"android\":%s,\"selected\":\"%s\",\"quests\":[",
         a->cloud_logged_in ? "true" : "false", esc_email, esc_name, esc_msg,
         a->internet_sharing ? "true" : "false",
         a->bot_logged_in ? "true" : "false", esc_botemail, esc_botname, esc_botmsg,
-        a->bot_joined ? "true" : "false", esc_botroom, a->bot_mode[0] ? a->bot_mode : "audio",
+        a->bot_joined ? "true" : "false", esc_botroom, a->bot_mode[0] ? a->bot_mode : "audio", botmodes,
+        a->bot_modes_n > 0 ? "true" : "false",
         a->bot_stopped ? "true" : "false", a->bot_follow ? "true" : "false",
-        a->bot_loopback ? "true" : "false", a->bot_solo_owner ? "true" : "false",
+        a->bot_loopback ? "true" : "false", a->bot_solo_owner ? "true" : "false", avatar_st,
         a->quest_paired ? "true" : "false", a->quest_name, a->quest_ip,
         a->streaming ? "true" : "false", a->paused ? "true" : "false",
         a->source, a->source_path, a->source_path2, a->audio ? "true" : "false", a->file_loop ? "true" : "false",
         a->term_backend[0] ? a->term_backend : "pty", a->term_cols, a->term_rows,
         a->blank_want ? "true" : "false", a->pointer_touch ? "true" : "false", a->cloud_mic_fallback ? "true" : "false",
-        a->owner_mic_local ? "true" : "false", a->room_mic_want ? "true" : "false",
+        a->owner_mic_local ? "true" : "false", a->owner_mic_to_questmic ? "true" : "false", a->room_mic_want ? "true" : "false",
         bsdr_tls_is_insecure() ? "true" : "false",
         a->threed_mode, a->threed_deepness, a->threed_convergence,
         a->threed_swap ? "true" : "false", a->threed_full ? "true" : "false", a->threed_tier, esc_ai,
         a->res_w, a->res_h, a->bitrate, a->bitrate_override, a->cpu_only ? "false" : "true",
         a->enc_level, a->enc_x264_threads, a->use_vaapi ? "true" : "false", a->use_kmsgrab ? "true" : "false",
         a->lan_1x ? "true" : "false", a->fps_cap,
-        a->wifi_opt ? "true" : "false",
+        a->wifi_opt ? "true" : "false", a->cloud_rtcp_pli ? "true" : "false",
         a->stt_endpoint, a->stt_model, a->stt_token[0] ? "true" : "false",
         a->llm_endpoint, a->llm_model, a->llm_token[0] ? "true" : "false",
+        a->tts_enabled ? "true" : "false", (int)a->tts.engine, a->tts_route,
+        e_tpiper, e_tmodel, e_tendp, e_tcm, e_tvoice, a->tts.token[0] ? "true" : "false",
         a->sniff_want ? "true" : "false", a->sniff_mitm ? "true" : "false", a->sniff_method,
         a->sniff_active ? "true" : "false", esc_sniff, a->sniff_wifi > 0 ? "true" : "false",
         a->voice_fx_on ? "true" : "false",
@@ -1753,6 +2583,7 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         a->voice_substitute ? "true" : "false", a->sniff_remote_port,
         a->compctl_want ? "true" : "false", a->compctl_vision ? "true" : "false",
         a->compctl_active ? "true" : "false", esc_cc,
+        a->browser_ctl_enabled ? "true" : "false", esc_cdp,
 #if defined(BSDR_PLATFORM_ANDROID)
         "true",
 #else
@@ -1832,7 +2663,7 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
                       "\"available\":%s,\"baseReady\":%s,\"rmvpe\":%s,"
                       "\"dl\":{\"active\":%s,\"pct\":%d,\"done\":%ld,\"total\":%ld,\"ok\":%s,\"name\":\"%s\",\"err\":\"%s\"},\"voices\":[",
                       a->voiceai_on ? "true" : "false", a->voiceai_tier, evv, a->voiceai_key, evst,
-                      bsdr_voiceai_available() ? "true" : "false",
+                      "false",   /* core has no voice-ai engine now; the voice-changer plugin reports its own */
                       bsdr_voice_base_present(BSDR_VBASE_CONTENT) ? "true" : "false",
                       bsdr_voice_base_present(BSDR_VBASE_RMVPE) ? "true" : "false",
                       vdl.active ? "true" : "false", vdl.pct, vdl.done, vdl.total,
@@ -1851,7 +2682,27 @@ size_t bsdr_app_status_json(bsdr_app *a, char *out, size_t cap) {
         }
         n += snprintf(out + n, cap - n, "]}");
     }
-    n += snprintf(out + n, cap - n, "}");
+    /* Release the app lock BEFORE calling into any plugin hook below: a plugin's ui/panel/sections hook
+     * may call back into an app host service (e.g. fullbot's panel reads bsdr_app_avatar_state), which
+     * re-locks a->lock — a self-deadlock if we still held it. Everything below only appends to `out`
+     * using local `n`/`cap`; no more app state is read. */
     bsdr_mutex_unlock(a->lock);
+    /* Loadable plugins contribute their own bot-card UI (name + HTML fragment); the panel renders
+     * s.plugins[] into #plugins. Empty array when no plugin exposes a ui_html hook. */
+    n += snprintf(out + n, cap - n, ",\"pluginsLoaded\":");
+    if (n > 0 && (size_t)n < cap) n += (int)bsdr_plugins_names_json(out + n, cap - (size_t)n);
+    n += snprintf(out + n, cap - n, ",\"plugins\":");
+    if (n > 0 && (size_t)n < cap) n += (int)bsdr_plugins_ui_json(out + n, cap - (size_t)n);
+    /* Plugins may also contribute full top-level panels (own cards) and declared config variables;
+     * the panel renders s.pluginPanels[] as cards and s.pluginConfig[] as auto-generated forms. */
+    n += snprintf(out + n, cap - n, ",\"pluginPanels\":");
+    if (n > 0 && (size_t)n < cap) n += (int)bsdr_plugins_panel_json(out + n, cap - (size_t)n);
+    n += snprintf(out + n, cap - n, ",\"pluginSections\":");
+    if (n > 0 && (size_t)n < cap) n += (int)bsdr_plugins_sections_json(out + n, cap - (size_t)n);
+    n += snprintf(out + n, cap - n, ",\"pluginScripts\":");
+    if (n > 0 && (size_t)n < cap) n += (int)bsdr_plugins_scripts_json(out + n, cap - (size_t)n);
+    n += snprintf(out + n, cap - n, ",\"pluginConfig\":");
+    if (n > 0 && (size_t)n < cap) n += (int)bsdr_plugins_config_json(out + n, cap - (size_t)n);
+    n += snprintf(out + n, cap - n, "}");
     return (size_t)n;
 }

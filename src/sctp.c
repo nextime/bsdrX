@@ -377,17 +377,27 @@ int bsdr_sctp_send_room(bsdr_sctp *s, const uint8_t *data, size_t len) {
     if (!s || !s->sock) return -1;
     /* BigSoup sends on stream 1, no DCEP channel setup (the relay accepts stream-1 data blindly and
      * fans it out). The payload is an ASCII string ("<legacyId>*base64(code+body)"), so the channel is
-     * WebRTC-string — but the native lib emits the PPID BYTE-SWAPPED: the on-wire ppid field is exactly
-     * 33 00 00 00 (proven byte-for-byte across all 389 data messages in room.pcap). Reproduce that
-     * wire pattern verbatim, else the Quest's native BigSoup drops the frame before OnData(). Ordered
-     * delivery (no SCTP_UNORDERED), B+E bits (single unfragmented message). */
-    struct sctp_sndinfo si;
-    memset(&si, 0, sizeof(si));
-    si.snd_sid = 1;
-    si.snd_ppid = htonl(0x33000000u);   /* wire bytes 33 00 00 00 — matches BigSoupBroadcastData */
-    si.snd_flags = SCTP_EOR;
-    return (int)usrsctp_sendv(s->sock, data, len, NULL, 0, &si, sizeof(si),
-                              SCTP_SENDV_SNDINFO, 0);
+     * WebRTC-string — the native lib emits the PPID BYTE-SWAPPED: on-wire ppid is exactly 33 00 00 00
+     * (proven across all 389 data messages in room.pcap). Reproduce that verbatim, else the Quest's
+     * native BigSoup drops the frame before OnData().
+     *
+     * UNRELIABLE + UNORDERED (PR-SCTP, 0 retransmits): this is the avatar/pose channel and the relay is
+     * a receive-only comedia sink that NEVER SACKs our DATA (even the official host gets zero packets
+     * back). Sending reliably there makes usrsctp retransmit forever — the unacked queue grows without
+     * bound and the relay fans every retransmitted copy to the headset, flooding its data consumer until
+     * it CRASHES (observed: tx bundles growing 276→540→804→1068 B). Fire-and-forget matches the schema
+     * (TickState is the unreliable channel) and how a WebRTC unreliable/unordered DataChannel behaves:
+     * each frame is transmitted once and abandoned if not delivered, so the queue can never pile up. */
+    struct sctp_sendv_spa spa;
+    memset(&spa, 0, sizeof(spa));
+    spa.sendv_flags = SCTP_SEND_SNDINFO_VALID | SCTP_SEND_PRINFO_VALID;
+    spa.sendv_sndinfo.snd_sid   = 1;
+    spa.sendv_sndinfo.snd_ppid  = htonl(0x33000000u);          /* wire bytes 33 00 00 00 */
+    spa.sendv_sndinfo.snd_flags = SCTP_EOR | SCTP_UNORDERED;   /* single message, no head-of-line stall */
+    spa.sendv_prinfo.pr_policy  = SCTP_PR_SCTP_RTX;            /* limit by retransmit count... */
+    spa.sendv_prinfo.pr_value   = 0;                           /* ...to 0 -> send once, never retransmit */
+    return (int)usrsctp_sendv(s->sock, data, len, NULL, 0, &spa, sizeof(spa),
+                              SCTP_SENDV_SPA, 0);
 }
 
 void bsdr_sctp_free(bsdr_sctp *s) {

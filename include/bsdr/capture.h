@@ -86,13 +86,9 @@ bsdr_capture *bsdr_capture_open(const bsdr_capture_config *cfg);
 struct bsdr_overlay;
 void bsdr_capture_set_overlay(bsdr_capture *c, struct bsdr_overlay *ov);
 
-/* Run realtime face swap on each frame before encoding (NULL = none). The engine is owned by the
- * caller (the agent); it's applied on the CPU encode path only, so enabling it forces CPU scale. */
-struct bsdr_faceswap;
-void bsdr_capture_set_faceswap(bsdr_capture *c, struct bsdr_faceswap *fs);
-
 /* Decode an image file (jpg/png/…) to a freshly malloc'd packed-RGB buffer (caller frees). Sets
- * *w and *h. Returns 0 on success. Used to load the face-swap source image. */
+ * *w and *h. Returns 0 on success. Used to load the face-swap source image (via a host service, so the
+ * face-swap plugin can reuse the core's FFmpeg image decoder). */
 int bsdr_capture_decode_image_rgb(const char *path, uint8_t **rgb, int *w, int *h);
 
 /* Grab + encode one frame. On a produced access unit, sets *au (valid until the
@@ -103,6 +99,10 @@ int bsdr_capture_frame(bsdr_capture *c, const uint8_t **au, size_t *len,
 
 /* The encoder's out dimensions / chosen encoder name (diagnostics). */
 void bsdr_capture_info(bsdr_capture *c, int *w, int *h, const char **enc);
+
+/* Force the next encoded frame to be a keyframe (IDR). Thread-safe. Used to serve an on-demand
+ * keyframe to a newly-joined cloud consumer instead of making it wait for the next scheduled GOP. */
+void bsdr_capture_force_keyframe(bsdr_capture *c);
 
 /* ---- File-source playback controls (no-ops unless opened with cfg.input_file) ---- */
 /* Seek to a fraction (0..1) of the file. Thread-safe wrt bsdr_capture_frame. */
