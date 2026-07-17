@@ -1,6 +1,6 @@
 # bsdrX — cast any screen into a Bigscreen VR headset
 
-**Version 0.1.1** · Linux · Windows · macOS · Android
+**Version 0.2.0** · Linux · Windows · macOS · Android
 
 **bsdrX** is a clean-room **Bigscreen Remote Desktop** agent. It turns a PC — or an
 Android device — into a Bigscreen Remote Desktop *host*: it casts your **screen and
@@ -15,6 +15,21 @@ Windows, macOS and Android** — the same portable C core runs on all four, and 
 the thin platform shims (capture, audio, input injection) differ. Every feature is
 driven from a **local web control panel** at `http://127.0.0.1:8088` (on Android, the
 very same UI is shown in an embedded WebView).
+
+On the desktop the panel opens by default in a **chromeless native app window** (a
+Chrome/Edge/Chromium `--app` window that looks like an ordinary application, with an
+instant loading splash) rather than a browser tab — on **Windows, Linux and macOS**
+alike. Pass **`--browser`** to open it in your default browser instead, **`--no-browser`**
+to run the panel without auto-opening anything, or **`--no-ui`** to disable it entirely.
+The Windows build is a GUI app that opens **no console window** unless you pass
+**`--console`** (or launch it from a terminal, where it attaches to the parent console).
+
+**System tray.** In app-window mode a tray icon is installed where the platform has
+one — **Windows** always, and **Linux** when a StatusNotifier host is present (loaded at
+runtime via `dlopen`, no build dependency). Closing the window then **minimizes to the
+tray**; right-click for **Open bsdrX** (reopen the window) / **Quit bsdrX**. Where no tray
+is available (macOS, or a Linux desktop without a StatusNotifier host), **closing the
+window quits the agent**.
 
 It is an **independent, clean-room implementation** of Bigscreen's Remote Desktop
 wire protocol — reverse-engineered from *observed behaviour* (network captures and
@@ -890,6 +905,13 @@ make osxcross OSX_DEPS=/path/to/darwin-deps [OSX_HOST=o64|oa64]
 Full audio + owner-mic sniffer + capture (avfoundation/VideoToolbox). Install
 **BlackHole** for the virtual mic. See [`docs/macos.md`](docs/macos.md).
 
+**Code-signing (Gatekeeper).** The bundle is always **ad-hoc signed** (so the arm64 slice
+runs on Apple Silicon), but that does not clear Gatekeeper's "unidentified developer" block.
+To ship without the prompt you need an Apple **Developer ID Application** cert ($99/yr) and
+**notarization** — `scripts/build-osx-bundle.sh` does both from Linux via `rcodesign` when you
+set `OSX_CODESIGN_P12` (+ `OSX_NOTARY_API_KEY` to notarize + staple). There is **no free**
+Apple signing program. Full recipe in [`docs/MACOS-SIGNING.md`](docs/MACOS-SIGNING.md).
+
 ### Windows (MinGW-w64 cross-build)
 
 ```bash
@@ -909,6 +931,18 @@ Start-Menu shortcut, uninstaller, and a components step that opens the **Npcap**
 without Npcap** — the relay, remote desktop and the bundled-WinDivert sniff fallback all work;
 only the pcap owner-mic **sniffer/MITM** needs Npcap (`wpcap.dll` is loaded at runtime, and the
 sniffer prompts to install it when absent). The installer's Npcap step is the one-click way in.
+
+**Code-signing (SmartScreen).** Unsigned, Windows SmartScreen warns "unknown publisher — Run
+anyway?" on the exe and the installer. To Authenticode-sign them at build time, install
+`osslsigncode` and set `WIN_CODESIGN_PFX` (a `.pfx`/`.p12` code-signing cert) + `WIN_CODESIGN_PASS`
+(optionally `WIN_CODESIGN_TS` for the RFC-3161 timestamp URL); the bundle then signs + timestamps
+both. Without a cert it's a no-op (ships unsigned). An **EV** cert clears SmartScreen immediately;
+an **OV** cert clears it once the binary earns download reputation. The pipeline signs **locally**
+(no CI) and drives a **cloud signer** (Azure Trusted Signing, SSL.com eSigner, DigiCert KeyLocker)
+or a **PKCS#11 token/HSM**. bsdrX being commercial + built locally, the recommended route is a
+bought cert — **Azure Trusted Signing** or an **EV token** (free OSS programs like SignPath don't
+fit: they sign from CI and disallow proprietary components). Full recipe with ready-to-run env vars
+in [`docs/WINDOWS-SIGNING.md`](docs/WINDOWS-SIGNING.md).
 
 ### Android
 

@@ -341,6 +341,34 @@ void bsdr_set_nonblocking(bsdr_socket_t s) {
 #endif
 }
 
+/* Force a socket to BLOCKING mode. Needed on Windows for sockets returned by accept(): unlike POSIX
+ * (where an accepted socket is always blocking), Windows makes the accepted socket INHERIT the listener's
+ * non-blocking mode — so a blocking recv() on it would instead return WSAEWOULDBLOCK immediately and the
+ * request would be dropped. Our listeners are non-blocking (to poll for shutdown), so every accepted
+ * connection must be reset to blocking before we recv() the request on it. */
+void bsdr_set_blocking(bsdr_socket_t s) {
+#if defined(_WIN32)
+    u_long off = 0;
+    ioctlsocket(s, FIONBIO, &off);
+#else
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl != -1) fcntl(s, F_SETFL, fl & ~O_NONBLOCK);
+#endif
+}
+
+/* Bound a blocking recv() so one silent/half-open client can't hang a single-threaded accept loop: a
+ * connection that opens but never sends a full request (a browser preconnect, a port scan) makes recv()
+ * return an error after `ms`, and the caller closes it and moves on. */
+void bsdr_set_recv_timeout(bsdr_socket_t s, int ms) {
+#if defined(_WIN32)
+    DWORD tv = (DWORD)ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
+#else
+    struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+#endif
+}
+
 int bsdr_socket_wait_readable(bsdr_socket_t s, int timeout_ms) {
 #if defined(_WIN32)
     WSAPOLLFD pfd = { 0 };

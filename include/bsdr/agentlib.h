@@ -92,6 +92,7 @@ typedef struct {
     const char *webui_allow; /* --web-allow: extra Host/Origin values the CSRF guard accepts (comma
                               * list; "*" = any, for use behind an authenticating reverse proxy) */
     bool open_browser;       /* auto-open the control UI (desktop only) */
+    bool plain_browser;      /* --browser: open the default browser, not the chromeless native app window (the default) */
     bsdr_pairing_cb on_pairing_code;
     void *user;
 } bsdr_agent_options;

@@ -45,6 +45,7 @@
 #include "bsdr/app.h"
 #include "bsdr/tls.h"
 #include "bsdr/webui.h"
+#include "bsdr/appwindow.h"
 #include "bsdr/plugin.h"
 #include "bsdr/agentlib.h"
 #include "bsdr/micsniff.h"
@@ -137,6 +138,10 @@ static void on_fatal(int sig) {
     raise(sig);
 }
 void bsdr_agent_stop(void) { g_running = 0; }
+
+/* Fired by the native window's tray "Quit", or by the window closing on a
+ * platform without a tray: stop the whole agent. */
+static void appwin_on_quit(void *user) { (void)user; bsdr_agent_stop(); }
 
 /* System prompt handed to the LLM for spoken desktop commands. The tool schema
  * (type_text/key/click/scroll/open_app) lives in llm.c; this tells the model how
@@ -1371,6 +1376,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     bsdr_updatecheck_start(&app);   /* hourly, background, quiet — flags a newer release for the UI */
 
     bsdr_webui *ui = NULL;
+    bsdr_appwindow *appwin = NULL;
     if (webui_port > 0) {
         ui = bsdr_webui_start(&app, (uint16_t)webui_port, opt->webui_bind, opt->webui_allow);
         if (ui && open_browser) {
@@ -1384,15 +1390,13 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
             }
             if (!reachable) BSDR_WARN("bsdr.agent", "web UI not reachable yet; open http://127.0.0.1:%d manually", webui_port);
             if (reachable) {
-                char cmd[128];
-#if defined(__APPLE__)
-                snprintf(cmd, sizeof(cmd), "open http://127.0.0.1:%d >/dev/null 2>&1 &", webui_port);
-#elif defined(_WIN32)
-                snprintf(cmd, sizeof(cmd), "start http://127.0.0.1:%d", webui_port);
-#else
-                snprintf(cmd, sizeof(cmd), "xdg-open http://127.0.0.1:%d >/dev/null 2>&1 &", webui_port);
-#endif
-                if (system(cmd) != 0) { /* user can open it manually */ }
+                /* Open the control panel as a chromeless native "app window" (default) or the plain
+                 * default browser (--browser). In app-window mode the window is a tracked child and a
+                 * system-tray icon is installed where available (Windows always; Linux when a
+                 * StatusNotifier host exists): closing it minimizes to the tray, and the tray menu
+                 * offers Open / Quit. Without a tray, closing the window quits the agent. */
+                appwin = bsdr_appwindow_start((uint16_t)webui_port, !opt->plain_browser,
+                                              appwin_on_quit, NULL);
             }
         }
     }
@@ -1854,6 +1858,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
     if (voice_inj) bsdr_injector_destroy(voice_inj);   /* voice borrows it; we own it */
     if (a.overlay) bsdr_overlay_free(a.overlay);
     app.update_stop = 1;   /* let the detached update checker exit its sleep loop */
+    if (appwin) bsdr_appwindow_stop(appwin);   /* remove tray, close the window, join its thread */
     if (ui) bsdr_webui_stop(ui);   /* stop serving before unloading plugins (no more http hook calls) */
     bsdr_plugins_unload();
     bsdr_discovery_stop(disc);
@@ -1868,7 +1873,28 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
  * Excluded from the Android build (BSDR_NO_CLI_MAIN), where the JNI bridge
  * calls bsdr_agent_run() directly. */
 #ifndef BSDR_NO_CLI_MAIN
+#if defined(_WIN32)
+#include <windows.h>
+/* The Windows build is a GUI-subsystem app (-mwindows) so double-clicking it opens NO console window.
+ * But we still want logs when the user runs it from a terminal or asks for them: attach to the parent's
+ * console if we were launched from cmd/PowerShell, else pop one only when --console/--debug was passed.
+ * Launched from Explorer with neither, stay windowless. Call this before anything writes to stdout. */
+static void win_console_setup(int argc, char **argv) {
+    int want = 0;
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--console") == 0 || strcmp(argv[i], "--debug") == 0) { want = 1; break; }
+    if (AttachConsole(ATTACH_PARENT_PROCESS) || (want && AllocConsole())) {
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+        freopen("CONIN$",  "r", stdin);
+    }
+}
+#endif
+
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+    win_console_setup(argc, argv);
+#endif
     /* Privileged owner-mic helper: the agent re-execs itself (via sudo) with this flag to do the
      * root-only capture/ARP setup, then hands the fd back to the unprivileged parent. Must be
      * handled before anything else — it never runs the normal agent. */
@@ -1926,6 +1952,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--web-allow") == 0 && i + 1 < argc) opt.webui_allow = argv[++i];
         else if (strcmp(argv[i], "--no-ui") == 0) opt.webui_port = 0;
         else if (strcmp(argv[i], "--no-browser") == 0) opt.open_browser = false;
+        else if (strcmp(argv[i], "--console") == 0) { /* Windows: force a console (see win_console_setup) */ }
+        else if (strcmp(argv[i], "--browser") == 0 || strcmp(argv[i], "--no-app-window") == 0)
+            opt.plain_browser = true;   /* open the default browser instead of the chromeless app window */
         else if (strcmp(argv[i], "--no-cloud-video") == 0) opt.no_cloud_video = true;
         else if (strcmp(argv[i], "--video-decoupled") == 0) opt.video_decoupled = true;
         else if (strcmp(argv[i], "--cpu") == 0) opt.cpu_only = true;
@@ -2049,8 +2078,12 @@ int main(int argc, char **argv) {
 "                       Off-loopback is UNAUTHENTICATED — firewall it or put it behind a proxy.\n"
 "  --web-allow HOSTS    Extra Host/Origin values the CSRF guard accepts (comma-separated): a LAN\n"
 "                       IP, or your reverse-proxy hostname. '*' accepts any (behind an auth proxy).\n"
-"  --no-ui              Disable the web control panel.\n"
-"  --no-browser         Don't auto-open the panel in a browser at startup.\n"
+"  --no-ui              Disable the web control panel entirely (no server).\n"
+"  --no-browser         Run the panel but don't auto-open it (reach it manually).\n"
+"  --browser            Open the panel in your default browser instead of the native app window\n"
+"                       (the app window is the default on Windows, Linux and macOS).\n"
+"  --console            Windows: force a console window for logs (the GUI build has none by default;\n"
+"                       running from a terminal already shows logs there).\n"
 "\n"
 "INTERNET SHARING (cloud relay)\n"
 "  --no-cloud-video         Don't relay video to the room (default: on).\n"

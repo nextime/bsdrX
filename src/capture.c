@@ -318,7 +318,7 @@ static int open_encoder(bsdr_capture *c, const bsdr_capture_config *cfg,
                 av_opt_set_int(enc->priv_data, "realtime", 1, 0);
                 av_opt_set_int(enc->priv_data, "prio_speed", 1, 0);
             }
-        } else {
+        } else if (strstr(try_names[i], "x264")) {
             /* 'veryfast' (not 'ultrafast'): ultrafast disables CABAC + 8x8dct, forcing the SPS to
              * Constrained Baseline (profile_idc 66) regardless of the requested profile — and the
              * Quest chokes on non-High streams. veryfast keeps the High-profile tools (idc 100),
@@ -351,6 +351,14 @@ static int open_encoder(bsdr_capture *c, const bsdr_capture_config *cfg,
              * makes --cpu look worse. x264's larger IDRs don't freeze the Quest (that was the
              * multi-slice bug, fixed above; nvenc's IDRs are bigger and work). The nvenc branch keeps
              * its own VBV; on a GPU box 3D encodes with nvenc, so this path is genuinely CPU-only. */
+        } else {
+            /* Other Windows HW encoders (h264_amf / h264_qsv / h264_mf). Their private option names
+             * differ from x264's, so setting preset="veryfast"/tune/x264-params on them just logged
+             * "undefined constant or missing ) in 'veryfast'" and risked a bad config. The generic
+             * AVCodecContext fields set above (High profile, no B-frames, target bitrate, ~1s GOP) are
+             * enough to attempt an open; if it fails we fall through to the next encoder (ultimately the
+             * always-correct libx264). Try a low-latency hint the generic layer understands. */
+            enc->flags |= AV_CODEC_FLAG_LOW_DELAY;
         }
         if (avcodec_open2(enc, codec, NULL) == 0) {
             c->enc = enc;

@@ -159,6 +159,12 @@ static const char PAGE[] =
 "select,input{max-width:100%}"
 ".card h2 .en{font-size:10px;padding:2px 7px}}"
 "</style></head><body>"
+/* Splash: covers the page instantly (rendered before any JS) so opening the app-window never shows a
+ * blank/half-built panel; fades out on the first successful status poll (see tick()/updPoll). */
+"<div id=splash style=\"position:fixed;inset:0;background:#12141a;color:#e6e8ee;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;transition:opacity .45s\">"
+"<div style='font-size:30px;font-weight:700;letter-spacing:1px'>bsdrX</div>"
+"<div class=spin style='width:22px;height:22px;margin-top:18px'></div>"
+"<div class=hint style='margin-top:12px'>Starting the control panel\xE2\x80\xA6</div></div>"
 "<header><h1>bsdrX <small style='font-size:.5em;opacity:.55;font-weight:400'>v" BSDR_VERSION "</small></h1><span class=sub>Bigscreen Remote Desktop</span>"
 "<a href='https://bigscreen.nexlab.net' target=_blank rel=noopener style=margin-left:auto>bigscreen.nexlab.net</a>"
 "<button class=p style=width:auto onclick=showDonate()>&#9829; Donate</button></header>"
@@ -776,7 +782,8 @@ static const char PAGE[] =
 "function enApply(e,on,txt){if(!e)return;"
 "if(on===null){e.className='en';e.textContent=txt||'';}else{e.className='en '+(on?'y':'n');e.textContent=txt||(on?'on':'off');}}"
 "function setEn(k,on,txt){enApply(document.getElementById('en_'+k),on,txt);}"
-"async function tick(){let s=await api('/api/status');"
+"function hideSplash(){var sp=document.getElementById('splash');if(sp){sp.style.opacity=0;setTimeout(function(){if(sp.parentNode)sp.parentNode.removeChild(sp);},500);}}"
+"async function tick(){let s=await api('/api/status');if(!s||s.error){return;}hideSplash();"   /* first real status -> drop the splash */
 "cloud.innerHTML=dot(s.cloud.loggedIn)+'<span>'+(s.cloud.loggedIn?('Connected as '+s.cloud.name):('Not connected — '+s.cloud.msg))+'</span>'+(s.cloud.loggedIn?'<button onclick=logout() style=margin-left:auto>Log out</button>':'');"
 "loginform.style.display=s.cloud.loggedIn?'none':'flex';"
 "loginform2.style.display=s.cloud.loggedIn?'none':'flex';"
@@ -849,6 +856,7 @@ static const char PAGE[] =
 "function updPoll(){fetch('/api/update').then(r=>r.json()).then(d=>{if(d&&d.available){uplatest.textContent='v'+(d.latest||'');if(d.home)uplink.href=d.home;upbanner.style.display='block';}}).catch(()=>{})}"
 /* one delegated listener persists a plugin config var edited in an auto-rendered form (data-pcfg-*) */
 "document.addEventListener('change',function(e){var t=e.target;if(t&&t.dataset&&t.dataset.pcfgKey)pcfg(t.dataset.pcfgPlugin,t.dataset.pcfgKey,(t.type==='checkbox')?(t.checked?1:0):t.value);});"
+"setTimeout(hideSplash,8000);"   /* safety net: never leave the splash stuck if status is slow */
 "setupPanels();setInterval(tick,1000);tick();loadWindows();loadDeps();aclLoad();setInterval(botStatePoll,2000);botStatePoll();updPoll();setInterval(updPoll,600000);psRefresh();"
 "</script></body></html>";
 
@@ -910,7 +918,8 @@ static int acl_status_json(bsdr_app *a, char *buf, size_t cap) {
 static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
                    const char *path, const char *body) {
     bsdr_app *a = w->app;
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
+    if (strcmp(method, "GET") == 0 && (strcmp(path, "/") == 0 || strncmp(path, "/?", 2) == 0)) {
+        /* also serve "/" with a query (e.g. the app-window's /?app=1) — the query is just a UI hint. */
         respond(c, 200, "text/html", PAGE, sizeof(PAGE) - 1);
     } else if (strcmp(method, "GET") == 0 && strncmp(path, "/deps/", 6) == 0) {
         /* Per-dependency install instructions page (opened in a new tab from the Dependencies card). */
@@ -1771,6 +1780,8 @@ static void loop(void *arg) {
             if (w->running) bsdr_socket_wait_readable(w->listener, 500);
             continue;
         }
+        bsdr_set_blocking(c);   /* Windows inherits the listener's non-blocking mode onto c — undo it */
+        bsdr_set_recv_timeout(c, 15000);   /* a silent client can't hang this single-threaded loop */
         char *buf = malloc(8192);
         if (buf) {
             int total = 0, r;

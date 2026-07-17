@@ -57,6 +57,7 @@ set(CORE_SRC
   ${CORE}/toolregistry.c                # bot host-service: tool registry plugins register into (ABI 4)
   ${CORE}/botsense.c                    # bot host-service: per-SSRC VAD + utterance delivery worker (ABI 4)
   ${CORE}/mediafx.c                     # media-effect registry (voice-changer / 2D->3D plugins)
+  ${CORE}/appwindow.c                   # native window/tray lifecycle (no-op on Android: in-app WebView)
   ${REPO}/third_party/miniz/miniz.c     # model-zip import
   ${REPO}/third_party/minimp3/minimp3.c # MP3 decode (FreeTTS engine)
   ${REPO}/third_party/cjson/cJSON.c     # JSON parser (roster/social/access store)

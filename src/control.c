@@ -375,6 +375,8 @@ static void control_loop(void *arg) {
             if (c->running) bsdr_sleep_ms(20);
             continue;
         }
+        bsdr_set_blocking(conn);   /* Windows: an accepted socket inherits the listener's non-blocking mode */
+        bsdr_set_recv_timeout(conn, 15000);   /* don't let a silent client tie up a handler thread forever */
         struct conn_arg *ca = calloc(1, sizeof(*ca));
         if (!ca) { bsdr_socket_close(conn); continue; }
         ca->c = c;

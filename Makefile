@@ -214,7 +214,7 @@ CORE_SRC := src/log.c src/net.c src/json.c src/input_decode.c \
             src/model_store.c src/webcam.c src/micsub.c src/deps.c src/screenblank.c \
             src/roomstate.c src/botroom.c src/botaudio.c src/botmic.c src/voicestore.c \
             src/acl.c src/roster.c src/roomcmd.c src/botprompt.c src/llmctx.c src/updatecheck.c src/browserctl.c \
-            src/plugin.c src/plugstore.c src/toolregistry.c src/botsense.c src/mediafx.c \
+            src/plugin.c src/plugstore.c src/toolregistry.c src/botsense.c src/mediafx.c src/appwindow.c \
             $(INJECT_SRC) $(WINLIST_SRC) $(SCTP_SRC) $(MEDIA_SRC)
 # miniz (vendored, third_party) backs model_store.c's zip import; built in every config.
 # flatcc runtime (vendored) backs roomstate.c's FlatBuffers avatar/room-state codec (bot Plane-2).
@@ -446,7 +446,7 @@ windows-media:
 	  SCTP_SRC= WINLIST_SRC=src/winlist_win.c MEDIA_SRC="$(WIN_MEDIA_SRC)" \
 	  ONNX_PREFIX="$(if $(wildcard $(WIN_DEPS)/include/onnxruntime_c_api.h),$(WIN_DEPS),)" \
 	  CFLAGS="$(BASE_CFLAGS) -I$(WIN_DEPS)/include $(WIN_MEDIA_DEF) $(WIN_ONNX_DEF)" \
-	  LDFLAGS="-static-libgcc -L$(WIN_DEPS)/lib" \
+	  LDFLAGS="-static-libgcc -mwindows -L$(WIN_DEPS)/lib" \
 	  LDLIBS="-L$(WIN_DEPS)/lib $(WIN_MEDIA_LIBS) $(WIN_ONNX_LIBS)"
 
 # Native macOS build (run this ON a Mac). Delegates to ./configure, which detects

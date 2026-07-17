@@ -118,6 +118,41 @@ ${ICON_LINE}
 </dict></plist>
 EOF
 
+# ---- 3c. optional REAL Developer ID signing + notarization (clears Gatekeeper) ----------------
+# The ad-hoc signature above only lets the arm64 slice EXECUTE; it does NOT clear Gatekeeper (the
+# "bsdrX can't be opened — unidentified developer" block). To ship without that, sign the whole .app
+# with an Apple "Developer ID Application" cert (Apple Developer Program, $99/yr) and notarize it.
+# rcodesign does BOTH from Linux — no Mac needed. Unconfigured, this is skipped (the app still runs,
+# but users must right-click > Open once, or you tell them to strip the quarantine xattr). Env:
+#   OSX_CODESIGN_P12       Developer ID Application cert exported as .p12  (enables signing)
+#   OSX_CODESIGN_P12_PASS  its password (optional)
+#   OSX_NOTARY_API_KEY     App Store Connect API key JSON (from `rcodesign encode-app-store-connect-api-key`)
+#                          — if set, the signed app is notarized AND stapled.
+if [ -n "${OSX_CODESIGN_P12:-}" ] && [ -f "${OSX_CODESIGN_P12}" ]; then
+  if [ -n "${SIGN_TOOL:-}" ] && basename "$SIGN_TOOL" | grep -q rcodesign; then
+    P12ARGS=(--p12-file "$OSX_CODESIGN_P12")
+    [ -n "${OSX_CODESIGN_P12_PASS:-}" ] && P12ARGS+=(--p12-password "$OSX_CODESIGN_P12_PASS")
+    # --code-signature-flags runtime = hardened runtime, a notarization prerequisite. rcodesign
+    # walks the bundle and signs nested Mach-O (the onnxruntime dylib) automatically.
+    if rcodesign sign "${P12ARGS[@]}" --code-signature-flags runtime "$APP"; then
+      echo ">> Developer ID signed bsdrX.app"
+      if [ -n "${OSX_NOTARY_API_KEY:-}" ] && [ -f "${OSX_NOTARY_API_KEY}" ]; then
+        if rcodesign notary-submit --api-key-file "$OSX_NOTARY_API_KEY" --staple "$APP"; then
+          echo ">> notarized + stapled bsdrX.app (Gatekeeper will pass silently)"
+        else
+          echo ">> WARN: notarization failed — app is signed but not notarized (Gatekeeper still prompts)"
+        fi
+      else
+        echo ">> (OSX_NOTARY_API_KEY unset — signed but NOT notarized; Gatekeeper still prompts. Notarize to clear it.)"
+      fi
+    else
+      echo ">> WARN: Developer ID signing failed — shipping the ad-hoc-signed app instead"
+    fi
+  else
+    echo ">> WARN: OSX_CODESIGN_P12 set but rcodesign is not the active signer — cannot Developer-ID sign; shipping ad-hoc"
+  fi
+fi
+
 # ---- 4. zip the .app + docs --------------------------------------------------
 # Older bsdrx-osx-full images may predate zip being baked into the Dockerfile;
 # install it on the fly so the bundle step works regardless of image vintage.

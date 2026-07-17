@@ -45,6 +45,11 @@ bsdr_socket_t bsdr_tcp_accept(bsdr_socket_t listener, struct sockaddr_in *from);
 /* Mark a listener/discovery socket non-blocking so its accept/recvfrom poll loop
  * exits promptly on shutdown instead of blocking until the next packet. */
 void bsdr_set_nonblocking(bsdr_socket_t s);
+/* Force a socket to BLOCKING mode. Call on every accept()ed connection: on Windows an accepted socket
+ * inherits the (non-blocking) listener's mode, so recv() would return WSAEWOULDBLOCK and drop the request. */
+void bsdr_set_blocking(bsdr_socket_t s);
+/* Set SO_RCVTIMEO (milliseconds) so a blocking recv() can't hang forever on a silent client. */
+void bsdr_set_recv_timeout(bsdr_socket_t s, int ms);
 int bsdr_send_all(bsdr_socket_t s, const void *buf, size_t len);
 
 /* Sleep until `s` is readable or `timeout_ms` elapses. Returns 1 if readable,
