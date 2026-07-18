@@ -22,6 +22,7 @@
 #define BSDR_PLUGSTORE_H
 
 #include <stddef.h>
+#include "bsdr/model_store.h"   /* bsdr_model_dl — the shared download-progress snapshot shape */
 
 /* Default store base URL (overridable from the UI; persisted in <config_dir>/plugstore.conf). */
 #define BSDR_PLUGSTORE_DEFAULT_URL "https://bigscreen.nexlab.net/bsdrxstore"
@@ -63,6 +64,13 @@ int  bsdr_plugstore_buy_url(const char *slug, char *out, size_t cap);
  * <config_dir>/plugins, and reload plugins so it takes effect. Returns 1 on success; on failure 0 and
  * a reason into err (e.g. not entitled -> buy first, or no build for this platform). Blocking. */
 int  bsdr_plugstore_download(const char *slug, char *err, size_t errcap);
+
+/* Async variant: start the download+install (with dependencies) on a background thread and return
+ * immediately — 0 = started or already running (one at a time), -1 = couldn't start. Byte progress
+ * and the final result are polled via bsdr_plugstore_download_state (same shape as the model-store
+ * downloads, so the web UI renders the same progress bar). `name` carries the slug being fetched. */
+int  bsdr_plugstore_download_start(const char *slug);
+void bsdr_plugstore_download_state(bsdr_model_dl *out);
 
 /* ---- local plugin management ---------------------------------------------------------------- */
 

@@ -386,3 +386,4 @@ avatar-channel send.
 | 4   | host bot-service surface (in progress): tool registry `tool_register`/`tool_unregister`/`tool_list_json`/`tool_invoke` + `bsdr_tool_fn`. |
 | 5   | plugin-to-plugin services: host `service_publish`/`service_get`; `bsdr_hearing_service` + `BSDR_SERVICE_HEARING`, `bsdr_room_audio_service` + `BSDR_SERVICE_ROOM_AUDIO` (§9). |
 | 6   | priority-arbitrated audio focus: `bsdr_room_audio_service.focus_at(ssrc, priority)` + `BSDR_FOCUS_MICCHECK/FRIEND/HOST/OWNER` tiers, so features steer the mix without clobbering (§9). |
+| 7   | host `set_voiceai_status(status)` — a plugin reports a human-readable AI-voice engine status to the UI (GPU-fell-back-to-CPU, model-load failure). Guard with `BSDR_HOST_HAS(host, set_voiceai_status)`. |

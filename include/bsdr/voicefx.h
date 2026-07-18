@@ -55,6 +55,11 @@ void bsdr_voicefx_set_ai(bsdr_voicefx *v, int on, int tier, const char *content,
 /* 1 if the AI tier is selected AND its engine is loaded and running. */
 int bsdr_voicefx_ai_active(const bsdr_voicefx *v);
 
+/* Human-readable AI-engine status for the UI. Never NULL: "off" when AI is disabled, a load-failure
+ * message when the model couldn't open, otherwise the RVC engine status string (which itself flags a
+ * GPU tier that fell back to CPU). */
+const char *bsdr_voicefx_ai_status(const bsdr_voicefx *v);
+
 /* True if any effect is active (so the caller can skip processing when everything is 0). */
 int bsdr_voicefx_active(const bsdr_voicefx *v);
 

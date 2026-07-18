@@ -139,7 +139,11 @@ for d in "${pdirs[@]}"; do
     [ "$name" = "$PLUGIN_ONLY" ] || [ "$only_slug" = "$PLUGIN_ONLY" ] || continue
   fi
   srcs=("$d"*.c)
-  [ ${#srcs[@]} -gt 0 ] || { echo ">>   $name: no .c — skipped"; continue; }
+  # Payload plugins (e.g. gpu-cuda) ship DATA files pulled from $ONNX_PREFIX/lib instead of a compiled
+  # .so — declared in store.conf via PAYLOAD_TARGET (+ PAYLOAD_FILES). Read via a subshell like PLATFORMS.
+  payload_target="$(sh -c '. "$1" >/dev/null 2>&1; printf %s "${PAYLOAD_TARGET:-}"' _ "$d/store.conf" 2>/dev/null || true)"
+  payload_files="$(sh -c '. "$1" >/dev/null 2>&1; printf %s "${PAYLOAD_FILES:-}"' _ "$d/store.conf" 2>/dev/null || true)"
+  [ ${#srcs[@]} -gt 0 ] || [ -n "$payload_target" ] || { echo ">>   $name: no .c — skipped"; continue; }
   # Optional per-plugin platform allowlist (store.conf PLATFORMS="linux windows macos"): skip this
   # plugin entirely for a platform not in the list — no build, no package, no store upload. Empty or
   # absent = every platform (the default). Media-effect plugins hook the DESKTOP capture/mic path
@@ -162,15 +166,32 @@ for d in "${pdirs[@]}"; do
     . "$d/build.conf"
   fi
   stage="$(mktemp -d)/$name"; mkdir -p "$stage"
-  echo ">>   building plugin '$name' v$pver (abi$PLUGIN_ABI) for $PLATFORM/$ARCH${PLUGIN_BUILD_LIBS:+ (+libs)}"
-  # shellcheck disable=SC2086
-  if ! $PLUGIN_CC -O2 $PIC -shared $PLUGIN_CFLAGS $PLUGIN_BUILD_CFLAGS -I"$SRC/include" "${srcs[@]}" \
-        $PLUGIN_BUILD_LIBS -o "$stage/$name$PLUGIN_EXT"; then
-    echo ">>   $name: build FAILED for $PLATFORM/$ARCH" >&2; rm -rf "$(dirname "$stage")"; continue
+  if [ -n "$payload_target" ]; then
+    # Payload plugin: copy the declared files from the ONNX prefix + write bsdr-payload.conf. Auto-skips
+    # (no build, no upload) on any platform/arch where the files aren't present — e.g. providers_cuda.so
+    # is linux/x86_64-only, so gpu-cuda naturally builds only there. The agent's store installer drops
+    # these beside libonnxruntime.so (see src/plugstore.c install_payload).
+    if [ -z "${ONNX_PREFIX:-}" ]; then echo ">>   $name: payload needs ONNX_PREFIX — skipped"; rm -rf "$(dirname "$stage")"; continue; fi
+    miss=""
+    for pf in $payload_files; do [ -f "$ONNX_PREFIX/lib/$pf" ] || miss="$miss $pf"; done
+    if [ -n "$miss" ]; then echo ">>   $name: payload files not present for $PLATFORM/$ARCH ($miss ) — skipped"; rm -rf "$(dirname "$stage")"; continue; fi
+    echo ">>   packaging payload plugin '$name' v$pver (abi$PLUGIN_ABI) for $PLATFORM/$ARCH (target=$payload_target)"
+    for pf in $payload_files; do
+      cp "$ONNX_PREFIX/lib/$pf" "$stage/"
+      case "$pf" in *providers_*.so) command -v patchelf >/dev/null 2>&1 && patchelf --set-rpath '$ORIGIN' "$stage/$pf" 2>/dev/null || true ;; esac
+    done
+    printf 'target=%s\n' "$payload_target" > "$stage/bsdr-payload.conf"
+  else
+    echo ">>   building plugin '$name' v$pver (abi$PLUGIN_ABI) for $PLATFORM/$ARCH${PLUGIN_BUILD_LIBS:+ (+libs)}"
+    # shellcheck disable=SC2086
+    if ! $PLUGIN_CC -O2 $PIC -shared $PLUGIN_CFLAGS $PLUGIN_BUILD_CFLAGS -I"$SRC/include" "${srcs[@]}" \
+          $PLUGIN_BUILD_LIBS -o "$stage/$name$PLUGIN_EXT"; then
+      echo ">>   $name: build FAILED for $PLATFORM/$ARCH" >&2; rm -rf "$(dirname "$stage")"; continue
+    fi
   fi
   [ -f "$d/README.md" ] && cp -p "$d/README.md" "$stage/README.md"
   [ -f "$d/LICENSE" ]   && cp -p "$d/LICENSE"   "$stage/LICENSE"   # ship the plugin's own license (e.g. BSD)
-  cat > "$stage/INSTALL.txt" <<EOF
+  [ -n "$payload_target" ] || cat > "$stage/INSTALL.txt" <<EOF
 bsdrX plugin '$name' — $PLATFORM/$ARCH build ($name$PLUGIN_EXT). Packaged on its own, apart from the app.
 
 Install: drop $name$PLUGIN_EXT into a directory the agent scans at startup, one of:

@@ -14,18 +14,26 @@
  * platform/arch/ABI. State (store URL, license key, email) persists in <config_dir>/plugstore.conf;
  * the per-plugin disabled list in <config_dir>/plugins.disabled. All entry points here run on the
  * single web-UI accept thread, so the in-memory config cache needs no lock. */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE        /* dladdr + Dl_info (GNU extension) for onnx_provider_dir */
+#endif
 #include "bsdr/plugstore.h"
 #include "bsdr/plugin.h"    /* bsdr_plugins_reload / _user_dir / _is_loaded */
 #include "bsdr/app.h"       /* bsdr_config_dir */
 #include "bsdr/httpc.h"
 #include "bsdr/json.h"
 #include "bsdr/log.h"
+#include "bsdr/platform.h"  /* bsdr_mutex + bsdr_thread_start_detached for the async download */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#if !defined(_WIN32)
+#include <unistd.h>     /* access(W_OK) */
+#include <dlfcn.h>      /* locate an already-loaded libonnxruntime.so to find its (writable) lib dir */
+#endif
 #if defined(_WIN32)
 #include <direct.h>       /* _mkdir */
 #endif
@@ -557,6 +565,107 @@ static int ps_present(const char *slug) {
     return stat(path, &st) == 0;
 }
 
+/* ---- download progress (web-UI) — one at a time, a singleton like model_store's g_dl ------------ */
+static bsdr_mutex   *g_psdl_lock;
+static bsdr_model_dl g_psdl;
+static void ps_dl_lock_init(void) { if (!g_psdl_lock) g_psdl_lock = bsdr_mutex_new(); }
+static void ps_dl_progress(size_t done, size_t total) {   /* bsdr_http_download byte callback */
+    if (!g_psdl_lock) return;
+    bsdr_mutex_lock(g_psdl_lock);
+    g_psdl.done = (long)done; g_psdl.total = (long)total;
+    g_psdl.pct  = total ? (int)((done * 100) / total) : -1;
+    bsdr_mutex_unlock(g_psdl_lock);
+}
+static void ps_dl_set_current(const char *slug) {   /* the file we're fetching now (deps then target) */
+    if (!g_psdl_lock) return;
+    bsdr_mutex_lock(g_psdl_lock);
+    snprintf(g_psdl.name, sizeof g_psdl.name, "%s", slug);
+    g_psdl.done = g_psdl.total = 0; g_psdl.pct = -1;
+    bsdr_mutex_unlock(g_psdl_lock);
+}
+
+/* ---- "payload" plugins: deliver files somewhere other than <plugins>/<slug>.so ------------------ *
+ * A store item whose zip contains a "bsdr-payload.conf" ("target=onnx-provider") isn't a loadable
+ * bsdr_plugin — it ships data files to a target dir. Used by the GPU CUDA provider "plugin", which
+ * drops libonnxruntime_providers_cuda.so beside libonnxruntime.so so the ONNX plugins can use CUDA
+ * without a ~700 MB base bundle. The CUDA/cuDNN runtime is host-provided; absent it, ORT can't load the
+ * provider and select_ep() falls back to CPU (surfaced in the UI). */
+
+/* Directory that holds libonnxruntime.so (where ORT looks for its provider .so's), preferring a WRITABLE
+ * one. Best source: an already-loaded libonnxruntime (an ONNX plugin loads it) via dladdr; else probe
+ * the dev/install layouts. Returns 1 + writes the dir. */
+static int onnx_provider_dir(char *out, size_t cap) {
+#if !defined(_WIN32)
+    for (int pass = 0; pass < 2; pass++) {
+        void *h = dlopen(pass ? "libonnxruntime.so" : "libonnxruntime.so.1", RTLD_NOLOAD | RTLD_LAZY);
+        if (!h) continue;
+        void *sym = dlsym(h, "OrtGetApiBase");
+        Dl_info di;
+        if (sym && dladdr(sym, &di) && di.dli_fname && di.dli_fname[0]) {
+            char p[1024]; snprintf(p, sizeof p, "%s", di.dli_fname);
+            char *s = strrchr(p, '/');
+            if (s) { *s = 0; if (access(p, W_OK) == 0) { snprintf(out, cap, "%s", p); dlclose(h); return 1; } }
+        }
+        dlclose(h);
+    }
+    static const char *cands[] = { "third_party/onnxruntime/linux-x64/lib", "/opt/bsdrX/lib", "lib", NULL };
+    for (int i = 0; cands[i]; i++) {
+        char probe[1200]; snprintf(probe, sizeof probe, "%s/libonnxruntime.so", cands[i]);
+        if (access(probe, F_OK) == 0 && access(cands[i], W_OK) == 0) { snprintf(out, cap, "%s", cands[i]); return 1; }
+    }
+#endif
+    (void)out; (void)cap;
+    return 0;
+}
+
+/* If `zip` carries a payload manifest, copy its target string ("onnx-provider") into `target`. */
+static int zip_payload_target(const char *zip, char *target, size_t tcap) {
+    mz_zip_archive z; memset(&z, 0, sizeof z);
+    if (!mz_zip_reader_init_file(&z, zip, 0)) return 0;
+    int got = 0;
+    int idx = mz_zip_reader_locate_file(&z, "bsdr-payload.conf", NULL, 0);
+    if (idx >= 0) {
+        size_t sz = 0; char *buf = (char *)mz_zip_reader_extract_to_heap(&z, idx, &sz, 0);
+        if (buf) {
+            char *t = strstr(buf, "target=");
+            if (t) { t += 7; size_t n = 0; while (t[n] && t[n] != '\n' && t[n] != '\r' && n + 1 < tcap) { target[n] = t[n]; n++; } target[n] = 0; got = 1; }
+            mz_free(buf);
+        }
+    }
+    mz_zip_reader_end(&z);
+    return got;
+}
+
+/* Extract every file in `zip` (except the manifest) into the target payload dir. Returns 1 if all landed. */
+static int install_payload(const char *zip, const char *target, char *err, size_t errcap) {
+    char dir[1024];
+    if (strcmp(target, "onnx-provider") != 0) { if (err) snprintf(err, errcap, "unknown payload target '%s'", target); return 0; }
+    if (!onnx_provider_dir(dir, sizeof dir)) {
+        if (err) snprintf(err, errcap, "no writable ONNX Runtime lib dir (this build's ORT dir is read-only \xe2\x80\x94 use the GPU-bundled build)");
+        return 0;
+    }
+    mz_zip_archive z; memset(&z, 0, sizeof z);
+    if (!mz_zip_reader_init_file(&z, zip, 0)) { if (err) snprintf(err, errcap, "cannot open package"); return 0; }
+    mz_uint num = mz_zip_reader_get_num_files(&z);
+    int okc = 0, total = 0;
+    for (mz_uint i = 0; i < num; i++) {
+        char name[512];
+        if (mz_zip_reader_get_filename(&z, i, name, sizeof name) == 0) continue;
+        if (mz_zip_reader_is_file_a_directory(&z, i)) continue;
+        if (strcmp(name, "bsdr-payload.conf") == 0) continue;
+        const char *bn = strrchr(name, '/'); bn = bn ? bn + 1 : name;
+        char dest[1600]; snprintf(dest, sizeof dest, "%s/%s", dir, bn);
+        char tmp[1610]; snprintf(tmp, sizeof tmp, "%s.part", dest);
+        total++;
+        if (mz_zip_reader_extract_to_file(&z, i, tmp, 0)) { remove(dest); if (rename(tmp, dest) == 0) okc++; else remove(tmp); }
+        else remove(tmp);
+    }
+    mz_zip_reader_end(&z);
+    if (okc > 0 && okc == total) { BSDR_INFO(TAG, "installed payload -> %s (%d file(s))", dir, okc); return 1; }
+    if (err) snprintf(err, errcap, "extracted %d/%d payload file(s)", okc, total);
+    return 0;
+}
+
 /* Download + extract + record ONE plugin (no dependency handling, no reload). Returns 1 on success. */
 static int ps_install_one(const char *slug, char *err, size_t errcap) {
     char udir[1024];
@@ -577,12 +686,26 @@ static int ps_install_one(const char *slug, char *err, size_t errcap) {
         snprintf(url + m, sizeof url - m, "&key=%s", g_token);
 
     char zip[1200]; snprintf(zip, sizeof zip, "%s/%s.zip.part", udir, slug);
-    if (bsdr_http_download(url, zip, NULL) != 0) {
+    ps_dl_set_current(slug);
+    if (bsdr_http_download(url, zip, ps_dl_progress) != 0) {
         remove(zip);
         if (err) snprintf(err, errcap,
             "download failed \xe2\x80\x94 you may need to buy it first, sign in, or there's no build for %s/%s",
             ps_platform(), ps_arch());
         return 0;
+    }
+
+    /* Payload plugin? (e.g. the GPU CUDA provider) — deliver its files to a target dir, not plugins/. */
+    char ptarget[64] = "";
+    if (zip_payload_target(zip, ptarget, sizeof ptarget)) {
+        int pok = install_payload(zip, ptarget, err, errcap);
+        remove(zip);
+        if (!pok) return 0;
+        set_disabled(slug, 0);
+        char pver[64]; fetch_compatible_version(slug, pver, sizeof pver);
+        manifest_set(slug, pver[0] ? pver : "payload");
+        BSDR_INFO(TAG, "installed payload plugin '%s' (target %s)", slug, ptarget);
+        return 1;
     }
 
     char dest[1200]; snprintf(dest, sizeof dest, "%s/%s%s", udir, slug, PLG_EXT);
@@ -644,6 +767,51 @@ int bsdr_plugstore_download(const char *slug, char *err, size_t errcap) {
 
     bsdr_plugins_reload();
     return 1;
+}
+
+/* Async wrapper: run bsdr_plugstore_download on a detached thread, publishing byte progress + the final
+ * result into g_psdl for the web UI to poll (the sync path already updates progress via ps_install_one). */
+static void ps_dl_worker(void *arg) {
+    char *slug = arg;
+    char err[256] = "";
+    int ok = bsdr_plugstore_download(slug, err, sizeof err);
+    bsdr_mutex_lock(g_psdl_lock);
+    g_psdl.active = 0;
+    g_psdl.ok = ok;
+    if (ok) { g_psdl.pct = 100; g_psdl.err[0] = 0; }
+    else snprintf(g_psdl.err, sizeof g_psdl.err, "%s", err[0] ? err : "download failed");
+    bsdr_mutex_unlock(g_psdl_lock);
+    free(slug);
+}
+
+int bsdr_plugstore_download_start(const char *slug) {
+    if (!valid_slug(slug)) return -1;
+    ps_dl_lock_init();
+    if (!g_psdl_lock) return -1;
+    bsdr_mutex_lock(g_psdl_lock);
+    if (g_psdl.active) { bsdr_mutex_unlock(g_psdl_lock); return 0; }   /* one at a time */
+    memset(&g_psdl, 0, sizeof g_psdl);
+    g_psdl.active = 1; g_psdl.pct = -1;
+    snprintf(g_psdl.name, sizeof g_psdl.name, "%s", slug);
+    bsdr_mutex_unlock(g_psdl_lock);
+    char *arg = strdup(slug);
+    if (!arg || !bsdr_thread_start_detached(ps_dl_worker, arg)) {
+        free(arg);
+        bsdr_mutex_lock(g_psdl_lock);
+        g_psdl.active = 0; snprintf(g_psdl.err, sizeof g_psdl.err, "cannot start download thread");
+        bsdr_mutex_unlock(g_psdl_lock);
+        return -1;
+    }
+    return 0;
+}
+
+void bsdr_plugstore_download_state(bsdr_model_dl *out) {
+    if (!out) return;
+    ps_dl_lock_init();
+    if (!g_psdl_lock) { memset(out, 0, sizeof *out); return; }
+    bsdr_mutex_lock(g_psdl_lock);
+    *out = g_psdl;
+    bsdr_mutex_unlock(g_psdl_lock);
 }
 
 /* ---- local plugin management ---------------------------------------------------------------- */

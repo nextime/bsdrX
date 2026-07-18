@@ -236,6 +236,7 @@ static int      host_screenshot_jpeg(int max_dim, unsigned char *out, size_t cap
 static void     host_speak(const char *text)                     { if (g_app) bsdr_app_tts_say((bsdr_app *)g_app, text); }
 static int      host_stt(const int16_t *pcm, int frames, int rate, int channels, char *out, size_t cap) { return g_app ? bsdr_app_stt((bsdr_app *)g_app, pcm, frames, rate, channels, out, cap) : 0; }
 static int      host_avatar_state(void)                          { return g_app ? bsdr_app_avatar_state((bsdr_app *)g_app) : 0; }
+static void     host_set_voiceai_status(const char *status)      { if (g_app) bsdr_app_set_voiceai_status((bsdr_app *)g_app, status); }
 static int      host_local_legacy_id(char *out, size_t cap)      { return g_app ? bsdr_app_local_legacy_id((bsdr_app *)g_app, out, cap) : 0; }
 static int      host_llm_complete(const char *messages_json, const char *tools_json, char *out, size_t cap) { return g_app ? bsdr_app_llm_complete((bsdr_app *)g_app, messages_json, tools_json, out, cap) : 0; }
 static void     host_utterance_subscribe(bsdr_utterance_cb cb, void *user) { if (g_app) bsdr_app_utterance_subscribe((bsdr_app *)g_app, cb, user); }
@@ -595,6 +596,7 @@ static void plugins_load_locked(void) {
     g_host.voice_base_path      = host_voice_base_path;
     g_host.voice_base_ready     = host_voice_base_ready;
     g_host.voice_list_json      = host_voice_list_json;
+    g_host.set_voiceai_status   = host_set_voiceai_status;   /* ABI 7 */
 
     /* Gather candidates from every scanned directory FIRST, then init them in dependency order. */
     plg_cand cand[CAND_MAX];

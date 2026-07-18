@@ -1,6 +1,6 @@
 # bsdrX — cast any screen into a Bigscreen VR headset
 
-**Version 0.2.0** · Linux · Windows · macOS · Android
+**Version 0.2.1** · Linux · Windows · macOS · Android
 
 **bsdrX** is a clean-room **Bigscreen Remote Desktop** agent. It turns a PC — or an
 Android device — into a Bigscreen Remote Desktop *host*: it casts your **screen and
@@ -146,6 +146,14 @@ composited on top, and the source's own audio is streamed:
     with real mouse support; needs `xvfb` + `xterm` installed on the host.
   Like the other non-desktop sources it shows the in-VR bar with an **exit-to-desktop**
   button, and if the shell exits (or the backend fails to start) it returns to the desktop.
+- **Virtual desktop (headless)** — `--virtual-desktop[=SESSION]`. Same private-Xvfb + XTEST
+  path as `--terminal=xvfb`, but brings up a **full desktop** instead of a bare terminal, so a
+  truly headless box (no monitor, no running Xorg) can be driven from the headset like a real
+  PC. With no argument it launches the machine's **configured default X session** (GNOME/KDE/
+  XFCE/… via the `x-session-manager` alternative); if that can't come up headless it falls back
+  to a lightweight **window manager** (openbox/fluxbox/icewm/…) plus an xterm. `=SESSION` runs
+  your own session command as-is (e.g. `--virtual-desktop=startxfce4`). Needs `xvfb` + `xterm`
+  and, for the auto path, a desktop or WM installed.
 
 ### 2D→3D — real-time depth conversion
 
@@ -222,7 +230,10 @@ ContentVec (content) + pitch (**RMVPE** neural pitch-tracker on the GPU tiers; a
 tracker on CPU — both parabolic-interpolated / median-smoothed so the converted voice doesn't
 warble/buzz) + the voice's RVC generator with proper white-noise excitation, streamed with an overlap
 crossfade so it keeps the same low-latency, in-place audio contract (it adds ~one window of latency
-and passes audio through until warmed).
+and passes audio through until warmed). The RVC forward pass runs on a **worker thread**, never on the
+audio callback, and **drops backlog when it falls behind** — so latency stays bounded (on a GPU it's
+real-time; on CPU, where RVC is slower than real-time, it stays low-latency but goes choppy, passing
+the dry voice through, instead of drifting seconds behind).
 
 **Models are user-supplied / user-downloaded** (bsdrX ships no voice weights, so distribution stays
 clean). The card manages everything: **Download engine models** (the shared ContentVec + RMVPE base,
@@ -281,11 +292,17 @@ the OS, and the voice assistant, can use). Three capture methods:
   link (heartbeat timeout → the session ends). When you pick/start MITM on a Wi-Fi NIC
   the web UI warns and lets you **cancel (switch to Relay) or continue anyway**; the CLI
   logs the same warning and proceeds. Prefer **Relay** on Wi-Fi.
-- **Relay** (router companion) — run **`bsdr_micrelay`** on your router: it captures
-  the headset's uplink there and forwards it to the PC's `--sniff-remote PORT`. This
-  is the **Wi-Fi answer** (where MITM can't work because the AP isolates stations) and
-  needs **no root and no ARP** on the PC. It is also the **only** way Android gets the
-  owner mic.
+- **Relay** (router companion) — run **`bsdr_micrelay --iface br-lan`** on your router: it
+  captures the headset's uplink there and forwards it to the PC. This is the **Wi-Fi answer**
+  (where MITM can't work because the AP isolates stations) and needs **no root and no ARP** on
+  the PC. It is also the **only** way Android gets the owner mic.
+  **Zero-config & multi-headset:** the relay **auto-discovers** — it broadcasts a beacon, each
+  agent finds it and registers for the headset it's paired with, and **one relay serves many
+  agents/headsets in parallel** (no IPs/ports to hand-type). Authorisation is **bind-to-owner**:
+  the relay is in-path, so it watches each headset↔agent remote-desktop session and forwards a
+  headset's mic **only to the agent it observed paired with that headset** — a rogue LAN host
+  can't siphon someone else's owner voice. A static single-flow form (`--quest/--to`) still
+  exists for pinning one headset without discovery.
 
 Two more options in the panel: **"use this computer's microphone"** (skip the headset
 entirely and use the PC's own mic as the owner source) and the **cloud-room fallback**

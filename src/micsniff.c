@@ -33,6 +33,7 @@
 #include "bsdr/mediafx.h"
 #include "bsdr/platform.h"
 #include "micsniff_capture.h"
+#include "bsdr/relayproto.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -205,16 +206,36 @@ static void micsniff_apply_fx(struct bsdr_micsniff *s, int16_t *pcm, int frames)
 #define RELAY_MAGIC2 'R'
 #define RELAY_MAGIC3 'L'
 
-/* Tell the relay whether to substitute (mode 1) or pass through (mode 0), and the cloud dst to
- * suppress/forward-to. Throttled to ~4/s so a relay that (re)started re-learns the state. */
+/* Tell the relay whether to substitute (mode 1) or pass through (mode 0) for OUR headset, and the
+ * cloud dst to suppress/forward-to. Tagged with quest_be so the relay applies it to our flow only. */
 static void relay_send_control(struct bsdr_micsniff *s, int mode) {
     if (s->data_fd < 0 || !s->have_relay_peer || !s->have_flow) return;
-    uint8_t m[16];
-    m[0]=RELAY_MAGIC0; m[1]=RELAY_MAGIC1; m[2]=RELAY_MAGIC2; m[3]=RELAY_MAGIC3; m[4]='C';
-    m[5]=(uint8_t)mode;
-    memcpy(m + 6, &s->flow_dst_be, 4);                 /* cloud IP, wire order */
-    m[10]=(uint8_t)(s->flow_dport >> 8); m[11]=(uint8_t)(s->flow_dport & 0xff);
-    sendto(s->data_fd, (const char *)m, 12, 0, (struct sockaddr *)&s->relay_peer, sizeof s->relay_peer);
+    uint8_t m[24]; int n = bsdr_relay_hdr(m, BSDR_RELAY_CTRL);
+    memcpy(m + n, &s->quest_be, 4); n += 4;             /* which headset flow */
+    m[n++] = (uint8_t)mode;
+    memcpy(m + n, &s->flow_dst_be, 4); n += 4;          /* cloud IP, wire order */
+    m[n++] = (uint8_t)(s->flow_dport >> 8); m[n++] = (uint8_t)(s->flow_dport & 0xff);
+    sendto(s->data_fd, (const char *)m, (size_t)n, 0, (struct sockaddr *)&s->relay_peer, sizeof s->relay_peer);
+}
+
+/* Auto-discovery + registration: ask the relay to capture OUR headset and forward its mic to us
+ * (heartbeat, ~1/s). Unicast once the relay's address is learned from its HELLO beacon; until then
+ * broadcast so we bootstrap with zero configuration. The REGISTER's source address IS our return
+ * path, so the relay needs no forward-port from us. */
+static void relay_register(struct bsdr_micsniff *s, int unreg) {
+    if (s->data_fd < 0) return;
+    uint8_t m[24]; int n = bsdr_relay_hdr(m, unreg ? BSDR_RELAY_UNREG : BSDR_RELAY_REGISTER);
+    memcpy(m + n, &s->quest_be, 4); n += 4;
+    if (!unreg) {
+        m[n++] = (uint8_t)(s->substitute ? 1 : 0);
+        memcpy(m + n, &s->flow_dst_be, 4); n += 4;      /* cloud dst hint (0 until the flow is learned) */
+        m[n++] = (uint8_t)(s->flow_dport >> 8); m[n++] = (uint8_t)(s->flow_dport & 0xff);
+    }
+    struct sockaddr_in dst;
+    if (s->have_relay_peer) dst = s->relay_peer;
+    else { memset(&dst, 0, sizeof dst); dst.sin_family = AF_INET;
+           dst.sin_port = htons(BSDR_RELAY_PORT); dst.sin_addr.s_addr = htonl(INADDR_BROADCAST); }
+    sendto(s->data_fd, (const char *)m, (size_t)n, 0, (struct sockaddr *)&dst, sizeof dst);
 }
 
 /* The FULL-datagram relay send (magic "bsdF") is built in place at its one call site (the substitute
@@ -365,11 +386,12 @@ static void handle_ip(struct bsdr_micsniff *s, const uint8_t *ip, int len) {
                  * latch accepts. Headers verbatim, payload swapped, lengths + checksums fixed. */
                 int new_ulen = 8 + hlen + nolen + 8;
                 int new_iplen = ihl + new_ulen;
-                /* Build the datagram straight into a 5-byte-prefixed buffer ("bsdF" magic) and send
-                 * once — no second copy through relay_send_full (matches the 'A' path below). */
-                uint8_t out[5 + 1600];
-                out[0]=RELAY_MAGIC0; out[1]=RELAY_MAGIC1; out[2]=RELAY_MAGIC2; out[3]=RELAY_MAGIC3; out[4]='F';
-                uint8_t *d = out + 5;
+                /* Build the datagram into a [hdr][quest_be]-prefixed buffer and send once — the relay
+                 * strips the tag, keys the flow by quest_be, and RAW-injects the datagram. */
+                uint8_t out[16 + 1600];
+                int pfx = bsdr_relay_hdr(out, BSDR_RELAY_FULLDG);
+                memcpy(out + pfx, &s->quest_be, 4); pfx += 4;
+                uint8_t *d = out + pfx;
                 memcpy(d, ip, (size_t)(ihl + 8 + hlen));            /* IP + UDP + RTP headers */
                 memcpy(d + ihl + 8 + hlen, nopus, (size_t)nolen);   /* new opus */
                 memcpy(d + ihl + 8 + hlen + nolen, tr, 8);          /* [ssrc][frame_id] trailer */
@@ -377,7 +399,7 @@ static void handle_ip(struct bsdr_micsniff *s, const uint8_t *ip, int len) {
                 d[ihl + 4] = (uint8_t)(new_ulen >> 8); d[ihl + 5] = (uint8_t)(new_ulen & 0xff);
                 fix_ip_udp_csum(d, ihl, new_ulen);
                 if (s->data_fd >= 0)
-                    sendto(s->data_fd, (const char *)out, (size_t)(5 + new_iplen), 0,
+                    sendto(s->data_fd, (const char *)out, (size_t)(pfx + new_iplen), 0,
                            (struct sockaddr *)&s->relay_peer, sizeof s->relay_peer);
                 if (now - s->last_ctrl_ms > 250) { s->last_ctrl_ms = now; relay_send_control(s, 1); }
             }
@@ -838,7 +860,14 @@ static void sniff_main(void *arg) {
                   s->mitm ? "MITM" : "passive", s->quest_ip, s->iface, OWNER_DESC);
     unsigned char buf[PKT_MAX];
     long captured = 0; int warned = 0; uint64_t start = bsdr_now_ms();
+    uint64_t last_reg = 0;
     while (!s->stop) {
+        /* Auto-discovery heartbeat: keep our registration alive (relay expires a flow ~4s after the
+         * last REGISTER). Fires on poll-timeout ticks too, so it runs even before any mic arrives. */
+        if (s->remote_port > 0) {
+            uint64_t nowm = bsdr_now_ms();
+            if (nowm - last_reg > 1000) { relay_register(s, 0); last_reg = nowm; }
+        }
         struct pollfd pfd = { .fd = s->data_fd, .events = POLLIN };
         int pr = poll(&pfd, 1, 300);
         if (pr == 0) {
@@ -858,10 +887,28 @@ static void sniff_main(void *arg) {
             continue;
         }
         if (pr < 0) { if (errno == EINTR) continue; break; }
-        /* recvfrom so relay mode learns the router companion's address (to send substitution back). */
         struct sockaddr_in peer; socklen_t plen = sizeof peer;
         ssize_t n = recvfrom(s->data_fd, buf, sizeof buf, 0, (struct sockaddr *)&peer, &plen);
         if (n <= 0) break;                          /* helper gone */
+        /* Relay control (HELLO/ACK) vs mic data: control tells us the relay's address (learn it, so we
+         * unicast REGISTER + substitution there) but is NOT a packet to decode. A stray broadcast from
+         * ANOTHER agent (its bootstrap REGISTER) also lands here — ignore it, and never mistake its
+         * source for the relay. Only the relay's own HELLO/ACK (or forwarded IPv4 mic) is authoritative. */
+        if (s->remote_port > 0 && bsdr_relay_is_ctrl(buf, (int)n)) {
+            char type = (n >= 6) ? (char)buf[5] : 0;
+            int from_relay = (type == BSDR_RELAY_HELLO && n >= 7 && buf[6] == BSDR_RELAY_ROLE_RELAY) ||
+                             (type == BSDR_RELAY_ACK);
+            if (from_relay && plen == (socklen_t)sizeof peer && peer.sin_family == AF_INET &&
+                (!s->have_relay_peer || s->relay_peer.sin_addr.s_addr != peer.sin_addr.s_addr ||
+                 s->relay_peer.sin_port != peer.sin_port)) {
+                s->relay_peer = peer; s->have_relay_peer = 1;
+                relay_register(s, 0);   /* register immediately now that we know the relay */
+                BSDR_INFO("bsdr.micsniff", "relay companion discovered at %s:%d — registered Quest %s",
+                          inet_ntoa(peer.sin_addr), ntohs(peer.sin_port), s->quest_ip);
+            }
+            continue;   /* not mic data */
+        }
+        /* Mic data: a forwarded IPv4 packet from the relay (or the local helper). */
         if (s->remote_port > 0 && plen == (socklen_t)sizeof peer && peer.sin_family == AF_INET &&
             (!s->have_relay_peer || s->relay_peer.sin_addr.s_addr != peer.sin_addr.s_addr ||
              s->relay_peer.sin_port != peer.sin_port)) {
@@ -872,6 +919,7 @@ static void sniff_main(void *arg) {
         if (captured == 1)
             BSDR_INFO("bsdr.micsniff", "seeing Quest %s traffic; waiting for a room mic stream", s->quest_ip);
     }
+    if (s->remote_port > 0 && s->have_relay_peer) relay_register(s, 1);   /* UNREGISTER: free the flow now */
     BSDR_INFO("bsdr.micsniff", "owner-mic sniffer stopped (%ld frames decoded)", s->decoded);
 }
 
@@ -883,6 +931,7 @@ static int start_capture(struct bsdr_micsniff *s, const char *password) {
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) { BSDR_ERROR("bsdr.micsniff", "remote socket: %s", strerror(errno)); return -1; }
         int one = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof one);   /* bootstrap REGISTER before HELLO */
         struct sockaddr_in a; memset(&a, 0, sizeof a);
         a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = htons((uint16_t)s->remote_port);
         if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) {

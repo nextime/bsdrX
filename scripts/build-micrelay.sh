@@ -57,9 +57,15 @@ Pick the binary for your router's CPU and copy it there:
   bsdr_micrelay-x86      32-bit x86
 Each is fully static (no libpcap/glibc needed on the router).
 
-Run it on the router, and bsdrX on your PC:
+Auto mode (recommended) — zero config, serves every paired headset/agent in parallel:
+  router:  ./bsdr_micrelay-<arch> --iface br-lan
+  PC:      bsdr_agent --sniff-remote 45099   (or just enable the relay owner-mic method in the web panel)
+The relay beacons; each PC finds it and registers for the headset it is paired with. The relay only
+forwards a headset's mic to the agent it observed paired with it (bind-to-owner), so nobody can
+siphon someone else's owner voice.
+
+Static single flow (no discovery/auth), if you prefer to pin one headset:
   router:  ./bsdr_micrelay-<arch> --iface br-lan --quest <headset-ip> --to <pc-ip>:45099
-  PC:      bsdr_agent --sniff-remote 45099
 (OpenWRT users: an .ipk recipe is in openwrt/bsdr-micrelay/.)
 EOF
 

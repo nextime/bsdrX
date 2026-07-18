@@ -207,6 +207,24 @@ HOOK
   fi
 fi
 
+# GPU ONNX Runtime (auto-detected from the deps prefix): when $BSDRX_DEPS is a GPU ORT build, the
+# plugins compile with -DBSDR_ONNX_CUDA and at run time dlopen libonnxruntime_providers_cuda.so, which
+# needs the CUDA 12 / cuDNN 9 runtime. We bundle ONLY the ORT provider (not a distro package) and RELY
+# ON THE HOST for the CUDA/cuDNN runtime (~2.5 GB — installed via the NVIDIA driver/CUDA packages). If
+# the host has no CUDA, providers_cuda.so fails to load, the CUDA EP doesn't attach, and select_ep()
+# degrades to CPU — surfaced honestly in the web UI ("GPU unavailable, running CPU"). This keeps the
+# bundle ~700 MB (the provider) instead of ~3 GB; linuxdeploy won't pull the dlopened provider, so copy
+# it explicitly. Set BSDR_BUNDLE_CUDA_RUNTIME=1 to also bundle the CUDA/cuDNN runtime (fully offline).
+if [ -f "$BSDRX_DEPS/lib/libonnxruntime_providers_cuda.so" ]; then
+  echo ">> GPU ONNX Runtime detected -> bundling the ORT CUDA provider (CUDA/cuDNN runtime = host-provided)"
+  for f in "$BSDRX_DEPS"/lib/libonnxruntime_providers_*.so; do [ -e "$f" ] && cp -an "$f" "$APPDIR/usr/lib/"; done
+  if [ "${BSDR_BUNDLE_CUDA_RUNTIME:-0}" = 1 ]; then
+    echo ">> BSDR_BUNDLE_CUDA_RUNTIME=1 -> also bundling the CUDA 12 / cuDNN 9 runtime (LARGE ~3 GB, fully offline)"
+    for f in "$BSDRX_DEPS"/lib/libcudart.so.* "$BSDRX_DEPS"/lib/libcublas*.so.* "$BSDRX_DEPS"/lib/libcufft.so.* \
+             "$BSDRX_DEPS"/lib/libcurand.so.* "$BSDRX_DEPS"/lib/libcudnn*.so.*; do [ -e "$f" ] && cp -an "$f" "$APPDIR/usr/lib/"; done
+  fi
+fi
+
 # linuxdeploy follows ldd (honoring LD_LIBRARY_PATH) and copies non-system libs,
 # skipping glibc / GPU-driver libs via its built-in exclude list. FUSE-less mode.
 export APPIMAGE_EXTRACT_AND_RUN=1
@@ -231,9 +249,19 @@ rm -rf "$PKG"
 mkdir -p "$PKG/DEBIAN" "$PKG/opt/bsdrX/bin" "$PKG/opt/bsdrX/lib" \
          "$PKG/usr/bin" "$PKG/lib/udev/rules.d" "$PKG/usr/share/doc/bsdr-agent"
 cp "$BIN" "$PKG/opt/bsdrX/bin/bsdr_agent"
-# bundled shared libs (everything linuxdeploy pulled in, minus the ELF loader)
-find "$APPDIR/usr/lib" -maxdepth 1 -type f -name '*.so*' -exec cp -a {} "$PKG/opt/bsdrX/lib/" \;
-find "$APPDIR/usr/lib" -maxdepth 1 -type l -name '*.so*' -exec cp -a {} "$PKG/opt/bsdrX/lib/" \;
+# GPU: the AppImage bundles the CUDA 12 / cuDNN 9 runtime (self-contained), but a .deb should DEPEND on
+# the system CUDA packages instead of carrying ~3 GB of libs. So for the .deb we keep the ORT provider
+# (libonnxruntime_providers_*.so — not a distro package) but SKIP the CUDA/cuDNN runtime .so's, and add
+# them to Depends below (override the package list with BSDR_DEB_CUDA_DEPENDS to match your CUDA repo).
+GPU_DEPENDS=""
+if [ -f "$APPDIR/usr/lib/libonnxruntime_providers_cuda.so" ]; then
+  GPU_DEPENDS="${BSDR_DEB_CUDA_DEPENDS:-cuda-cudart-12-6 | libcudart.so.12, libcublas-12-6 | libcublas.so.12, libcufft-12-6 | libcufft.so.11, libcurand-12-6 | libcurand.so.10, cudnn9-cuda-12 | libcudnn.so.9}"
+  echo ">> GPU .deb: excluding the CUDA/cuDNN runtime (declared as Depends: $GPU_DEPENDS)"
+fi
+# bundled shared libs (everything linuxdeploy pulled in, minus the ELF loader; and minus the CUDA/cuDNN
+# runtime for the .deb — see GPU_DEPENDS). The ORT provider libs (libonnxruntime_providers_*) are kept.
+_deb_skip_cuda="-name libcudart.so.* -o -name libcublas*.so.* -o -name libcufft*.so.* -o -name libcurand.so.* -o -name libcudnn*.so.*"
+find "$APPDIR/usr/lib" -maxdepth 1 -name '*.so*' \( -type f -o -type l \) ! \( $_deb_skip_cuda \) -exec cp -a {} "$PKG/opt/bsdrX/lib/" \;
 # self-contained PipeWire in the .deb too: copy the bundled spa-0.2 + pipewire-0.3 trees (mirrors the AppImage)
 for d in spa-0.2 pipewire-0.3; do [ -d "$APPDIR/usr/lib/$d" ] && cp -a "$APPDIR/usr/lib/$d" "$PKG/opt/bsdrX/lib/"; done
 patchelf --set-rpath '$ORIGIN/../lib' "$PKG/opt/bsdrX/bin/bsdr_agent"

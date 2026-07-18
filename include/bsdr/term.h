@@ -37,6 +37,9 @@ typedef struct {
     const char *cmd;      /* shell/program to run (NULL -> $SHELL, else /bin/bash) */
     int cols, rows;       /* PTY grid (<=0 -> 120x36) */
     int width, height;    /* desired pixel size (XVFB screen; PTY render target hint); <=0 -> 1280x720 */
+    int desktop;          /* XVFB only: run a full virtual desktop (window manager + terminal) instead of
+                           * a bare fullscreen xterm. With `cmd` set, `cmd` is the whole session command
+                           * (e.g. "startxfce4"); else a WM is auto-detected (openbox/fluxbox/icewm/...). */
 } bsdr_term_config;
 
 /* Start the backend (spawns the child process). Returns NULL on failure. */

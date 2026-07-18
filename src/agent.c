@@ -49,6 +49,7 @@
 #include "bsdr/plugin.h"
 #include "bsdr/agentlib.h"
 #include "bsdr/micsniff.h"
+#include "bsdr/relayproto.h"
 #include "bsdr/overlay.h"
 #include "bsdr/threed.h"
 #include "bsdr/depth.h"
@@ -79,6 +80,8 @@
 #  include <sys/resource.h>   /* setpriority: raise scheduler priority for the encode path */
 #endif
 
+struct lan_input_ctx;   /* fwd decl: agent_t holds a pointer to the live input thread's ctx (defined below) */
+
 typedef struct {
     bool video, audio;
     const char *video_file;     /* --file: stream an H.264 file instead of the desktop */
@@ -89,6 +92,15 @@ typedef struct {
     bsdr_thread *worker;
     volatile int stop;          /* per-session cancel/stop flag */
     char remote_ip[64];
+    /* Warm-resume across a room change: on /unpair we keep the (expensive VAAPI) video worker RUNNING for
+     * a short grace instead of tearing it down, so a re-/start from the SAME headset (a room switch, same
+     * IP) resumes instantly — we just force a fresh keyframe and the input thread re-accepts DTLS. 0 = not
+     * warm; else the monotonic-ms deadline after which the main loop finalises the teardown. */
+    volatile uint64_t warm_until;
+    struct lan_input_ctx * volatile input_ctx;  /* the running input thread's ctx, so a warm re-pair can
+                                                  * tell it to drop its stale DTLS and re-accept (set while
+                                                  * a worker is up; NULL otherwise). */
+    int warm_resume;            /* keep the video worker warm across a room-change re-pair (--no-warm-resume off) */
     char src_path[512];         /* stable storage for the file source */
     char cam_left[256];         /* stable storage for the (left) webcam device */
     char cam_right[256];        /* stable storage for the right webcam device (stereo 3D) */
@@ -425,7 +437,7 @@ static void lan_file_audio_main(void *arg) {
  * (0x18008ee40): the data channel on 45004 IS DTLS (Quest=client, PC=server). After
  * the handshake the host sends a 5-byte hello, then receives raw opcode bytes over
  * DTLS (byte0=opcode; NO XOR — DTLS encrypts). We decode + inject via uinput. */
-struct lan_input_ctx { agent_t *a; int sw, sh; volatile int stop; };
+struct lan_input_ctx { agent_t *a; int sw, sh; volatile int stop; volatile int reaccept; };
 static void lan_input_main(void *arg) {
     struct lan_input_ctx *ctx = (struct lan_input_ctx *)arg;
     agent_t *a = ctx->a;
@@ -433,20 +445,27 @@ static void lan_input_main(void *arg) {
     if (!bsdr_udp_open(&udp, BSDR_REMOTE_DATA_PORT, a->remote_ip, BSDR_REMOTE_DATA_PORT)) {
         BSDR_WARN("bsdr.agent", "LAN input: udp 45004 open failed"); return;
     }
+    /* uinput is created ONCE and reused across re-accepts, so a room-change re-pair doesn't churn the
+     * kernel devices (which can wedge a real touchpad). Only the DTLS session is re-established. */
+    bsdr_injector *inj = bsdr_injector_create(ctx->sw, ctx->sh);
+    long n_ev = 0;   /* total injected events across all re-accepts (for the shutdown log below) */
+    /* Re-accept loop: a room change unpairs then re-/starts from the same headset. Keep the UDP socket
+     * bound and (re)accept a DTLS handshake each time the Quest connects, so input survives a re-pair
+     * without a full session respawn (the video worker stays warm across it — see cb_unpair/cb_start). */
+    while (!ctx->stop && !a->stop) {
+    ctx->reaccept = 0;
     bsdr_dtls *dtls = bsdr_dtls_new(&udp, BSDR_DTLS_SERVER);   /* Quest is the client */
-    if (!dtls) { bsdr_udp_close(&udp); return; }
+    if (!dtls) break;
     BSDR_INFO("bsdr.agent", "LAN input: DTLS server on 45004, awaiting Quest...");
     if (!bsdr_dtls_handshake(dtls, 30000, &a->stop)) {
         BSDR_WARN("bsdr.agent", "LAN input: DTLS handshake timeout (no Quest on 45004)");
-        bsdr_dtls_free(dtls); bsdr_udp_close(&udp); return;
+        bsdr_dtls_free(dtls); continue;   /* re-await; the while-condition exits on stop / worker teardown */
     }
     static const uint8_t hello[5] = { 0x10, 0, 0, 0, 0 };       /* host data-channel hello */
     bsdr_dtls_send(dtls, hello, sizeof(hello));
-    bsdr_injector *inj = bsdr_injector_create(ctx->sw, ctx->sh);
     BSDR_INFO("bsdr.agent", "LAN input: DTLS connected; injecting Quest mouse/keyboard");
     uint8_t buf[2048];
     bsdr_input_event evs[32];
-    long n_ev = 0;
     /* Diagnostic only: log the shape of any 45004 message the input decoder doesn't consume.
      * These are NOT mic audio — full.pcapng proved 45004 upstream is fixed-size controller
      * telemetry at the headset refresh rate; the mic never comes here (see the sniffer). */
@@ -460,7 +479,7 @@ static void lan_input_main(void *arg) {
      * We track the last absolute pointer position since clicks carry no coords. */
     double last_x = 0.5, last_y = 0.5, down_x = 0, down_y = 0;
     int balloon_drag = 0, balloon_moved = 0, swallow_up = 0;
-    while (!ctx->stop && !a->stop) {
+    while (!ctx->stop && !a->stop && !ctx->reaccept) {   /* reaccept: a warm re-pair asked us to re-DTLS */
         int n = bsdr_dtls_recv(dtls, buf, sizeof(buf), 100);
         if (n < 0) break;
         if (n == 0) continue;
@@ -547,8 +566,10 @@ static void lan_input_main(void *arg) {
               "0-99=%ld 100-199=%ld 200-299=%ld 300+=%ld",
               size_hist[0], size_hist[1], size_hist[2],
               size_hist[3]+size_hist[4]+size_hist[5]+size_hist[6]);
+    bsdr_dtls_free(dtls);       /* end this DTLS session; the outer loop re-accepts on the next re-pair */
+    }
     if (inj) bsdr_injector_destroy(inj);
-    bsdr_dtls_free(dtls); bsdr_udp_close(&udp);
+    bsdr_udp_close(&udp);
     BSDR_INFO("bsdr.agent", "LAN input stopped (%ld events injected)", n_ev);
 }
 
@@ -703,7 +724,8 @@ static void lan_live_main(agent_t *a) {
             bsdr_app_get_quality(a->app, &qw, &qh, &qbr);
             bsdr_term_config tcfg = { .backend = strcmp(tb, "xvfb") == 0 ? BSDR_TERM_XVFB : BSDR_TERM_PTY,
                                       .cmd = tcmd[0] ? tcmd : NULL, .cols = tc, .rows = tr,
-                                      .width = qw > 0 ? qw : 1280, .height = qh > 0 ? qh : 720 };
+                                      .width = qw > 0 ? qw : 1280, .height = qh > 0 ? qh : 720,
+                                      .desktop = a->app->term_desktop };
             term = bsdr_term_start(&tcfg);
             if (!term) {
                 BSDR_WARN("bsdr.agent", "terminal source failed to start -> desktop");
@@ -801,8 +823,9 @@ static void lan_live_main(agent_t *a) {
     bsdr_thread *athr = audio_ok ? bsdr_thread_start(filemode ? lan_file_audio_main : lan_audio_main, &actx)
                                  : NULL;   /* -> Quest:45003 */
 #endif
-    struct lan_input_ctx ictx = { a, w, h, 0 };       /* Quest mouse/keyboard -> uinput */
+    struct lan_input_ctx ictx = { a, w, h, 0, 0 };    /* Quest mouse/keyboard -> uinput */
     bsdr_thread *ithr = bsdr_thread_start(lan_input_main, &ictx);
+    bsdr_mutex_lock(a->lock); a->input_ctx = &ictx; bsdr_mutex_unlock(a->lock);   /* let a warm re-pair signal it */
     unsigned my_seek_gen = a->app->file_seek_gen;
     unsigned my_threed_gen = a->app->threed_gen;
     unsigned my_enc_gen = a->app ? a->app->encoder_gen : 0;
@@ -835,7 +858,8 @@ static void lan_live_main(agent_t *a) {
                 int nqw=0,nqh=0,nqbr=0; bsdr_app_get_quality(a->app, &nqw, &nqh, &nqbr);
                 bsdr_term_config tcfg = { .backend = strcmp(tb,"xvfb")==0?BSDR_TERM_XVFB:BSDR_TERM_PTY,
                                           .cmd = tcmd[0]?tcmd:NULL, .cols = tc, .rows = tr,
-                                          .width = nqw>0?nqw:1280, .height = nqh>0?nqh:720 };
+                                          .width = nqw>0?nqw:1280, .height = nqh>0?nqh:720,
+                                          .desktop = a->app->term_desktop };
                 nterm = bsdr_term_start(&tcfg);
                 if (!nterm) { BSDR_WARN("bsdr.agent", "source switch: terminal failed to start -> desktop"); ready = 0; }
                 else if (bsdr_term_is_pty(nterm)) {
@@ -1124,6 +1148,7 @@ static void lan_live_main(agent_t *a) {
     if (audio_ok) bsdr_udp_close(&audio_udp);
     if (adev_ok) bsdr_audio_devices_destroy(&adev);
 #endif
+    bsdr_mutex_lock(a->lock); a->input_ctx = NULL; bsdr_mutex_unlock(a->lock);   /* ictx about to go out of scope */
     if (ithr) { ictx.stop = 1; bsdr_thread_join(ithr); }   /* input thread stops reading a->term first */
     if ((filemode || termmode) && a->overlay) bsdr_overlay_set_visible(a->overlay, false);
     a->file_mode = 0; a->term_mode = 0;
@@ -1178,6 +1203,25 @@ static void cb_start(const bsdr_paired_device *dev, void *user) {
     BSDR_INFO("bsdr.agent", "device %s requested start; bringing up input link "
               "(DTLS data channel %s:%d)",
               dev->device_name, dev->remote_ip, BSDR_REMOTE_DATA_PORT);
+    /* WARM RESUME: if the video worker is still up from a very recent unpair (a room change) and the
+     * headset IP is unchanged, DON'T teardown+respawn — keep the running (expensive VAAPI) encoder, force
+     * a fresh keyframe for the re-joining headset, and tell the input thread to re-accept a DTLS
+     * handshake. Cuts the ~3s encoder/DTLS rebuild so the video barely blinks on a room switch. */
+    bsdr_mutex_lock(a->lock);
+    int warm = a->warm_resume && a->warm_until && a->worker &&
+               strcmp(a->remote_ip, dev->remote_ip) == 0;
+    a->warm_until = 0;
+    struct lan_input_ctx *ic = a->input_ctx;
+    bsdr_mutex_unlock(a->lock);
+    if (warm) {
+        BSDR_INFO("bsdr.agent", "warm resume (same headset %s) — keeping the encoder, forcing a keyframe",
+                  dev->remote_ip);
+        if (a->app) { bsdr_app_set_paired(a->app, true, dev->device_name, dev->remote_ip);
+                      bsdr_app_set_streaming(a->app, true);
+                      bsdr_app_request_keyframe(a->app); }
+        if (ic) ic->reaccept = 1;   /* input drops its stale DTLS and re-accepts the Quest's new handshake */
+        return;
+    }
     teardown_session(a);
     if (a->app) {
         bsdr_app_set_paired(a->app, true, dev->device_name, dev->remote_ip);
@@ -1205,7 +1249,15 @@ static void cb_unpair(const bsdr_paired_device *dev, void *user) {
      * arms it) so a quick unpair/re-pair keeps the cloud stream — it's finalized by the main loop's
      * bsdr_app_unpair_grace_expired() if no re-pair arrives. */
     if (a->app) bsdr_app_set_paired(a->app, false, NULL, NULL);
-    teardown_session(a);
+    /* Room change = unpair immediately followed by a re-/start from the same headset. Keep the video
+     * worker WARM for a short grace so the re-pair resumes instantly (the cb_start warm path); the main
+     * loop finalises the teardown if no re-pair arrives before the deadline. --no-warm-resume tears down
+     * now, as before. */
+    bsdr_mutex_lock(a->lock);
+    int warm_ok = a->warm_resume && a->worker;
+    if (warm_ok) a->warm_until = bsdr_now_ms() + 12000;   /* ~12 s grace (re-pair typically ~5 s) */
+    bsdr_mutex_unlock(a->lock);
+    if (!warm_ok) teardown_session(a);
 }
 
 /* The headset's PUT /device sends ONE of bitrate/fec/fps/resolution.
@@ -1298,6 +1350,7 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
 
     if (!bsdr_platform_init()) { fprintf(stderr, "platform init failed\n"); return 1; }
     a.lock = bsdr_mutex_new();
+    a.warm_resume = getenv("BSDR_NO_WARM_RESUME") ? 0 : 1;   /* warm-resume the encoder across a room-change re-pair */
 
     bsdr_app app;
     bsdr_app_init(&app);
@@ -1611,10 +1664,13 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
                                if (a.remote_ip[0]) snprintf(sip, sizeof sip, "%s", a.remote_ip);
                                bsdr_mutex_unlock(a.lock); }
                 if (sip[0]) {
-                    /* relay port only applies in relay mode; fall back to the CLI --sniff-remote port */
+                    /* relay port only applies in relay mode; fall back to the CLI --sniff-remote port,
+                     * then to the well-known relay port so auto-discovery (the relay's broadcast beacon
+                     * + mic forward both use BSDR_RELAY_PORT) lines up with zero configuration. */
                     int relay = 0;
                     if (method == 2) { relay = bsdr_app_get_relay_port(&app);
-                                       if (relay <= 0) relay = opt->sniff_remote_port; }
+                                       if (relay <= 0) relay = opt->sniff_remote_port;
+                                       if (relay <= 0) relay = BSDR_RELAY_PORT; }
                     bsdr_micsniff_cfg sc = { .quest_ip = sip, .iface = opt->sniff_iface,
                                              .gateway_ip = opt->sniff_gw, .mitm = want_mitm,
                                              .password = have_pw ? sniff_pw : NULL,
@@ -1822,6 +1878,13 @@ int bsdr_agent_run(const bsdr_agent_options *opt) {
             BSDR_INFO("bsdr.agent", "disconnected from Quest %s (operator request)", dropped);
         }
         bsdr_app_unpair_grace_expired(&app);      /* finalize a held relay once its grace timer lapses */
+        /* Warm-resume grace lapsed with no re-pair (not a room change) → finalize the LAN teardown now. */
+        bsdr_mutex_lock(a.lock);
+        int warm_expired = a.warm_until && bsdr_now_ms() > a.warm_until;
+        if (warm_expired) a.warm_until = 0;
+        bsdr_mutex_unlock(a.lock);
+        if (warm_expired) { teardown_session(&a); if (a.app) bsdr_app_set_streaming(&app, false);
+                            BSDR_INFO("bsdr.agent", "warm-resume grace lapsed — LAN session torn down"); }
         if (tick % 5 == 0)                        /* ~1 s: reconcile internet sharing promptly */
             bsdr_app_cloud_tick(&app);            /* start/stop the relay stream to match desired */
         if (++follow_ctr >= 75) {                 /* ~15 s: follow the operator between rooms */
@@ -1925,6 +1988,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--file-gpu") == 0) opt.file_gpu = true;
         else if (strncmp(argv[i], "--terminal=", 11) == 0) opt.terminal = argv[i] + 11;   /* --terminal=pty|xvfb */
         else if (strcmp(argv[i], "--terminal") == 0) opt.terminal = "pty";               /* bare = headless-native pty */
+        /* --virtual-desktop[=session-cmd]: xvfb backend in full-desktop mode. Bare = auto (the box's
+         * default X session, else a lightweight WM + xterm); =CMD runs CMD as the whole session. */
+        else if (strncmp(argv[i], "--virtual-desktop=", 18) == 0) { opt.terminal = "xvfb-desktop"; opt.terminal_cmd = argv[i] + 18; }
+        else if (strcmp(argv[i], "--virtual-desktop") == 0) opt.terminal = "xvfb-desktop";
         else if (strcmp(argv[i], "--terminal-cmd") == 0 && i + 1 < argc) opt.terminal_cmd = argv[++i];
         else if (strcmp(argv[i], "--terminal-size") == 0 && i + 1 < argc) { int c=0,r=0; if (sscanf(argv[++i], "%dx%d", &c, &r) == 2) { opt.terminal_cols = c; opt.terminal_rows = r; } }
         else if (strcmp(argv[i], "--threed") == 0 && i + 1 < argc) opt.threed_mode = bsdr_threed_mode_parse(argv[++i]);
@@ -2013,6 +2080,13 @@ int main(int argc, char **argv) {
 "                                needed; keystrokes go to the pty, mouse when the app enables it.\n"
 "                         xvfb = a private Xvfb + xterm captured via x11grab, injected via XTEST\n"
 "                                (full graphical terminal + mouse; needs Xvfb + xterm installed).\n"
+"  --virtual-desktop[=CMD]\n"
+"                       Like --terminal=xvfb but a FULL virtual desktop on the private Xvfb, not a\n"
+"                       bare terminal — great for a truly headless box (no monitor/Xorg). With no\n"
+"                       CMD it launches the machine's configured default X session (GNOME/KDE/XFCE/\n"
+"                       ...), or, if none, a lightweight WM (openbox/fluxbox/icewm/...) + an xterm.\n"
+"                       =CMD runs CMD as the whole session (e.g. --virtual-desktop=startxfce4).\n"
+"                       Needs Xvfb + xterm (+ a WM/desktop) installed.\n"
 "  --terminal-cmd CMD   Program to run in the terminal (default: $SHELL, else /bin/bash).\n"
 "  --terminal-size CxR  pty grid size in columns x rows (default 120x36).\n"
 "  --threed MODE        Real-time 2D->3D side-by-side. MODE = off|fast|ai. 'fast' is a\n"
@@ -2055,10 +2129,13 @@ int main(int argc, char **argv) {
 "                       mic through us (toggles ip_forward; heals ARP on exit). Implies --sniff-mic.\n"
 "  --sniff-iface IF     Capture interface (default: the default-route interface).\n"
 "  --sniff-gw IP        Gateway IP for --sniff-mitm (default: the default-route gateway).\n"
-"  --sniff-remote PORT  Receive the owner mic from a router companion (bsdr_micrelay) on this\n"
-"                       UDP port instead of capturing locally. Works over WiFi (the router sees\n"
-"                       the headset's traffic); no root/MITM. Run bsdr_micrelay on the router:\n"
-"                       bsdr_micrelay --iface br-lan --quest <headset-ip> --to <this-host>:PORT\n"
+"  --sniff-remote PORT  Receive the owner mic from a router companion (bsdr_micrelay) instead of\n"
+"                       capturing locally. Works over WiFi (the router sees the headset's traffic);\n"
+"                       no root/MITM. Omit or set 45099 to use AUTO-DISCOVERY: just run\n"
+"                       'bsdr_micrelay --iface br-lan' on the router — it beacons, this agent finds\n"
+"                       it and registers for the headset it's paired with (the relay only forwards a\n"
+"                       headset's mic to the agent it observed paired with it), and one relay serves\n"
+"                       many agents/headsets at once. No IPs/ports to hand-configure.\n"
 "\n"
 "VOICE COMPUTER CONTROL\n"
 "  --compctl            Arm voice-driven desktop control: a movable balloon is drawn over\n"

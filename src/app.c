@@ -1186,8 +1186,8 @@ static void settings_save(bsdr_app *a) {
             x264t, vaapi, kms);
     fprintf(f, "owner_mic_local=%d\nowner_mic_to_questmic=%d\n", omlocal, omquest);   /* owner-mic routing */
     fprintf(f, "file_loop=%d\n", a->file_loop);   /* loop the file/playlist source continuously */
-    fprintf(f, "term_backend=%s\nterm_cols=%d\nterm_rows=%d\n",   /* terminal-source prefs */
-            a->term_backend[0] ? a->term_backend : "pty", a->term_cols, a->term_rows);
+    fprintf(f, "term_backend=%s\nterm_cols=%d\nterm_rows=%d\nterm_desktop=%d\n",   /* terminal-source prefs */
+            a->term_backend[0] ? a->term_backend : "pty", a->term_cols, a->term_rows, a->term_desktop);
     /* voice changer: persist the master + every knob so presets/settings survive a restart */
     fprintf(f, "voice_fx=%d\nvoice_gender=%d\nvoice_formant=%d\nvoice_volume=%d\n"
                "voice_robot=%d\nvoice_echo=%d\nvoice_whisper=%d\nvoice_substitute=%d\n",
@@ -1248,6 +1248,7 @@ void bsdr_app_load_settings(bsdr_app *a) {
         else if (sscanf(line, "term_cols=%d", &v) == 1)        a->term_cols = (v >= 20 && v <= 400) ? v : 120;
         else if (sscanf(line, "term_rows=%d", &v) == 1)        a->term_rows = (v >= 6 && v <= 120) ? v : 36;
         else if (sscanf(line, "term_backend=%7[a-z]", a->term_backend) == 1) { if (strcmp(a->term_backend,"xvfb")) snprintf(a->term_backend, sizeof(a->term_backend), "pty"); }
+        else if (sscanf(line, "term_desktop=%d", &v) == 1)     a->term_desktop = v ? 1 : 0;
         else if (sscanf(line, "use_vaapi=%d", &v) == 1)        a->use_vaapi = v ? true : false;
         else if (sscanf(line, "use_kmsgrab=%d", &v) == 1)      a->use_kmsgrab = v ? true : false;
         else if (sscanf(line, "cloud_rtcp_pli=%d", &v) == 1)   a->cloud_rtcp_pli = v ? true : false;
@@ -1585,6 +1586,7 @@ void bsdr_app_bot_restore(bsdr_app *a) {
 static void bot_set_msg(bsdr_app *a, bool joined, const char *room, const char *fmt, ...);
 static void bot_loopback_apply(bsdr_app *a);
 static bool bot_renew_token(bsdr_app *a);
+static bool app_renew_token(bsdr_app *a);   /* renew the HOST access token (defined later) */
 
 void bsdr_app_bot_logout(bsdr_app *a) {
     bsdr_mutex_lock(a->lock);
@@ -1689,8 +1691,23 @@ bool bsdr_app_bot_join_room(bsdr_app *a) {
 
     /* host's current room + its join policy */
     bsdr_cloud_screen room; memset(&room, 0, sizeof room);
-    if (!bsdr_cloud_get_rooms(host_tok, &room) || !room.room_id[0]) {
-        bot_set_msg(a, false, NULL, "host is not in a room"); return false;
+    bool got = bsdr_cloud_get_rooms(host_tok, &room);
+    /* A 401/403 here is an EXPIRED host token, not "no room" — the host's access token is short-lived
+     * and expires mid-session exactly like the bot's. Renew it (via the stored refresh token) and retry
+     * once before concluding anything, mirroring the bot-token path below. */
+    if (!got && (room.http_status == 401 || room.http_status == 403) && app_renew_token(a)) {
+        bsdr_mutex_lock(a->lock); snprintf(host_tok, sizeof host_tok, "%s", a->access_token); bsdr_mutex_unlock(a->lock);
+        memset(&room, 0, sizeof room);
+        got = bsdr_cloud_get_rooms(host_tok, &room);
+        BSDR_INFO("bsdr.app", "host GET /rooms retried after token renew -> %s (HTTP %d)",
+                  got ? "OK" : "still failing", room.http_status);
+    }
+    if (!got || !room.room_id[0]) {
+        if (room.http_status == 401 || room.http_status == 403)
+            bot_set_msg(a, false, NULL, "host session expired and could not be renewed — re-login the host account, then Join again");
+        else
+            bot_set_msg(a, false, NULL, "host is not in a room — join a Bigscreen room on the headset first (a LAN remote-desktop session is not a Bigscreen room)");
+        return false;
     }
     const char *ut = room.user_type[0] ? room.user_type : "Anyone";
     BSDR_INFO("bsdr.app", "bot join: room %s preferredUserType=%s botSocialId=%s", room.room_id, ut, bot_sid);
@@ -2478,8 +2495,12 @@ void bsdr_app_get_source(bsdr_app *a, char *mode, size_t ml, char *path, size_t 
 
 void bsdr_app_set_terminal(bsdr_app *a, const char *backend, int cols, int rows) {
     bsdr_mutex_lock(a->lock);
-    if (backend && backend[0])
-        snprintf(a->term_backend, sizeof(a->term_backend), "%s", strcmp(backend, "xvfb") == 0 ? "xvfb" : "pty");
+    if (backend && backend[0]) {
+        /* "xvfb-desktop" = the xvfb backend in full virtual-desktop mode; "xvfb" = bare xterm. */
+        int xvfb = strcmp(backend, "xvfb") == 0 || strcmp(backend, "xvfb-desktop") == 0;
+        snprintf(a->term_backend, sizeof(a->term_backend), "%s", xvfb ? "xvfb" : "pty");
+        a->term_desktop = strcmp(backend, "xvfb-desktop") == 0 ? 1 : 0;
+    }
     if (cols > 0) a->term_cols = cols < 20 ? 20 : cols > 400 ? 400 : cols;
     if (rows > 0) a->term_rows = rows < 6 ? 6 : rows > 120 ? 120 : rows;
     bsdr_mutex_unlock(a->lock);

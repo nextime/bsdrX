@@ -154,7 +154,11 @@ mc_cap *mc_cap_open(const char *iface, const char *quest_ip, char *err, size_t e
     if (pd) {
         struct bpf_program fp;
         char filt[128];
-        snprintf(filt, sizeof filt, "udp and src host %s", quest_ip);
+        /* quest_ip NULL/empty = the multi-headset RELAY: capture ALL UDP and demux by source IP in
+         * userspace (the relay serves many headsets and also watches the pairing ports). A single
+         * quest_ip = the classic single-flow sniffer, filtered at the kernel for efficiency. */
+        if (quest_ip && quest_ip[0]) snprintf(filt, sizeof filt, "udp and src host %s", quest_ip);
+        else                         snprintf(filt, sizeof filt, "udp");
         if (pcap_compile(pd, &fp, filt, 1, PCAP_NETMASK_UNKNOWN) == 0) {
             pcap_setfilter(pd, &fp);
             pcap_freecode(&fp);
@@ -249,8 +253,17 @@ struct mc_cap {
     char backend[16];
 };
 
-static void attach_bpf(int sock, uint32_t quest_be) {   /* keep only UDP from the Quest */
+static void attach_bpf(int sock, uint32_t quest_be) {   /* keep UDP; if quest_be, only from that host */
     uint32_t q = ntohl(quest_be);
+    if (quest_be == 0) {                                /* relay: all UDP, any source (userspace demux) */
+        struct sock_filter code[] = {
+            { 0x30, 0, 0, 0x00000009 }, { 0x15, 0, 1, 0x00000011 },
+            { 0x06, 0, 0, 0x00040000 }, { 0x06, 0, 0, 0x00000000 },
+        };
+        struct sock_fprog prog = { .len = 4, .filter = code };
+        (void)setsockopt(sock, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof prog);
+        return;
+    }
     struct sock_filter code[] = {
         { 0x30, 0, 0, 0x00000009 }, { 0x15, 0, 3, 0x00000011 },
         { 0x20, 0, 0, 0x0000000c }, { 0x15, 0, 1, q },
@@ -265,7 +278,7 @@ mc_cap *mc_cap_open(const char *iface, const char *quest_ip, char *err, size_t e
     if (ifidx == 0) { snprintf(err, errlen, "unknown interface %s", iface); return NULL; }
     int s = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
     if (s < 0) { snprintf(err, errlen, "AF_PACKET socket: %s (need root/CAP_NET_RAW)", strerror(errno)); return NULL; }
-    attach_bpf(s, inet_addr(quest_ip));
+    attach_bpf(s, (quest_ip && quest_ip[0]) ? inet_addr(quest_ip) : 0);
     struct sockaddr_ll sll; memset(&sll, 0, sizeof sll);
     sll.sll_family = AF_PACKET; sll.sll_protocol = htons(ETH_P_IP); sll.sll_ifindex = ifidx;
     if (bind(s, (struct sockaddr *)&sll, sizeof sll) != 0) {

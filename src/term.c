@@ -60,6 +60,8 @@ struct bsdr_term {
     /* --- XVFB --- */
     pid_t xpid;                  /* the Xvfb process */
     pid_t tpid;                  /* the terminal (xterm) process */
+    pid_t wmpid;                 /* desktop mode: the window manager / session process (else -1) */
+    int desktop;                 /* XVFB: virtual-desktop mode (WM + terminal), not a bare xterm */
     char display[16];            /* ":99" */
     int screen_w, screen_h;
 #if defined(BSDR_HAVE_XTEST)
@@ -111,6 +113,67 @@ static pid_t spawn(char *const argv[]) {
     return pid;
 }
 
+/* Like spawn(), but exports DISPLAY=disp in the child first — for desktop clients (window managers,
+ * session scripts) that read the display from the environment rather than a -display flag. */
+static pid_t spawn_disp(char *const argv[], const char *disp) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        setsid();
+        setenv("DISPLAY", disp, 1);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); if (devnull > 2) close(devnull); }
+        signal(SIGPIPE, SIG_DFL);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    return pid;
+}
+
+/* Is `bin` an executable somewhere on $PATH? (No shell, no fork — just scan the dirs.) */
+static int in_path(const char *bin) {
+    const char *p = getenv("PATH");
+    if (!p || !*p) p = "/usr/local/bin:/usr/bin:/bin";
+    size_t blen = strlen(bin);
+    while (*p) {
+        const char *c = strchr(p, ':');
+        size_t len = c ? (size_t)(c - p) : strlen(p);
+        char buf[512];
+        if (len && len + blen + 2 < sizeof buf) {
+            memcpy(buf, p, len); buf[len] = '/'; memcpy(buf + len + 1, bin, blen + 1);
+            if (access(buf, X_OK) == 0) return 1;
+        }
+        if (!c) break;
+        p = c + 1;
+    }
+    return 0;
+}
+
+/* First available lightweight window manager, or NULL if none is installed. */
+static const char *find_wm(void) {
+    static const char *wms[] = { "openbox", "fluxbox", "icewm", "jwm", "matchbox-window-manager", "twm", NULL };
+    for (int i = 0; wms[i]; i++) if (in_path(wms[i])) return wms[i];
+    return NULL;
+}
+
+/* The system's configured default X session, if any — so a box with a real desktop installed brings
+ * up *that* (GNOME/KDE/XFCE/...) on the virtual display, exactly as a local login would. Returns a
+ * command to run under a login shell, or NULL to fall back to a lightweight WM + xterm.
+ * NB: we deliberately DON'T use /etc/X11/Xsession — it's the display-manager wrapper, and invoked
+ * standalone it can sit alive-but-blank (needs a DM's environment), an undetectable failure. The
+ * update-alternatives x-session-manager (the same "default DE" this box is configured for) execs the
+ * DE directly, so it either renders or exits — and a quick exit is caught by the survive-check in
+ * xvfb_start(), which then falls back to a WM + xterm. */
+static const char *find_default_session(void) {
+    if (in_path("x-session-manager")) return "x-session-manager";      /* the default-DE alternative */
+    static const char *sess[] = {                                       /* known DE launchers, richest first */
+        "gnome-session", "startplasma-x11", "startkde", "startxfce4", "mate-session",
+        "cinnamon-session", "lxqt-session", "startlxde", "lxsession", "enlightenment_start", NULL };
+    for (int i = 0; sess[i]; i++) if (in_path(sess[i])) return sess[i];
+    if (in_path("x-window-manager")) return "x-window-manager";         /* the default-WM alternative */
+    return NULL;
+}
+
 /* Wait up to timeout_ms for the X socket of display :n to appear (server ready). */
 static int wait_x_ready(int n, int timeout_ms) {
     char sock[64];
@@ -147,6 +210,64 @@ static int xvfb_start(struct bsdr_term *t, const bsdr_term_config *cfg) {
         kill(t->xpid, SIGTERM); return -1;
     }
 
+    t->desktop = cfg->desktop ? 1 : 0;
+    t->wmpid = -1;
+    if (t->desktop) {
+        /* Virtual desktop: run a real session on the private Xvfb so the headset sees a full desktop
+         * (windows, a WM, a taskbar) rather than a single fullscreen shell. Two shapes:
+         *   - cfg->cmd set  -> it's the whole session command (e.g. "startxfce4", "openbox-session"),
+         *                      launched via a login shell; honored as-is (no fallback — it's the
+         *                      operator's explicit choice; if it dies, bsdr_term_dead() reports it).
+         *   - cfg->cmd unset-> launch the box's configured default desktop; if that can't come up
+         *                      (e.g. a headless server with no DE runtime), fall back to a WM + xterm. */
+        int explicit_cmd = cfg->cmd && cfg->cmd[0];
+        const char *session = explicit_cmd ? cfg->cmd : find_default_session();
+        int session_ok = 0;
+        if (session) {
+            char *sess[] = { (char*)"/bin/sh", (char*)"-lc", (char*)session, NULL };
+            t->wmpid = spawn_disp(sess, t->display);
+            if (t->wmpid < 0) {
+                if (explicit_cmd) {
+                    BSDR_ERROR("bsdr.term", "cannot launch virtual-desktop session `%s`", session);
+                    kill(t->xpid, SIGTERM); return -1;
+                }
+                BSDR_WARN("bsdr.term", "cannot fork default session `%s` -> WM + xterm", session);
+            } else if (explicit_cmd) {
+                session_ok = 1;   /* honor the operator's command as-is */
+            } else {
+                /* Survive-check: a real DE keeps running; a DE that can't come up headless (no D-Bus
+                 * session, missing pieces) exits within ~1s. If it's gone, fall back to a WM + xterm
+                 * so the headset gets a usable desktop instead of a blank/dead one. */
+                struct timespec ts = {1, 0}; nanosleep(&ts, NULL);
+                if (waitpid(t->wmpid, NULL, WNOHANG) == 0) session_ok = 1;
+                else { BSDR_WARN("bsdr.term", "default session `%s` exited immediately -> WM + xterm", session); t->wmpid = -1; }
+            }
+            if (session_ok)
+                BSDR_INFO("bsdr.term", "xvfb desktop up: Xvfb %s %dx%d + %s session `%s` -> x11grab, XTEST input",
+                          t->display, w, h, explicit_cmd ? "custom" : "default", session);
+        }
+        if (!session_ok) {
+            const char *wm = find_wm();
+            if (wm) {
+                char *wmv[] = { (char*)wm, NULL };
+                t->wmpid = spawn_disp(wmv, t->display);
+            } else {
+                BSDR_WARN("bsdr.term", "no window manager on PATH (install openbox/fluxbox/icewm) — bare xterm only");
+            }
+            /* One initial WM-managed terminal so there's something to type into. No fixed geometry —
+             * the WM places it; the user can open more from it. */
+            char *xt[] = { (char*)"xterm", (char*)"-fa", (char*)"DejaVu Sans Mono", (char*)"-fs", (char*)"12",
+                           (char*)"-bg", (char*)"black", (char*)"-fg", (char*)"white", NULL };
+            t->tpid = spawn_disp(xt, t->display);
+            if (t->tpid < 0) {
+                BSDR_ERROR("bsdr.term", "cannot spawn xterm (is it installed? apt/dnf install xterm)");
+                if (t->wmpid > 0) kill(t->wmpid, SIGTERM);
+                kill(t->xpid, SIGTERM); return -1;
+            }
+            BSDR_INFO("bsdr.term", "xvfb desktop up: Xvfb %s %dx%d + %s + xterm -> x11grab, XTEST input",
+                      t->display, w, h, wm ? wm : "(no wm)");
+        }
+    } else {
     /* xterm sized to fill the virtual screen (no WM here, so give an explicit char geometry). A
      * 14px mono cell is ~8x17 px; compute cols/rows to cover w x h. */
     int cols = w / 8; if (cols < 20) cols = 20; if (cols > 400) cols = 400;
@@ -169,6 +290,8 @@ static int xvfb_start(struct bsdr_term *t, const bsdr_term_config *cfg) {
         BSDR_ERROR("bsdr.term", "cannot spawn xterm (is it installed? apt/dnf install xterm)");
         kill(t->xpid, SIGTERM); return -1;
     }
+    BSDR_INFO("bsdr.term", "xvfb terminal up: Xvfb %s %dx%d + xterm(%dx%d) -> x11grab, XTEST input", t->display, w, h, cols, rows);
+    }
 
     /* Injection connection to the private display. */
     t->dpy = XOpenDisplay(t->display);
@@ -176,7 +299,6 @@ static int xvfb_start(struct bsdr_term *t, const bsdr_term_config *cfg) {
     int ev=0, er=0, mj=0, mn=0;
     if (t->dpy && !XTestQueryExtension(t->dpy, &ev, &er, &mj, &mn))
         BSDR_WARN("bsdr.term", "XTEST extension missing on %s; input injection unavailable", t->display);
-    BSDR_INFO("bsdr.term", "xvfb terminal up: Xvfb %s %dx%d + xterm(%dx%d) -> x11grab, XTEST input", t->display, w, h, cols, rows);
     return 0;
 #endif
 }
@@ -322,18 +444,24 @@ static void xvfb_stop(struct bsdr_term *t) {
 #if defined(BSDR_HAVE_XTEST)
     if (t->dpy) { xvfb_release_latched(t); XCloseDisplay(t->dpy); t->dpy = NULL; }
 #endif
+    if (t->wmpid > 0) { kill(-t->wmpid, SIGTERM); kill(t->wmpid, SIGTERM); }  /* whole session group */
     if (t->tpid > 0) { kill(t->tpid, SIGTERM); }
     if (t->xpid > 0) { kill(t->xpid, SIGTERM); }
     /* reap (Xvfb exits once its last client is gone; give SIGKILL a moment if needed) */
     for (int i = 0; i < 20; i++) {
         int any = 0;
+        if (t->wmpid > 0 && waitpid(t->wmpid, NULL, WNOHANG) == 0) any = 1;
         if (t->tpid > 0 && waitpid(t->tpid, NULL, WNOHANG) == 0) any = 1;
         if (t->xpid > 0 && waitpid(t->xpid, NULL, WNOHANG) == 0) any = 1;
         if (!any) break;
         struct timespec ts = {0, 50*1000*1000}; nanosleep(&ts, NULL);
-        if (i == 10) { if (t->tpid > 0) kill(t->tpid, SIGKILL); if (t->xpid > 0) kill(t->xpid, SIGKILL); }
+        if (i == 10) {
+            if (t->wmpid > 0) { kill(-t->wmpid, SIGKILL); kill(t->wmpid, SIGKILL); }
+            if (t->tpid > 0) kill(t->tpid, SIGKILL);
+            if (t->xpid > 0) kill(t->xpid, SIGKILL);
+        }
     }
-    t->tpid = t->xpid = -1;
+    t->wmpid = t->tpid = t->xpid = -1;
 }
 
 /* ===================== public API ============================================================== */
@@ -343,7 +471,7 @@ bsdr_term *bsdr_term_start(const bsdr_term_config *cfg) {
     bsdr_term *t = calloc(1, sizeof *t);
     if (!t) return NULL;
     t->backend = cfg->backend;
-    t->xpid = t->tpid = -1;
+    t->xpid = t->tpid = t->wmpid = -1;
     if (cfg->backend == BSDR_TERM_XVFB) {
         if (xvfb_start(t, cfg) != 0) { free(t); return NULL; }
         return t;
@@ -400,6 +528,14 @@ void bsdr_term_input(bsdr_term *t, const bsdr_input_event *ev) {
 int bsdr_term_dead(bsdr_term *t) {
     if (!t) return 1;
     if (t->backend == BSDR_TERM_XVFB) {
+        if (t->desktop) {
+            /* Desktop lives as long as its session (or, WM-mode, its Xvfb) is up — NOT tied to the
+             * initial xterm, which the user may close. Reap a dead xterm so it doesn't zombie. */
+            if (t->tpid > 0 && waitpid(t->tpid, NULL, WNOHANG) > 0) t->tpid = -1;
+            if (t->wmpid > 0) { if (waitpid(t->wmpid, NULL, WNOHANG) > 0) { t->wmpid = -1; return 1; } return 0; }
+            if (t->xpid > 0 && waitpid(t->xpid, NULL, WNOHANG) > 0) { t->xpid = -1; return 1; }
+            return t->xpid <= 0;
+        }
         if (t->tpid > 0 && waitpid(t->tpid, NULL, WNOHANG) > 0) { t->tpid = -1; return 1; }
         return t->tpid <= 0;
     }

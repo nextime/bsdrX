@@ -1,7 +1,12 @@
-.TH BSDR_MICRELAY 1 "2026-07-04" "bsdrX" "User Commands"
+.TH BSDR_MICRELAY 1 "2026-07-18" "bsdrX" "User Commands"
 .SH NAME
-bsdr_micrelay \- router-side owner-mic relay for bsdrX
+bsdr_micrelay \- router-side owner-mic relay for bsdrX (auto-discovering, multi-headset)
 .SH SYNOPSIS
+.B bsdr_micrelay
+.BI \-\-iface " IF"
+.RB [ \-\-port " N" ]
+.RB [ \-\-verbose ]
+.br
 .B bsdr_micrelay
 .BI \-\-iface " IF"
 .BI \-\-quest " HEADSET-IP"
@@ -23,6 +28,23 @@ bsdrX then decodes them through its normal owner-mic path, exposing the
 virtual microphone and feeding voice computer-control. Because it captures the headset's own
 uplink, the result is the owner's voice only \(em no room mixing, no MITM, no monitor mode.
 .PP
+.B Auto-discovery and multiple headsets.
+Run with only
+.BI \-\-iface " IF"
+and the relay is zero-config: it broadcasts a beacon on UDP port 45099, each
+.B bsdr_agent
+on the LAN hears it and registers for the headset it is paired with, and the relay forwards each
+headset's mic to its own agent \(em serving many headsets and agents in parallel. Authorisation is
+.IR bind-to-owner :
+because the relay is in the path it observes each headset\(<->agent bsdrX session (the remote-desktop
+UDP ports) and forwards a headset's mic only to the agent it actually saw paired with that headset,
+so a rogue LAN host cannot siphon someone else's owner voice. The registration heartbeat keeps a flow
+alive; when an agent stops (or unregisters) its flow is dropped. The legacy
+.BI \-\-quest " HEADSET-IP"
+/
+.BI \-\-to " HOST:PORT"
+form still works for a single static flow that skips discovery and the pairing check.
+.PP
 .B Cloud voice substitution.
 When bsdrX has the voice changer's \(lqsubstitute into the cloud\(rq option on, it re\-encodes the
 changed voice and sends the modified RTP back to the relay over the same UDP link. The relay then
@@ -43,14 +65,25 @@ an OpenWRT package recipe is in
 .SH OPTIONS
 .TP
 .BI \-\-iface " IF"
-Capture interface \(em the router LAN/bridge the headset is on (for example
+Capture interface \(em the router LAN/bridge the headsets are on (for example
 .BR br-lan ).
 .TP
+.BI \-\-port " N"
+Control/discovery UDP port (default 45099). The beacon and each agent's listen socket share this
+port, so if you change it, set the same port on the agent side (its relay port /
+.BR "\-\-sniff\-remote N" ).
+At the default on both, discovery is fully zero-config.
+.TP
+.BR \-\-verbose ", " \-v
+Log denied registrations and per-flow detail.
+.TP
 .BI \-\-quest " HEADSET-IP"
-The headset's IPv4 address. Only packets from this source are forwarded.
+(Static mode) A headset's IPv4 address; with
+.BR \-\-to ,
+forward only its packets, skipping discovery and the pairing check.
 .TP
 .BI \-\-to " HOST:PORT"
-The bsdrX host and the UDP port it listens on
+(Static mode) The bsdrX host and the UDP port it listens on
 .RB ( "bsdr_agent \-\-sniff\-remote PORT" ).
 .TP
 .BR \-h ", " \-\-help
@@ -62,11 +95,14 @@ capability on the router. libpcap is statically linked into the prebuilt binarie
 from source it is the only dependency.
 .SH EXAMPLES
 .TP
-On the router (headset at 192.168.1.50, bsdrX host at 192.168.1.10, port 45099):
-.B bsdr_micrelay \-\-iface br\-lan \-\-quest 192.168.1.50 \-\-to 192.168.1.10:45099
+Auto (recommended) \(em on the router, serving every paired agent/headset:
+.B bsdr_micrelay \-\-iface br\-lan
 .TP
-On the bsdrX host:
+On each bsdrX host (or just enable the relay owner-mic method in the web panel):
 .B bsdr_agent \-\-sniff\-remote 45099
+.TP
+Static single flow (headset 192.168.1.50, bsdrX host 192.168.1.10), no discovery/auth:
+.B bsdr_micrelay \-\-iface br\-lan \-\-quest 192.168.1.50 \-\-to 192.168.1.10:45099
 .SH SEE ALSO
 .BR bsdr_agent (1).
 .SH AUTHOR

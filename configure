@@ -390,6 +390,18 @@ if [ -n "$onnx_prefix" ] && [ -f "$onnx_prefix/include/onnxruntime_c_api.h" ]; t
     ONNX_LIBS="-L$onnx_prefix/lib -lonnxruntime -Wl,-rpath,'\$\$ORIGIN/../lib' -Wl,-rpath,$onnx_abs"
     ONNX_LIB_INSTALL="$onnx_abs"
     echo "configure: in-process depth + face swap = ONNX Runtime at $onnx_prefix (rpath $onnx_abs + \$ORIGIN/../lib)"
+    # GPU execution provider — mirror scripts/onnx-plugin-link.sh so a native ./configure build enables
+    # the same acceleration the plugins do, auto-detected from the ORT package present:
+    #  - CUDA when the provider .so is bundled (a GPU ORT; needs CUDA 12 + cuDNN 9 at runtime).
+    #  - DirectML when the DML provider header ships (a DirectML-enabled ORT).
+    # Absent -> CPU/XNNPACK, unchanged.
+    if [ -f "$onnx_prefix/lib/libonnxruntime_providers_cuda.so" ]; then
+        ONNX_DEF="$ONNX_DEF -DBSDR_ONNX_CUDA=1"
+        echo "configure: GPU ONNX Runtime detected (providers_cuda.so) -> CUDA execution provider ENABLED"
+    elif [ -f "$onnx_prefix/include/dml_provider_factory.h" ]; then
+        ONNX_DEF="$ONNX_DEF -DBSDR_ONNX_DML=1"
+        echo "configure: DirectML ONNX Runtime detected -> DML execution provider ENABLED"
+    fi
 elif [ -n "$onnx_system" ]; then
     # System ORT (offline fallback): headers + libonnxruntime.so already where the compiler/loader look.
     # No -L/rpath, and `make install` must NOT copy a system lib (ONNX_LIB_INSTALL stays empty).

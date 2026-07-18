@@ -132,6 +132,8 @@ static const char PAGE[] =
 ".badge{font-size:11px;font-weight:600;border-radius:999px;padding:2px 9px}"
 ".spin{display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;vertical-align:-1px;animation:spin .7s linear infinite}"
 "@keyframes spin{to{transform:rotate(360deg)}}"
+".pbar{height:5px;background:rgba(127,127,127,.25);border-radius:3px;margin-top:5px;overflow:hidden}"
+".pbar>i{display:block;height:100%;background:var(--accent,#4a9);width:0;transition:width .3s ease}"
 ".badge.free{background:rgba(46,204,113,.14);color:#7ee2a8;border:1px solid rgba(46,204,113,.35)}"
 ".badge.custom{background:rgba(91,157,255,.14);color:#a9caff;border:1px solid rgba(91,157,255,.35)}"
 ".q{display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid var(--edge)}"
@@ -310,10 +312,10 @@ static const char PAGE[] =
 "<div class=hint id=pskeyhint>Prefer <b>Google</b> or <b>GitHub</b>? Click <b>Sign in / sign up in "
 "browser</b> \xE2\x80\x94 it opens the store, you authenticate there (password, Google or GitHub), and the "
 "agent connects automatically. Or paste a <b>license key</b> from the store Account page above.</div>"
-"<div class=row style=margin-top:8px><b>Installed on this machine</b>"
+"<div class=row style=margin-top:8px><b>Built-in &amp; sideloaded plugins</b>"
 "<button onclick=psRefresh() style=margin-left:auto>Refresh</button></div>"
-"<div class=hint>Every plugin present here \xE2\x80\x94 built-in and store-installed. Toggle one off to unload "
-"it live; back on to reload it.</div>"
+"<div class=hint>Plugins that don't come from the store (store plugins are managed under "
+"<b>Available plugins</b> below). Toggle one off to unload it live; back on to reload it.</div>"
 /* These are LIST containers (one plugin per row), so they must stack vertically. .status is a
  * single-line flex row (display:flex) used for the account line — reusing it here laid every plugin
  * side-by-side. Keep the class for its font-size but force block display so the rows stack. */
@@ -539,14 +541,18 @@ static const char PAGE[] =
 /* plugin config variable changed (auto-rendered form in a plugin's settings card) */
 "function pcfg(p,k,v){api('/api/plugin-config',{plugin:p,key:k,value:''+v});}"
 /* ---- plugin store ---- */
-"var psSt=null,psCat=null,psDL={};"   /* psDL: slugs with a download in flight (button disabled) */
-"function psRefresh(){api('/api/plugstore/status').then(function(x){psSt=x;psAcct();psRender();});api('/api/plugstore/catalog').then(function(x){psCat=x;psRender();});api('/api/plugins').then(psPlugins);}"
+"var psSt=null,psCat=null,psDL={},psPlugList=null;"   /* psDL: slugs downloading; psPlugList: cached /api/plugins for re-filter once the catalog loads */
+"function psRefresh(){api('/api/plugstore/status').then(function(x){psSt=x;psAcct();psRender();});api('/api/plugstore/catalog').then(function(x){psCat=x;psRender();psPlugins();});api('/api/plugins').then(psPlugins);}"
 /* Installed-on-this-machine list: every plugin on disk (built-in + store), with a live enable/disable. */
-"function psPlugins(list){var el=document.getElementById('psplugins');if(!el)return;if(!list||!list.length){el.textContent='No plugins found.';return;}"
-"el.innerHTML=list.slice().sort(function(a,b){return a.name<b.name?-1:1;}).map(function(p){"
+"function psInStore(name){return !!(psCat&&psCat.plugins&&psCat.plugins.some(function(c){return c.slug===name;}));}"
+"function psPlugins(list){if(list!=null)psPlugList=list;var el=document.getElementById('psplugins');if(!el)return;"
+/* store plugins are managed in the catalog above; here list only the rest (built-in / sideloaded) so nothing appears twice */
+"var rows=(psPlugList||[]).filter(function(p){return !psInStore(p.name);}).sort(function(a,b){return a.name<b.name?-1:1;});"
+"if(!rows.length){el.textContent='No other plugins.';return;}"
+"el.innerHTML=rows.map(function(p){"
 "var st=p.loaded?'loaded':(p.enabled?'enabled (reload to load)':'disabled');"
 "var tag=p.builtin?' <span class=hint>built-in</span>':'';"
-"return '<div class=row style=\"margin-top:6px;align-items:baseline\"><b>'+_at(p.name)+'</b>'+tag"
+"return '<div class=row style=\"margin-top:6px;align-items:baseline;flex-wrap:wrap;gap:4px\"><b>'+_at(p.name)+'</b>'+tag"
 "+(p.version?(' <span class=hint>v'+_at(p.version)+'</span>'):'')"
 "+' <span class=hint style=margin-left:6px>'+st+'</span><span style=margin-left:auto></span>'"
 "+'<button onclick=\"psEnable(\\''+p.name+'\\','+(p.enabled?0:1)+')\">'+(p.enabled?'Disable':'Enable')+'</button></div>';}).join('');}"
@@ -554,22 +560,31 @@ static const char PAGE[] =
 "var li=psSt.loggedIn;psacct.innerHTML=li?('\\u{1F7E2} Signed in'+(psSt.email?(' as '+_at(psSt.email)):'')+' <button style=margin-left:8px onclick=psLogout()>Log out</button>'):'Not signed in \\u2014 log in or create an account to buy and download plugins.';"
 "pslogin.style.display=li?'none':'flex';}"
 "function psInstalled(slug){if(!psSt||!psSt.installed)return null;for(var i=0;i<psSt.installed.length;i++)if(psSt.installed[i].name===slug)return psSt.installed[i];return null;}"
+"function psCatBySlug(s){if(!psCat||!psCat.plugins)return null;for(var i=0;i<psCat.plugins.length;i++)if(psCat.plugins[i].slug===s)return psCat.plugins[i];return null;}"
+/* Soft recommendations (NOT hard deps): the AI plugins run on CPU without gpu-cuda, but it enables GPU.
+ * Merged with any store-provided p.recommends[] so the store can add more without a client change. */
+"var PS_RECO={'voice-changer':['gpu-cuda'],'2d-3d':['gpu-cuda'],'faceswap':['gpu-cuda']};"
+"function psRecos(p){var r=(p.recommends||[]).slice();(PS_RECO[p.slug]||[]).forEach(function(s){if(r.indexOf(s)<0)r.push(s);});return r;}"
 "function psRender(){var el=document.getElementById('pscatalog');if(!el)return;if(!psCat||!psCat.plugins){el.textContent=(psCat&&psCat.error)?('Store error: '+psCat.error):'\\u2026';return;}"
 "if(!psCat.plugins.length){el.textContent='No plugins available.';return;}"
 "el.innerHTML=psCat.plugins.map(function(p){var ins=psInstalled(p.slug);"
 "var price=(p.visibility==='paid')?((p.price_cents/100).toFixed(2)+' '+(p.currency||'EUR')):(p.visibility==='public'?'free':p.visibility);"
 "var cv=p.compatible_version,noBuild=(p.compatible===false);"
 "var upd=(ins&&cv&&ins.version&&cv!==ins.version);"
-"var b='<div class=row style=\"margin-top:6px;align-items:baseline\"><b>'+_at(p.name)+'</b>'"
+"var b='<div class=row style=\"margin-top:6px;align-items:baseline;flex-wrap:wrap;gap:4px\"><b>'+_at(p.name)+'</b>'"
 "+' <span class=hint>v'+_at(p.latest_version||'?')+' \\u2014 '+price+(p.source_kind?(' \\u2014 '+p.source_kind):'')+'</span>';"
 "if(upd)b+=' <span class=badge style=\"background:#1e3a2f;color:#8affc4\">update \\u2192 v'+_at(cv)+'</span>';"
 "else if(noBuild&&!ins)b+=' <span class=hint>(no build for your ABI/platform)</span>';"
-"b+='<span style=margin-left:auto></span>';"
-"if(p.visibility==='paid'&&!p.entitled){b+='<button class=p onclick=\"psBuy(\\''+p.slug+'\\')\">Buy</button>';}"
-"if((p.entitled||p.visibility==='public')&&!noBuild){b+=psDL[p.slug]?'<button disabled style=opacity:.7><span class=spin></span> Downloading\\u2026</button>':('<button class='+(upd||!ins?'p':'\\'\\'')+' onclick=\"psDownload(\\''+p.slug+'\\')\">'+(ins?(upd?'Update':'Reinstall'):'Install')+'</button>');}"
-"if(ins){b+='<button onclick=\"psEnable(\\''+p.slug+'\\','+(ins.enabled?0:1)+')\">'+(ins.enabled?'Disable':'Enable')+'</button>';"
-"b+='<button class=danger onclick=\"psRemove(\\''+p.slug+'\\')\">Remove</button>';}"
-"b+='</div>';if(p.summary||ins)b+='<div class=hint style=\"margin:0 0 4px\">'+_at(p.summary||'')+(ins?(' \\u2014 '+(ins.version?('v'+_at(ins.version)+' '):'')+(ins.loaded?'loaded':(ins.enabled?'installed (reload to load)':'disabled'))):'')+'</div>';return b;}).join('');}"
+"b+='</div>';"   /* close the info line; buttons go on their own right-aligned line below */
+"var bt='';"
+"if(p.visibility==='paid'&&!p.entitled){bt+='<button class=p onclick=\"psBuy(\\''+p.slug+'\\')\">Buy</button>';}"
+"if((p.entitled||p.visibility==='public')&&!noBuild){var _pd=psDL[p.slug];if(_pd){var _pp=(_pd.pct>=0)?_pd.pct:0;var _pt=(_pd.pct>=0)?(_pd.pct+'%'):'\\u2026';var _pn=(_pd.name&&_pd.name!==p.slug)?(' '+_pd.name):'';bt+='<button disabled style=opacity:.7><span class=spin></span> Downloading'+_pn+' '+_pt+'</button><div class=pbar style=\"flex:1 0 100%\"><i style=\"width:'+_pp+'%\"></i></div>';}else{bt+='<button class='+(upd||!ins?'p':'\\'\\'')+' onclick=\"psDownload(\\''+p.slug+'\\')\">'+(ins?(upd?'Update':'Reinstall'):'Install')+'</button>';}}"
+"if(ins){bt+='<button onclick=\"psEnable(\\''+p.slug+'\\','+(ins.enabled?0:1)+')\">'+(ins.enabled?'Disable':'Enable')+'</button>';"
+"bt+='<button class=danger onclick=\"psRemove(\\''+p.slug+'\\')\">Remove</button>';}"
+"if(bt)b+='<div class=row style=\"justify-content:flex-end;flex-wrap:wrap;gap:4px;margin-top:2px\">'+bt+'</div>';"
+"if(p.summary||ins)b+='<div class=hint style=\"margin:0 0 4px\">'+_at(p.summary||'')+(ins?(' \\u2014 '+(ins.version?('v'+_at(ins.version)+' '):'')+(ins.loaded?'loaded':(ins.enabled?'installed (reload to load)':'disabled'))):'')+'</div>';"
+"psRecos(p).forEach(function(rs){var rc=psCatBySlug(rs);if(!rc)return;var rins=psInstalled(rs);var why=(rs==='gpu-cuda')?' for GPU acceleration (otherwise CPU)':'';b+='<div class=hint style=\"margin:0 0 4px\">\\u{1F4A1} Recommended: <b>'+_at(rc.name||rs)+'</b>'+why+' \\u2014 '+(rins?'installed \\u2713':'<a href=# onclick=\"psDownload(\\''+rs+'\\');return false\">install</a>')+'</div>';});"
+"return b;}).join('');}"
 "function psSetUrl(){api('/api/plugstore/url',{url:psurl.value}).then(psRefresh);}"
 "function psLogin(){api('/api/plugstore/login',{email:psemail.value,password:pspw.value}).then(function(r){pspw.value='';if(!r.ok)alert('Sign-in failed: '+(r.error||''));psRefresh();});}"
 "function psLoginKey(){var k=(document.getElementById('pskey').value||'').trim();if(!k){alert('Paste a license key first.');return;}api('/api/plugstore/login-key',{key:k}).then(function(r){if(!r.ok)alert('License key not accepted: '+(r.error||''));else document.getElementById('pskey').value='';psRefresh();});}"
@@ -585,8 +600,13 @@ static const char PAGE[] =
 "function psRegister(){if((pspw.value||'').length<8){alert('Password must be at least 8 characters.');return;}api('/api/plugstore/register',{email:psemail.value,password:pspw.value}).then(function(r){pspw.value='';if(!r.ok)alert('Sign-up failed: '+(r.error||''));psRefresh();});}"
 "function psLogout(){api('/api/plugstore/logout',{}).then(psRefresh);}"
 "function psBuy(slug){api('/api/plugstore/buy',{slug:slug}).then(function(r){if(r.ok&&r.url)window.open(r.url,'_blank','noopener');else alert('Could not open the purchase page.');});}"
-"function psDownload(slug){if(psDL[slug])return;psDL[slug]=1;psRender();"   /* guard the re-click, flip the button to a spinner immediately */
-"api('/api/plugstore/download',{slug:slug}).then(function(r){delete psDL[slug];if(!r.ok)alert('Download failed: '+(r.error||''));psRefresh();});}"
+"function psDownload(slug){if(psDL[slug])return;psDL[slug]={active:true,pct:-1,name:slug};psRender();"   /* guard re-click; show a bar immediately */
+"api('/api/plugstore/download',{slug:slug}).then(function(r){"
+"if(!r.ok){delete psDL[slug];alert('Download failed: '+(r.error||''));psRender();return;}"
+"var iv=setInterval(function(){api('/api/plugstore/dl-state').then(function(d){"    /* poll byte progress until done */
+"psDL[slug]=d;psRender();"
+"if(!d||!d.active){clearInterval(iv);delete psDL[slug];if(d&&!d.ok)alert('Download failed: '+(d.error||''));psRefresh();}"
+"});},500);});}"
 "function psEnable(name,on){api('/api/plugstore/enable',{name:name,on:on}).then(function(r){if(!r.ok)alert(r.error||'failed');psRefresh();});}"
 "function psRemove(name){if(!confirm('Remove plugin '+name+'?'))return;api('/api/plugstore/remove',{name:name}).then(function(r){if(!r.ok)alert(r.error||'failed');psRefresh();});}"
 /* ---- plugin UI extension API (panels, sections, config, scripts) ---- */
@@ -1671,10 +1691,19 @@ static void handle(struct bsdr_webui *w, bsdr_socket_t c, const char *method,
         respond(c, 200, "application/json", j, jn);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/plugstore/download") == 0) {
         char slug[160] = ""; bsdr_json_get_str(body, "slug", slug, sizeof slug);
-        char err[256] = "";
-        int ok = bsdr_plugstore_download(slug, err, sizeof err);
-        char ee[300]; bsdr_json_escape(ee, sizeof ee, err);
-        char j[400]; int jn = snprintf(j, sizeof j, "{\"ok\":%s,\"error\":\"%s\"}", ok ? "true" : "false", ee);
+        /* Start the download+install on a background thread and return immediately; the UI polls
+         * /api/plugstore/dl-state for byte progress and the final result. */
+        int rc = bsdr_plugstore_download_start(slug);
+        char j[128]; int jn = snprintf(j, sizeof j, "{\"ok\":%s,\"error\":\"%s\"}",
+            rc == 0 ? "true" : "false", rc == 0 ? "" : "could not start the download");
+        respond(c, 200, "application/json", j, jn);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/plugstore/dl-state") == 0) {
+        bsdr_model_dl d; bsdr_plugstore_download_state(&d);
+        char nm[160]; bsdr_json_escape(nm, sizeof nm, d.name);
+        char ee[220]; bsdr_json_escape(ee, sizeof ee, d.err);
+        char j[512]; int jn = snprintf(j, sizeof j,
+            "{\"active\":%s,\"pct\":%d,\"done\":%ld,\"total\":%ld,\"ok\":%s,\"name\":\"%s\",\"error\":\"%s\"}",
+            d.active ? "true" : "false", d.pct, d.done, d.total, d.ok ? "true" : "false", nm, ee);
         respond(c, 200, "application/json", j, jn);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/plugstore/enable") == 0) {
         char name[160] = ""; bsdr_json_get_str(body, "name", name, sizeof name);

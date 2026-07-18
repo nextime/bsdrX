@@ -367,7 +367,10 @@ $(AGENT): src/agent.c $(LIB) $(WINRES) | $(BUILD)
 # snapshot (scripts/publish-github.sh strips the private plugins/ tree), where this is simply a no-op.
 # Match only sub-DIRECTORIES (trailing-slash wildcard), so loose files like plugins/PLUGIN-AUTHORING.md
 # aren't mistaken for plugins.
-PLUGIN_DIRS := $(patsubst %/,%,$(wildcard plugins/*/))
+# Only dirs that actually contain .c compile here; a source-less "payload" plugin (e.g. plugins/gpu-cuda,
+# which ships the ONNX CUDA provider) is packaged by scripts/build-plugins.sh for the store, not built
+# into a loadable .so, so it must not reach PLUGIN_RULE (which would `cc` with no inputs).
+PLUGIN_DIRS := $(patsubst %/,%,$(sort $(dir $(wildcard plugins/*/*.c))))
 PLUGIN_SOS  := $(patsubst plugins/%,$(BUILD)/plugins/%.so,$(PLUGIN_DIRS))
 
 $(BUILD)/plugins:

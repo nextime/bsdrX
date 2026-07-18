@@ -21,6 +21,7 @@
 #ifdef _WIN32
 #  include <windows.h>
 #endif
+/* DML EP resolved at RUNTIME (GetProcAddress) below — not linked, no dml_provider_factory.h needed. */
 #ifdef __ANDROID__
 #  include <dlfcn.h>
 #endif
@@ -376,7 +377,10 @@ static void select_ep(bsdr_faceswap *fs, int use_gpu) {
 #endif
         if (g){ OrtStatus *s=o->SessionOptionsAppendExecutionProvider(fs->opts,g,NULL,NULL,0); if(!s){fs->ep=g;return;} o->ReleaseStatus(s); }
 #if defined(_WIN32) && defined(BSDR_ONNX_DML)
-        { OrtStatus *s=OrtSessionOptionsAppendExecutionProvider_DML(fs->opts,0); if(!s){fs->ep="dml";return;} o->ReleaseStatus(s); }
+        {   typedef OrtStatus *(ORT_API_CALL *dml_fn)(OrtSessionOptions *, int);
+            HMODULE _m = GetModuleHandleA("onnxruntime.dll"); if (!_m) _m = LoadLibraryA("onnxruntime.dll");
+            dml_fn _dml = _m ? (dml_fn)(void *)GetProcAddress(_m, "OrtSessionOptionsAppendExecutionProvider_DML") : NULL;
+            if (_dml) { OrtStatus *s = _dml(fs->opts, 0); if (!s) { fs->ep = "dml"; return; } o->ReleaseStatus(s); } }
 #endif
 #if defined(BSDR_ONNX_CUDA)
         { OrtCUDAProviderOptions c; memset(&c,0,sizeof c); OrtStatus *s=o->SessionOptionsAppendExecutionProvider_CUDA(fs->opts,&c); if(!s){fs->ep="cuda";return;} o->ReleaseStatus(s); }

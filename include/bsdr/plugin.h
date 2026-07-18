@@ -72,7 +72,7 @@
  *      loadable (their N stays <= the new H and their X stays open) — that is the "retroactive until
  *      marked obsolete" guarantee. Only capping a plugin's abi_max, or raising BSDR_PLUGIN_ABI_MIN,
  *      drops an old plugin. */
-#define BSDR_PLUGIN_ABI     6   /* current host ABI (bump on every change to this header's contract) */
+#define BSDR_PLUGIN_ABI     7   /* current host ABI (bump on every change to this header's contract) */
 #define BSDR_PLUGIN_ABI_MIN 1   /* host's hard floor: oldest plugin build it will still load */
 
 /* True if `field` lies wholly within the struct the plugin actually provided (per its struct_size),
@@ -80,6 +80,12 @@
  *     if (BSDR_PLUGIN_HAS(p, http) && p->http) p->http(...);  */
 #define BSDR_PLUGIN_HAS(p, field) \
     ((p)->struct_size >= offsetof(bsdr_plugin, field) + sizeof(((const bsdr_plugin *)0)->field))
+
+/* Mirror for the HOST struct: true if `field` lies within the host the plugin was handed (per
+ * host->struct_size), i.e. safe for a plugin built against a newer ABI to call on an older host:
+ *     if (BSDR_HOST_HAS(host, set_voiceai_status) && host->set_voiceai_status) host->set_voiceai_status(...);  */
+#define BSDR_HOST_HAS(h, field) \
+    ((h)->struct_size >= offsetof(bsdr_plugin_host, field) + sizeof(((const bsdr_plugin_host *)0)->field))
 
 /* A configuration variable a plugin declares (bsdr_plugin.config). The host auto-renders a form for
  * these in the plugin's panel/section, persists edited values, and the plugin reads them back live via
@@ -445,6 +451,11 @@ typedef struct bsdr_plugin_host {
      * A host with RGB frames (Android's GL readback) calls bsdr_mediafx_face_process / _set_source.
      * Cleared automatically when the plugin unloads. For the face-swap plugin. */
     void     (*face_fx_register)(const bsdr_face_fx *fx);
+
+    /* ABI 7: report a human-readable status string for the AI voice engine (shown in the UI as the
+     * voice card's "Engine:" line, e.g. "tier2:cpu ... - GPU unavailable, running CPU (not real-time)"
+     * or "model failed to load ..."). Guard with BSDR_PLUGIN_HAS(host, set_voiceai_status). */
+    void     (*set_voiceai_status)(const char *status);
 } bsdr_plugin_host;
 
 /* What a plugin provides. abi + struct_size + name are required; every hook may be NULL.

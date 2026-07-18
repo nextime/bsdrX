@@ -175,6 +175,8 @@ typedef struct bsdr_app {
      * xterm captured via x11grab (XTEST injection). term_cols/rows size the pty grid (0 = default). */
     char term_backend[8];         /* "pty" | "xvfb" (empty = pty) */
     int  term_cols, term_rows;    /* pty grid size; 0 = default (120x36) */
+    int  term_desktop;            /* xvfb backend only: 1 = full virtual desktop (window manager +
+                                   * terminal, or the box's default X session) instead of a bare xterm */
     volatile unsigned source_gen; /* bump when the source changes so the live session reopens capture */
     volatile unsigned encoder_gen;/* bump on a CPU<->GPU encoder toggle so the session reopens capture
                                    * IN PLACE (no full restart, which would drop the input channel) */
